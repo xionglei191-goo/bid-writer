@@ -1,0 +1,88 @@
+import React, { useEffect, useMemo, useState } from "react";
+import { BookCheck, FileSearch, Play, RefreshCw, ScanSearch, Search, Send, WandSparkles } from "lucide-react";
+import { api, post } from "../api";
+import { BusyButton, Empty, Metric, Notice, PageHeader, Status, Tabs } from "../components";
+
+const tabItems = [
+  { key: "sources", label: "原始资料" }, { key: "jobs", label: "处理队列" }, { key: "documents", label: "标准文档" },
+  { key: "units", label: "知识单元" }, { key: "reviews", label: "审核发布" }, { key: "publications", label: "正式知识" }, { key: "search", label: "检索测试" },
+];
+
+export default function Knowledge({ initialTab, onChanged }) {
+  const [tab, setTab] = useState(initialTab || "sources");
+  const [metrics, setMetrics] = useState({});
+  function selectTab(key) { setTab(key); location.hash = `#/knowledge/${key}`; }
+  async function loadMetrics() { setMetrics(await api("/api/knowledge/metrics")); }
+  useEffect(() => { setTab(initialTab || "sources"); }, [initialTab]);
+  useEffect(() => { loadMetrics().catch(() => {}); }, [tab]);
+  return <>
+    <PageHeader eyebrow="知识工程中心" title="本地知识资产" description="只有审核并发布的内容可以进入技术标生成链路。" />
+    <section className="metric-grid five"><Metric label="已扫描" value={metrics.sources} /><Metric label="重复文件" value={metrics.duplicates} /><Metric label="标准文档" value={metrics.documents} /><Metric label="待审核" value={metrics.review_pending} tone="warning" /><Metric label="已发布" value={metrics.published} tone="success" /></section>
+    <Tabs items={tabItems} active={tab} onChange={selectTab} />
+    {tab === "sources" && <Sources onChanged={() => { loadMetrics(); onChanged?.(); }} />}
+    {tab === "jobs" && <Jobs onChanged={() => { loadMetrics(); onChanged?.(); }} />}
+    {tab === "documents" && <Documents />}
+    {tab === "units" && <Units mode="all" onChanged={loadMetrics} />}
+    {tab === "reviews" && <Units mode="review" onChanged={loadMetrics} />}
+    {tab === "publications" && <Publications onChanged={loadMetrics} />}
+    {tab === "search" && <KnowledgeSearch />}
+  </>;
+}
+
+function Sources({ onChanged }) {
+  const [data, setData] = useState({ items: [], total: 0 });
+  const [status, setStatus] = useState("");
+  const [query, setQuery] = useState("");
+  const [limit, setLimit] = useState(300);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  async function load() { setData(await api(`/api/knowledge/sources?limit=100&status=${encodeURIComponent(status)}&query=${encodeURIComponent(query)}`)); }
+  async function scan() { setBusy(true); try { const result = await post("/api/knowledge/sources/scan", { limit, expand_archives: true }); setMessage(`扫描${result.scanned}个文件，新增${result.created}个，识别重复${result.duplicates}个。`); await load(); onChanged?.(); } catch (error) { setMessage(error.message); } finally { setBusy(false); } }
+  useEffect(() => { load().catch(() => {}); }, [status]);
+  return <section className="panel"><div className="toolbar"><div className="filters"><input placeholder="文件名或路径" value={query} onChange={(event) => setQuery(event.target.value)} /><select value={status} onChange={(event) => setStatus(event.target.value)}><option value="">全部状态</option><option value="discovered">待处理</option><option value="duplicate">重复</option><option value="asset">素材</option><option value="metadata_only">仅登记</option></select><button className="secondary icon-only" title="查询" onClick={load}><Search size={17} /></button></div><div className="actions"><label className="inline-field">本次扫描<input type="number" min="1" value={limit} onChange={(event) => setLimit(Number(event.target.value))} /></label><BusyButton busy={busy} onClick={scan}><ScanSearch size={16} />扫描原始库</BusyButton></div></div>{message && <Notice>{message}</Notice>}<div className="table-wrap"><table><thead><tr><th>文件</th><th>行业</th><th>格式</th><th>大小</th><th>状态</th></tr></thead><tbody>{data.items.map((item) => <tr key={item.id}><td><strong>{item.file_name}</strong><small>{item.relative_path}</small></td><td>{item.industry}</td><td>{item.extension || "-"}</td><td>{(item.size_bytes / 1024 / 1024).toFixed(1)} MB</td><td><Status value={item.status} /></td></tr>)}</tbody></table>{!data.items.length && <Empty title="尚未扫描原始资料" />}</div><div className="table-footer">显示 {data.items.length} / {data.total}</div></section>;
+}
+
+function Jobs({ onChanged }) {
+  const [jobs, setJobs] = useState([]); const [busyId, setBusyId] = useState(null); const [message, setMessage] = useState("");
+  async function load() { setJobs(await api("/api/knowledge/jobs?limit=200")); }
+  async function create() { const result = await post("/api/knowledge/jobs", { limit: 100 }); setMessage(`已创建${result.created}个任务。`); await load(); }
+  async function runBatch() { setBusyId("batch"); try { const result = await post("/api/knowledge/jobs/run-batch", { limit: 20 }); setMessage(`批量处理${result.processed}项，完成${result.completed}项，等待OCR ${result.waiting_ocr}项，失败${result.failed}项。`); await load(); onChanged?.(); } catch (error) { setMessage(error.message); } finally { setBusyId(null); } }
+  async function run(job, action = "run") { setBusyId(job.id); try { const result = await post(`/api/knowledge/jobs/${job.id}/${action}`, {}); setMessage(result.status === "completed" ? `${job.file_name}处理完成。` : result.error || `任务状态：${result.status}`); await load(); onChanged?.(); } catch (error) { setMessage(error.message); } finally { setBusyId(null); } }
+  useEffect(() => { load().catch(() => {}); }, []);
+  return <section className="panel"><div className="toolbar"><div><strong>标准化任务</strong><span className="toolbar-note">失败任务可重试，扫描PDF进入OCR队列。</span></div><div className="actions"><button className="secondary icon-only" title="刷新" onClick={load}><RefreshCw size={17} /></button><BusyButton busy={busyId === "batch"} className="secondary" onClick={runBatch}><Play size={16} />批量执行20项</BusyButton><button onClick={create}><FileSearch size={16} />创建任务</button></div></div>{message && <Notice>{message}</Notice>}<div className="table-wrap"><table><thead><tr><th>资料</th><th>步骤</th><th>进度</th><th>状态</th><th>操作</th></tr></thead><tbody>{jobs.map((job) => <tr key={job.id}><td><strong>{job.file_name}</strong><small>{job.industry} · {job.extension}</small></td><td>{job.current_step || "queued"}</td><td><div className="progress"><span style={{ width: `${job.progress}%` }} /></div></td><td><Status value={job.status} />{job.error_message && <small className="error-text">{job.error_message}</small>}</td><td><div className="row-actions">{["pending", "failed"].includes(job.status) && <BusyButton busy={busyId === job.id} className="secondary" onClick={() => run(job, job.status === "failed" ? "retry" : "run")}><Play size={15} />{job.status === "failed" ? "重试" : "执行"}</BusyButton>}{job.status === "waiting_ocr" && <BusyButton busy={busyId === job.id} onClick={() => run(job, "ocr")}><ScanSearch size={15} />OCR</BusyButton>}{["pending", "failed", "waiting_ocr"].includes(job.status) && <button className="secondary" onClick={() => run(job, "pause")}>暂停</button>}{job.status === "paused" && <button className="secondary" onClick={() => run(job, "resume")}>恢复</button>}</div></td></tr>)}</tbody></table>{!jobs.length && <Empty title="暂无处理任务" />}</div></section>;
+}
+
+function Documents() {
+  const [data, setData] = useState({ items: [], total: 0 });
+  useEffect(() => { api("/api/knowledge/documents?limit=200").then(setData).catch(() => {}); }, []);
+  return <section className="panel"><div className="table-wrap"><table><thead><tr><th>标准文档</th><th>行业</th><th>解析器</th><th>章节</th><th>字符</th><th>状态</th></tr></thead><tbody>{data.items.map((item) => <tr key={item.id}><td><strong>{item.title}</strong><small>{item.relative_path}</small></td><td>{item.industry}</td><td>{item.parser}</td><td>{item.section_count}</td><td>{item.char_count.toLocaleString()}</td><td><Status value={item.status} /></td></tr>)}</tbody></table>{!data.items.length && <Empty title="暂无标准文档" detail="处理任务完成后会在这里形成统一Markdown。" />}</div></section>;
+}
+
+function Units({ mode, onChanged }) {
+  const [items, setItems] = useState([]); const [selected, setSelected] = useState(null); const [query, setQuery] = useState(""); const [reviewer, setReviewer] = useState("技术负责人"); const [busy, setBusy] = useState(false); const [message, setMessage] = useState("");
+  const status = mode === "review" ? "review_required" : "";
+  async function load() { setItems(await api(`/api/knowledge/units?limit=200&status=${status}&query=${encodeURIComponent(query)}`)); }
+  async function open(id) { setSelected(await api(`/api/knowledge/units/${id}`)); }
+  async function rewrite() { setBusy(true); try { await post(`/api/knowledge/units/${selected.id}/rewrite`, { related_unit_ids: [] }); setMessage("知识重构草稿已生成，等待人工审核。"); await open(selected.id); await load(); } catch (error) { setMessage(error.message); } finally { setBusy(false); } }
+  async function review(action) { const version = selected.versions[0]; setBusy(true); try { await post(`/api/knowledge/reviews/${selected.id}`, { version_id: version.id, action, reviewer, notes: "" }); setMessage(action === "approve" ? "版本已批准。" : "版本已退回。"); await open(selected.id); await load(); onChanged?.(); } catch (error) { setMessage(error.message); } finally { setBusy(false); } }
+  async function publish() { const version = selected.versions.find((item) => item.status === "approved"); if (!version) return; setBusy(true); try { await post(`/api/knowledge/publications/${selected.id}`, { version_id: version.id, publisher: reviewer }); setMessage("知识已发布并进入正式检索库。"); await open(selected.id); await load(); onChanged?.(); } catch (error) { setMessage(error.message); } finally { setBusy(false); } }
+  async function cluster() { setBusy(true); try { const result = await post("/api/knowledge/units/cluster?limit=5000", {}); setMessage(`已将${result.units}个知识单元归入${result.clusters}个主题簇。`); await load(); } catch (error) { setMessage(error.message); } finally { setBusy(false); } }
+  useEffect(() => { load().catch(() => {}); }, [status]);
+  const approvedVersion = selected?.versions?.find((item) => item.status === "approved");
+  return <section className="split-view"><article className="panel list-pane"><div className="toolbar"><div className="filters"><input placeholder="标题或内容" value={query} onChange={(event) => setQuery(event.target.value)} /><button className="secondary icon-only" title="查询" onClick={load}><Search size={17} /></button></div><div className="actions"><BusyButton busy={busy} className="secondary" onClick={cluster}>自动聚类</BusyButton><span>{items.length}项</span></div></div><div className="unit-list">{items.map((item) => <button key={item.id} className={selected?.id === item.id ? "unit-item active" : "unit-item"} onClick={() => open(item.id)}><div><strong>{item.title}</strong><span>{item.industry} · {item.unit_type}</span></div><Status value={item.status} /></button>)}{!items.length && <Empty title={mode === "review" ? "没有待审核知识" : "暂无知识单元"} />}</div></article><article className="panel detail-pane">{selected ? <><div className="detail-title"><div><span className="eyebrow">{selected.unit_type}</span><h2>{selected.title}</h2><p>{selected.industry} · 来源{selected.sources.length}份 · 版本{selected.versions.length}个</p></div><Status value={selected.status} /></div>{message && <Notice>{message}</Notice>}<div className="reviewer-row"><label>审核人<input value={reviewer} onChange={(event) => setReviewer(event.target.value)} /></label><div className="actions"><BusyButton busy={busy} className="secondary" onClick={rewrite}><WandSparkles size={16} />重构草稿</BusyButton><BusyButton busy={busy} className="danger-outline" onClick={() => review("reject")} disabled={!selected.versions.length}>退回</BusyButton><BusyButton busy={busy} onClick={() => review("approve")} disabled={!selected.versions.length}><BookCheck size={16} />批准</BusyButton><BusyButton busy={busy} className="success" onClick={publish} disabled={!approvedVersion}><Send size={16} />发布</BusyButton></div></div><div className="content-preview"><pre>{selected.versions[0]?.content || selected.cleaned_content}</pre></div><div className="source-box"><h3>来源追溯</h3>{selected.sources.map((source) => <div key={source.id}><strong>{source.file_name}</strong><span>{source.heading || "正文"} · {source.relative_path}</span></div>)}</div></> : <Empty title="选择知识单元" detail="查看正文、来源、版本并执行审核发布。" />}</article></section>;
+}
+
+function Publications({ onChanged }) {
+  const [items, setItems] = useState([]); const [reviewer, setReviewer] = useState("系统管理员");
+  async function load() { setItems(await api("/api/knowledge/publications?limit=200")); }
+  async function retire(item) { await post(`/api/knowledge/publications/${item.id}/retire`, { reviewer }); await load(); onChanged?.(); }
+  async function restore(item) { await post(`/api/knowledge/publications/${item.id}/restore`, { reviewer }); await load(); onChanged?.(); }
+  useEffect(() => { load().catch(() => {}); }, []);
+  return <section className="panel"><div className="toolbar"><strong>正式知识库</strong><label className="inline-field">操作人<input value={reviewer} onChange={(event) => setReviewer(event.target.value)} /></label></div><div className="table-wrap"><table><thead><tr><th>知识</th><th>行业</th><th>类型</th><th>版本</th><th>来源</th><th>状态</th><th>操作</th></tr></thead><tbody>{items.map((item) => <tr key={item.id}><td><strong>{item.title}</strong></td><td>{item.industry}</td><td>{item.unit_type}</td><td>v{item.publication_version}</td><td>{item.source_name || "可追溯"}</td><td><Status value={item.status} /></td><td>{item.status === "published" ? <button className="secondary" onClick={() => retire(item)}>停用</button> : <button className="secondary" onClick={() => restore(item)}>恢复</button>}</td></tr>)}</tbody></table>{!items.length && <Empty title="正式知识库为空" detail="知识单元必须经过人工批准后才能发布。" />}</div></section>;
+}
+
+function KnowledgeSearch() {
+  const [query, setQuery] = useState("施工工艺"); const [industry, setIndustry] = useState(""); const [items, setItems] = useState([]); const [message, setMessage] = useState("");
+  async function search() { try { const result = await post("/api/knowledge/search", { query, industry, limit: 20 }); setItems(result); setMessage(`命中${result.length}条已发布知识。`); } catch (error) { setMessage(error.message); } }
+  return <section className="panel"><div className="search-bar"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="输入章节、工艺或管理要求" /><select value={industry} onChange={(event) => setIndustry(event.target.value)}><option value="">全部行业</option>{["医院", "学校", "市政", "厂房", "水利", "通用"].map((value) => <option key={value}>{value}</option>)}</select><button onClick={search}><Search size={17} />检索</button></div>{message && <Notice>{message}</Notice>}<div className="search-results">{items.map((item) => <article key={item.publication_id}><div><span className="eyebrow">{item.industry} · {item.unit_type}</span><h3>{item.title}</h3></div><p>{item.content.slice(0, 320)}...</p><footer><span>发布v{item.publication_version}</span><span>来源{item.sources.length}份</span></footer></article>)}{!items.length && <Empty title="等待检索" detail="检索范围只包含当前有效的已发布知识。" />}</div></section>;
+}
