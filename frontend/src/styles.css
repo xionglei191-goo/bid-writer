@@ -1,0 +1,54 @@
+@import "../../static/styles.css";
+
+.react-workbench {
+  min-height: 100vh;
+}
+
+.react-dashboard {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.react-dashboard h1 {
+  margin: 0;
+}
+
+.react-dashboard p {
+  margin: 8px 0 0;
+  color: #58657a;
+}
+
+.react-grid {
+  display: grid;
+  grid-template-columns: minmax(300px, 0.9fr) minmax(360px, 1.1fr);
+  gap: 16px;
+}
+
+.compact-actions {
+  margin: 10px 0 12px;
+}
+
+.embedded-workbench iframe {
+  width: 100%;
+  min-height: 760px;
+  border: 1px solid #d8e0ea;
+  border-radius: 8px;
+  background: #fff;
+}
+
+@media (max-width: 900px) {
+  .react-dashboard {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .react-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .embedded-workbench iframe {
+    min-height: 680px;
+  }
+}

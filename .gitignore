@@ -1,0 +1,35 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Runtime data and customer/project material
+data/*
+!data/.gitkeep
+!data/README.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Node and build output
+node_modules/
+dist/
+build/
+
+# Logs, temporary files and local IDE settings
+*.log
+*.tmp
+*.bak
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
