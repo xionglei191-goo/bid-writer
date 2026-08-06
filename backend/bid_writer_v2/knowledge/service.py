@@ -22,6 +22,24 @@ ASSET_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".
 METADATA_ONLY = {".dwg", ".dwf", ".mpp", ".vsd", ".plt"}
 
 
+def decode_archive_member_name(name: str, flag_bits: int = 0) -> str:
+    """Repair legacy Chinese ZIP names decoded by zipfile as CP437."""
+    if flag_bits & 0x800:
+        return name
+    suspicious = sum(
+        1
+        for char in name
+        if "\u2500" <= char <= "\u259f" or "\u0370" <= char <= "\u03ff"
+    )
+    if not suspicious:
+        return name
+    try:
+        candidate = name.encode("cp437").decode("gb18030")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return name
+    return candidate if any("\u4e00" <= char <= "\u9fff" for char in candidate) else name
+
+
 class KnowledgeService:
     def __init__(self, db: Database, settings: Settings, llm: LlmClient | None = None) -> None:
         self.db = db
@@ -168,7 +186,8 @@ class KnowledgeService:
         if extension == ".zip":
             with zipfile.ZipFile(path) as archive:
                 for member in archive.infolist():
-                    destination = (target / member.filename).resolve()
+                    member_name = decode_archive_member_name(member.filename, member.flag_bits)
+                    destination = (target / member_name).resolve()
                     if not str(destination).startswith(str(target.resolve())):
                         continue
                     if member.is_dir():
