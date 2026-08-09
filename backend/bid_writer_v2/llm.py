@@ -49,13 +49,16 @@ class LlmClient:
             try:
                 response = self._request(settings, headers, instructions, prompt, max_output_tokens)
                 response.raise_for_status()
-                content = self._text(response.json(), settings["wire_api"])
+                data = response.json()
+                content = self._text(data, settings["wire_api"])
+                usage = self._usage(data)
                 return {
                     **settings,
                     "content": content,
                     "error": "" if content else "模型未返回文本",
                     "latency_ms": round((time.time() - started) * 1000),
                     "attempts": attempt,
+                    **usage,
                 }
             except requests.HTTPError as exc:
                 last_error = f"HTTPError: {exc}"
@@ -74,6 +77,16 @@ class LlmClient:
             "error": last_error or "模型调用失败",
             "latency_ms": round((time.time() - started) * 1000),
             "attempts": 3,
+            "input_tokens": 0,
+            "output_tokens": 0,
+        }
+
+    @staticmethod
+    def _usage(data: dict[str, Any]) -> dict[str, int]:
+        usage = data.get("usage") or {}
+        return {
+            "input_tokens": int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or usage.get("completion_tokens") or 0),
         }
 
     @staticmethod
@@ -135,16 +148,50 @@ class LlmClient:
         cleaned = content.strip()
         if cleaned.startswith("```"):
             cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
-        try:
-            value = json.loads(cleaned)
-            return value if isinstance(value, dict) else None
-        except json.JSONDecodeError:
-            start = cleaned.find("{")
-            end = cleaned.rfind("}")
-            if start >= 0 and end > start:
+        candidates = [cleaned]
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start >= 0 and end > start and (start > 0 or end < len(cleaned) - 1):
+            candidates.append(cleaned[start : end + 1])
+        for candidate in candidates:
+            for attempt in (candidate, LlmClient._remove_trailing_json_commas(candidate)):
                 try:
-                    value = json.loads(cleaned[start : end + 1])
+                    value = json.loads(attempt)
                     return value if isinstance(value, dict) else None
                 except json.JSONDecodeError:
-                    return None
+                    continue
         return None
+
+    @staticmethod
+    def _remove_trailing_json_commas(value: str) -> str:
+        result: list[str] = []
+        in_string = False
+        escaped = False
+        index = 0
+        while index < len(value):
+            char = value[index]
+            if in_string:
+                result.append(char)
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                index += 1
+                continue
+            if char == '"':
+                in_string = True
+                result.append(char)
+                index += 1
+                continue
+            if char == ",":
+                lookahead = index + 1
+                while lookahead < len(value) and value[lookahead].isspace():
+                    lookahead += 1
+                if lookahead < len(value) and value[lookahead] in "}]":
+                    index += 1
+                    continue
+            result.append(char)
+            index += 1
+        return "".join(result)

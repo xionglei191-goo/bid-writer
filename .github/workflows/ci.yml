@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -r backend/requirements.txt
+      - run: python -m compileall -q backend/bid_writer_v2 backend/tests_v2
+      - run: python -m unittest discover -s backend/tests_v2 -v
+        env:
+          PYTHONPATH: backend
+          BID_WRITER_DISABLE_LLM: "1"
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: bid_writer_test
+          POSTGRES_USER: bid_writer
+          POSTGRES_PASSWORD: test-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U bid_writer -d bid_writer_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - run: python -m pip install -r backend/requirements.txt
+      - run: python backend/scripts_v2/check_postgres.py
+        env:
+          PYTHONPATH: backend
+          BID_WRITER_DATABASE_URL: postgresql+psycopg://bid_writer:test-password@127.0.0.1:5432/bid_writer_test
+
+  compose-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cp .env.example .env
+      - run: docker compose config --quiet
+      - run: docker compose up -d postgres redis qdrant minio
+      - name: Wait for infrastructure health
+        run: |
+          for attempt in $(seq 1 30); do
+            unhealthy=$(docker compose ps --format json | jq -r 'select(.Service == "postgres" or .Service == "redis" or .Service == "qdrant" or .Service == "minio") | select(.Health != "healthy") | .Service' | wc -l)
+            if [ "$unhealthy" -eq 0 ]; then exit 0; fi
+            sleep 5
+          done
+          docker compose ps
+          exit 1
+      - run: docker compose down -v
+        if: always()

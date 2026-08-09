@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import tempfile
@@ -125,21 +126,30 @@ class V2WorkflowTest(unittest.TestCase):
             self.assertTrue(generated["citations"])
             self.assertNotIn("[项目名称]", generated["content"])
             self.assertIn("| ---", generated["content"])
-            self.production.confirm_draft(generated["draft_id"], "测试技术负责人")
+            self.production.confirm_draft(
+                generated["draft_id"],
+                "测试技术负责人",
+                [{"index": 0, "resolution": "已核对知识来源和项目资料，同意采用当前表述"}],
+            )
 
             with self.db.connect() as conn:
                 base = conn.execute("SELECT * FROM project_drafts WHERE id=?", (generated["draft_id"],)).fetchone()
+                copied_draft_ids = []
                 for section in outline["sections"]:
                     if section["id"] == target["id"]:
                         continue
-                    conn.execute(
+                    cursor = conn.execute(
                         """
-                        INSERT INTO project_drafts(project_id,section_id,content,citations_json,confirmations_json,version_no,status)
-                        VALUES (?,?,?,?, '[]',1,'reviewed')
+                        INSERT INTO project_drafts(
+                            project_id,section_id,content,citations_json,confirmations_json,version_no,status,content_hash
+                        ) VALUES (?,?,?,?, '[]',1,'draft',?)
                         """,
-                        (project["id"], section["id"], base["content"], base["citations_json"]),
+                        (project["id"], section["id"], base["content"], base["citations_json"], base["content_hash"]),
                     )
+                    copied_draft_ids.append(int(cursor.lastrowid))
                     conn.execute("UPDATE project_sections SET status='drafted' WHERE id=?", (section["id"],))
+            for draft_id in copied_draft_ids:
+                self.production.confirm_draft(draft_id, "测试技术负责人")
 
             quality = self.production.quality_gate(project["id"])
             self.assertTrue(quality["ready"], quality)
@@ -156,6 +166,56 @@ class V2WorkflowTest(unittest.TestCase):
             else:
                 os.environ["BID_WRITER_DISABLE_LLM"] = old_disable
 
+    def test_confirmation_is_bound_to_content_and_resolved_individually(self) -> None:
+        self.publish_first_unit()
+        old_disable = os.environ.get("BID_WRITER_DISABLE_LLM")
+        os.environ["BID_WRITER_DISABLE_LLM"] = "1"
+        try:
+            project = self.production.create_project(
+                {"name": "签审测试", "industry": "学校", "source_text": "投标人必须编制主要施工方案与技术措施。"}
+            )
+            self.production.parse_requirements(project["id"])
+            outline = self.production.build_outline(project["id"])
+            generated = self.production.generate_section(project["id"], outline["sections"][3]["id"])
+
+            with self.assertRaisesRegex(ValueError, "必须逐项处理"):
+                self.production.confirm_draft(generated["draft_id"], "审核人")
+
+            confirmed = self.production.confirm_draft(
+                generated["draft_id"],
+                "审核人",
+                [{"index": 0, "resolution": "已复核，采用当前内容"}],
+            )
+            self.assertEqual(confirmed["resolved_confirmations"], 1)
+            detail = self.production.get_project(project["id"])
+            draft = next(item["draft"] for item in detail["sections"] if item["id"] == outline["sections"][3]["id"])
+            self.assertEqual(len(draft["confirmations"]), 1)
+            self.assertEqual(draft["confirmation_resolutions"][0]["resolver"], "审核人")
+            reviewed_section = next(item for item in detail["sections"] if item["id"] == outline["sections"][3]["id"])
+            self.assertEqual(reviewed_section["status"], "reviewed")
+
+            changed = self.production.update_draft(generated["draft_id"], generated["content"] + "\n新增内容。")
+            self.assertTrue(changed["quality_confirmations_invalidated"])
+            detail = self.production.get_project(project["id"])
+            changed_section = next(item for item in detail["sections"] if item["id"] == outline["sections"][3]["id"])
+            self.assertEqual(changed_section["status"], "drafted")
+            quality = self.production.quality_gate(project["id"])
+            self.assertEqual(quality["metrics"]["covered_requirements"], 0)
+            self.assertGreaterEqual(quality["metrics"]["unreviewed_drafts"], 1)
+        finally:
+            if old_disable is None:
+                os.environ.pop("BID_WRITER_DISABLE_LLM", None)
+            else:
+                os.environ["BID_WRITER_DISABLE_LLM"] = old_disable
+
+    def test_production_service_has_no_duplicate_methods(self) -> None:
+        source_path = Path(__file__).parents[1] / "bid_writer_v2" / "production" / "service.py"
+        module = ast.parse(source_path.read_text(encoding="utf-8"))
+        service = next(node for node in module.body if isinstance(node, ast.ClassDef) and node.name == "ProductionService")
+        methods = [node.name for node in service.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        duplicates = sorted({name for name in methods if methods.count(name) > 1})
+        self.assertEqual(duplicates, [])
+
     def test_http_status_uses_v2_database(self) -> None:
         app = create_app(self.settings)
         with TestClient(app) as client:
@@ -165,6 +225,37 @@ class V2WorkflowTest(unittest.TestCase):
             self.assertEqual(payload["version"], "2.0.0")
             self.assertEqual(payload["architecture"], "knowledge-engineering-first")
             self.assertFalse(payload["operations_enabled"])
+            self.assertIn("ai", payload)
+            self.assertEqual(client.get("/api/ai/metrics").status_code, 200)
+            self.assertEqual(client.get("/api/ai/runs").status_code, 200)
+            self.assertEqual(client.get("/api/ai/prompts").status_code, 200)
+            self.assertEqual(client.get("/api/evaluation/cases").status_code, 200)
+            self.assertEqual(client.get("/api/evaluation/runs").status_code, 200)
+            self.assertEqual(client.get("/api/knowledge-ai/metrics").status_code, 200)
+            self.assertEqual(client.get("/api/knowledge-ai/candidates").status_code, 200)
+            self.assertEqual(client.get("/api/knowledge-ai/tasks").status_code, 200)
+            metrics = client.get("/metrics")
+            self.assertEqual(metrics.status_code, 200)
+            self.assertIn("bid_writer_ai_runs", metrics.text)
+            self.assertIn("bid_writer_retrieval_latency_ms", metrics.text)
+            self.assertIn("bid_writer_audit_chain_valid", metrics.text)
+
+    def test_unhandled_errors_do_not_leak_internal_details(self) -> None:
+        app = create_app(self.settings)
+        app.state.knowledge.metrics = lambda: (_ for _ in ()).throw(RuntimeError("secret-path-and-sql"))
+        with TestClient(app, raise_server_exceptions=False) as client:
+            response = client.get("/api/status", headers={"X-Request-ID": "test-request-id"})
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["code"], "internal_error")
+        self.assertEqual(response.json()["request_id"], "test-request-id")
+        self.assertNotIn("secret-path-and-sql", response.text)
+
+    def test_unknown_api_uses_stable_json_error(self) -> None:
+        app = create_app(self.settings)
+        response = TestClient(app).get("/api/definitely-missing", headers={"X-Request-ID": "missing-test"})
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["code"], "http_404")
+        self.assertEqual(response.json()["request_id"], "missing-test")
 
 
 if __name__ == "__main__":

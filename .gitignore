@@ -24,6 +24,11 @@ venv/
 node_modules/
 dist/
 build/
+runtime/
+test-results/
+playwright-report/
+backups/
+sample-data/
 
 # Logs, temporary files and local IDE settings
 *.log

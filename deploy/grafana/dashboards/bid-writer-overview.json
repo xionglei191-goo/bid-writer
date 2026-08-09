@@ -1,0 +1,23 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {"type":"stat","title":"Pending jobs","targets":[{"expr":"bid_writer_jobs{status=\"pending\"} + bid_writer_jobs{status=\"retrying\"}","refId":"A"}],"gridPos":{"h":4,"w":4,"x":0,"y":0}},
+    {"type":"stat","title":"Failed jobs","targets":[{"expr":"bid_writer_jobs{status=\"failed\"}","refId":"A"}],"gridPos":{"h":4,"w":4,"x":4,"y":0}},
+    {"type":"stat","title":"AI failures","targets":[{"expr":"bid_writer_ai_runs{status=\"failed\"}","refId":"A"}],"gridPos":{"h":4,"w":4,"x":8,"y":0}},
+    {"type":"stat","title":"Published knowledge","targets":[{"expr":"bid_writer_published_knowledge","refId":"A"}],"gridPos":{"h":4,"w":4,"x":12,"y":0}},
+    {"type":"stat","title":"Storage","targets":[{"expr":"bid_writer_storage_healthy","refId":"A"}],"gridPos":{"h":4,"w":4,"x":16,"y":0}},
+    {"type":"stat","title":"Audit chain","targets":[{"expr":"bid_writer_audit_chain_valid","refId":"A"}],"gridPos":{"h":4,"w":4,"x":20,"y":0}},
+    {"type":"timeseries","title":"AI latency (ms)","targets":[{"expr":"bid_writer_ai_latency_ms","refId":"A"}],"gridPos":{"h":8,"w":8,"x":0,"y":4}},
+    {"type":"timeseries","title":"Retrieval latency (ms)","targets":[{"expr":"bid_writer_retrieval_latency_ms","refId":"A"}],"gridPos":{"h":8,"w":8,"x":8,"y":4}},
+    {"type":"timeseries","title":"AI tokens","targets":[{"expr":"bid_writer_ai_tokens_total","legendFormat":"{{direction}}","refId":"A"}],"gridPos":{"h":8,"w":8,"x":16,"y":4}}
+  ],
+  "schemaVersion": 40,
+  "tags": ["bid-writer"],
+  "templating": {"list": []},
+  "time": {"from":"now-6h","to":"now"},
+  "title": "Bid Writer Overview",
+  "uid": "bid-writer-overview",
+  "version": 1
+}

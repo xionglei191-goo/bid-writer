@@ -12,20 +12,16 @@ from ..settings import Settings
 from ..utils import normalize_text, write_text_atomic
 
 
-JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
-MODEL = "PaddleOCR-VL-1.5"
-
-
 def ocr_pdf(path: Path, source_id: int, settings: Settings) -> tuple[str, int]:
-    token = os.environ.get("PADDLE_OCR_TOKEN") or os.environ.get("OCR_TOKEN")
+    token = os.environ.get(settings.ocr_token_env)
     if not token:
-        raise RuntimeError("PADDLE_OCR_TOKEN未配置")
+        raise RuntimeError(f"{settings.ocr_token_env}未配置")
     reader = PdfReader(str(path))
     chunk_dir = settings.cache_root / "ocr_chunks" / str(source_id)
     chunk_dir.mkdir(parents=True, exist_ok=True)
     parts: list[str] = []
-    for start in range(0, len(reader.pages), 100):
-        end = min(start + 100, len(reader.pages))
+    for start in range(0, len(reader.pages), settings.ocr_chunk_pages):
+        end = min(start + settings.ocr_chunk_pages, len(reader.pages))
         chunk_path = chunk_dir / f"pages_{start + 1}_{end}.pdf"
         if not chunk_path.exists():
             writer = PdfWriter()
@@ -37,13 +33,13 @@ def ocr_pdf(path: Path, source_id: int, settings: Settings) -> tuple[str, int]:
         if result_path.exists():
             parts.append(result_path.read_text(encoding="utf-8"))
             continue
-        markdown = _run_job(chunk_path, token, start)
+        markdown = _run_job(chunk_path, token, start, settings)
         write_text_atomic(result_path, markdown)
         parts.append(markdown)
     return normalize_text("\n\n".join(parts)), len(reader.pages)
 
 
-def _run_job(path: Path, token: str, page_offset: int) -> str:
+def _run_job(path: Path, token: str, page_offset: int, settings: Settings) -> str:
     headers = {"Authorization": f"bearer {token}"}
     optional = {
         "useDocOrientationClassify": False,
@@ -52,16 +48,16 @@ def _run_job(path: Path, token: str, page_offset: int) -> str:
     }
     with path.open("rb") as handle:
         response = requests.post(
-            JOB_URL,
+            settings.ocr_job_url,
             headers=headers,
-            data={"model": MODEL, "optionalPayload": json.dumps(optional)},
+            data={"model": settings.ocr_model, "optionalPayload": json.dumps(optional)},
             files={"file": handle},
             timeout=180,
         )
     response.raise_for_status()
     job_id = response.json()["data"]["jobId"]
-    for _ in range(720):
-        status_response = requests.get(f"{JOB_URL}/{job_id}", headers=headers, timeout=60)
+    for _ in range(settings.ocr_max_polls):
+        status_response = requests.get(f"{settings.ocr_job_url}/{job_id}", headers=headers, timeout=60)
         status_response.raise_for_status()
         data = status_response.json()["data"]
         state = data["state"]
@@ -82,5 +78,5 @@ def _run_job(path: Path, token: str, page_offset: int) -> str:
             return "\n\n".join(blocks)
         if state == "failed":
             raise RuntimeError(data.get("errorMsg") or "OCR任务失败")
-        time.sleep(5)
+        time.sleep(settings.ocr_poll_interval_seconds)
     raise TimeoutError(f"OCR任务超时：{job_id}")

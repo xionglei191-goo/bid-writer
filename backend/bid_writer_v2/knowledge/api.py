@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from .service import KnowledgeService
+from ..utils import public_payload
 
 
 class ScanRequest(BaseModel):
@@ -14,12 +15,12 @@ class ScanRequest(BaseModel):
 
 
 class JobCreateRequest(BaseModel):
-    source_ids: list[int] = []
+    source_ids: list[int] = Field(default_factory=list)
     limit: int = Field(default=100, ge=1, le=1000)
 
 
 class RewriteRequest(BaseModel):
-    related_unit_ids: list[int] = []
+    related_unit_ids: list[int] = Field(default_factory=list)
 
 
 class ReviewRequest(BaseModel):
@@ -58,7 +59,7 @@ def build_router(service: KnowledgeService) -> APIRouter:
 
     @router.post("/sources/scan")
     def scan_sources(payload: ScanRequest) -> dict[str, Any]:
-        return service.scan_sources(limit=payload.limit, expand_archives=payload.expand_archives)
+        return public_payload(service.scan_sources(limit=payload.limit, expand_archives=payload.expand_archives))
 
     @router.get("/sources")
     def list_sources(
@@ -67,7 +68,7 @@ def build_router(service: KnowledgeService) -> APIRouter:
         limit: int = Query(default=100, ge=1, le=500),
         offset: int = Query(default=0, ge=0),
     ) -> dict[str, Any]:
-        return service.list_sources(status=status, query=query, limit=limit, offset=offset)
+        return public_payload(service.list_sources(status=status, query=query, limit=limit, offset=offset))
 
     @router.post("/jobs")
     def create_jobs(payload: JobCreateRequest) -> dict[str, Any]:
@@ -75,19 +76,19 @@ def build_router(service: KnowledgeService) -> APIRouter:
 
     @router.get("/jobs")
     def list_jobs(status: str = "", limit: int = Query(default=100, ge=1, le=500)) -> list[dict[str, Any]]:
-        return service.list_jobs(status=status, limit=limit)
+        return public_payload(service.list_jobs(status=status, limit=limit))
 
     @router.post("/jobs/{job_id}/run")
     def run_job(job_id: int) -> dict[str, Any]:
         try:
-            return service.run_job(job_id)
+            return public_payload(service.run_job(job_id))
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @router.post("/jobs/{job_id}/ocr")
     def run_ocr(job_id: int) -> dict[str, Any]:
         try:
-            return service.run_ocr(job_id)
+            return public_payload(service.run_ocr(job_id))
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -118,7 +119,7 @@ def build_router(service: KnowledgeService) -> APIRouter:
 
     @router.get("/documents")
     def list_documents(limit: int = Query(default=100, ge=1, le=500), offset: int = Query(default=0, ge=0)) -> dict[str, Any]:
-        return service.list_documents(limit=limit, offset=offset)
+        return public_payload(service.list_documents(limit=limit, offset=offset))
 
     @router.get("/units")
     def list_units(
@@ -156,12 +157,12 @@ def build_router(service: KnowledgeService) -> APIRouter:
 
     @router.get("/publications")
     def publications(limit: int = Query(default=100, ge=1, le=500)) -> list[dict[str, Any]]:
-        return service.list_publications(limit)
+        return public_payload(service.list_publications(limit))
 
     @router.post("/publications/{unit_id}")
     def publish(unit_id: int, payload: PublishRequest) -> dict[str, Any]:
         try:
-            return service.publish_unit(unit_id, payload.version_id, payload.publisher)
+            return public_payload(service.publish_unit(unit_id, payload.version_id, payload.publisher))
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -181,6 +182,6 @@ def build_router(service: KnowledgeService) -> APIRouter:
 
     @router.post("/search")
     def search(payload: SearchRequest) -> list[dict[str, Any]]:
-        return service.search(payload.query, payload.industry, payload.unit_type, payload.limit)
+        return public_payload(service.search(payload.query, payload.industry, payload.unit_type, payload.limit))
 
     return router

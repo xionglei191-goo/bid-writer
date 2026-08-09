@@ -1,0 +1,10 @@
+FROM python:3.13-slim-bookworm
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app/backend HF_HOME=/models HF_HUB_DISABLE_TELEMETRY=1
+WORKDIR /app
+COPY backend/requirements-embedding.txt /app/backend/requirements-embedding.txt
+RUN pip install --no-cache-dir -r /app/backend/requirements-embedding.txt
+COPY backend/embedding_server.py /app/backend/embedding_server.py
+RUN useradd --create-home --uid 10002 model && mkdir -p /models && chown -R model:model /models /app
+USER model
+EXPOSE 8090
+CMD ["uvicorn", "embedding_server:app", "--host", "0.0.0.0", "--port", "8090"]

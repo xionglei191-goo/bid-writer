@@ -8,6 +8,7 @@ import zipfile
 from pathlib import Path
 from typing import Any, Iterable
 
+from ..ai_runtime import AiRuntime, KNOWLEDGE_REWRITE_PROMPT
 from ..database import Database
 from ..llm import LlmClient
 from ..settings import Settings
@@ -41,10 +42,19 @@ def decode_archive_member_name(name: str, flag_bits: int = 0) -> str:
 
 
 class KnowledgeService:
-    def __init__(self, db: Database, settings: Settings, llm: LlmClient | None = None) -> None:
+    def __init__(
+        self,
+        db: Database,
+        settings: Settings,
+        llm: LlmClient | None = None,
+        ai_runtime: AiRuntime | None = None,
+    ) -> None:
         self.db = db
         self.settings = settings
         self.llm = llm or LlmClient()
+        self.ai_runtime = ai_runtime or AiRuntime(db, self.llm)
+        self.hybrid_search = None
+        self.on_publication_changed = None
 
     def scan_sources(self, limit: int | None = None, expand_archives: bool = True) -> dict[str, Any]:
         counters = {"scanned": 0, "created": 0, "updated": 0, "duplicates": 0, "archives": 0, "archive_failed": 0, "file_failed": 0, "unsupported": 0}
@@ -489,6 +499,70 @@ class KnowledgeService:
         })
         return unit_id
 
+    def create_unit_from_ai_candidate(self, candidate: dict[str, Any]) -> dict[str, Any]:
+        content = normalize_text(candidate["content"])
+        fingerprint = content_hash(content)
+        tags = candidate.get("tags") or []
+        with self.db.connect() as conn:
+            existing = conn.execute(
+                "SELECT id FROM knowledge_units WHERE content_fingerprint=? ORDER BY id LIMIT 1",
+                (fingerprint,),
+            ).fetchone()
+            if existing:
+                unit_id = int(existing["id"])
+                conn.execute(
+                    "INSERT OR IGNORE INTO knowledge_unit_sources(unit_id,section_id,source_id,excerpt) VALUES (?,?,?,?)",
+                    (unit_id, candidate["source_section_id"], candidate["source_id"], candidate["source_quote"][:500]),
+                )
+                return {"unit_id": unit_id, "created": False}
+            unit_key = content_hash(f"ai:{candidate['pipeline_run_id']}:{candidate['candidate_index']}:{fingerprint}")[:32]
+            cursor = conn.execute(
+                """
+                INSERT INTO knowledge_units(
+                    unit_key,unit_type,title,content,cleaned_content,industry,tags_json,risk_level,status,content_fingerprint
+                ) VALUES (?,?,?,?,?,?,?,?, 'review_required',?)
+                """,
+                (
+                    unit_key,
+                    candidate["unit_type"],
+                    candidate["title"],
+                    content,
+                    content,
+                    candidate.get("industry") or "通用",
+                    json.dumps(tags, ensure_ascii=False),
+                    candidate["risk_level"],
+                    fingerprint,
+                ),
+            )
+            unit_id = int(cursor.lastrowid)
+            conn.execute(
+                "INSERT INTO knowledge_unit_sources(unit_id,section_id,source_id,excerpt) VALUES (?,?,?,?)",
+                (unit_id, candidate["source_section_id"], candidate["source_id"], candidate["source_quote"][:500]),
+            )
+            conn.execute(
+                """
+                INSERT INTO knowledge_versions(unit_id,version_no,content,summary,origin,model,content_hash,status)
+                VALUES (?,1,?,?, 'ai_extract',?,?,'review_required')
+                """,
+                (unit_id, content, candidate.get("summary") or content[:200], candidate.get("model"), fingerprint),
+            )
+        self._write_unit_file(
+            unit_id,
+            {
+                "id": unit_id,
+                "unit_key": unit_key,
+                "unit_type": candidate["unit_type"],
+                "title": candidate["title"],
+                "industry": candidate.get("industry") or "通用",
+                "tags": tags,
+                "risk_level": candidate["risk_level"],
+                "status": "review_required",
+                "source_ids": [candidate["source_id"]],
+                "content": content,
+            },
+        )
+        return {"unit_id": unit_id, "created": True}
+
     @staticmethod
     def _split_sections(markdown: str, default_title: str) -> list[dict[str, Any]]:
         sections: list[dict[str, Any]] = []
@@ -661,18 +735,22 @@ class KnowledgeService:
 
     def rewrite_unit(self, unit_id: int, related_unit_ids: Iterable[int] = ()) -> dict[str, Any]:
         unit = self.get_unit(unit_id)
-        related = [self.get_unit(int(value)) for value in related_unit_ids if int(value) != unit_id]
+        related_ids = [int(value) for value in related_unit_ids if int(value) != unit_id]
+        related = [self.get_unit(value) for value in related_ids]
         source_material = "\n\n".join(
             f"## {item['title']}\n{item['cleaned_content']}" for item in [unit, *related]
         )
-        prompt = (
-            "请将以下历史技术标内容重构为可复用知识。删除具体项目、客户、地域、人员、设备数量和未经来源确认的承诺；"
-            "保留可验证的施工逻辑、工艺步骤、质量检查、安全措施和验收逻辑。输出JSON："
-            '{"title":"...","content":"Markdown正文","summary":"...","tags":["..."]}。\n\n'
-            f"资料：\n{source_material[:30000]}"
+        source_material = source_material[:30000]
+        prompt = KNOWLEDGE_REWRITE_PROMPT.render(source_material=source_material)
+        result = self.ai_runtime.execute(
+            KNOWLEDGE_REWRITE_PROMPT,
+            prompt,
+            {"unit_id": unit_id, "related_unit_ids": related_ids, "source_material": source_material},
+            task_type="knowledge_rewrite",
+            target_type="knowledge_unit",
+            target_id=unit_id,
         )
-        result = self.llm.generate("你是建设工程技术标知识工程专家。不得编造参数，不得把示意内容写成现场事实。", prompt)
-        payload = self.llm.json_payload(result.get("content", "")) if result.get("content") else None
+        payload = result.get("payload")
         content = normalize_text(str(payload.get("content", ""))) if payload else unit["cleaned_content"]
         title = str(payload.get("title") or unit["title"]) if payload else unit["title"]
         summary = str(payload.get("summary") or content[:200]) if payload else content[:200]
@@ -687,11 +765,20 @@ class KnowledgeService:
             version_id = int(cursor.lastrowid)
             conn.execute(
                 "UPDATE knowledge_units SET title=?, cleaned_content=?, tags_json=?, status='review_required', content_fingerprint=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (title, json.dumps(tags, ensure_ascii=False), digest, unit_id),
+                (title, content, json.dumps(tags, ensure_ascii=False), digest, unit_id),
             )
         draft_path = self.settings.knowledge_directories["drafts"] / f"{unit_id:07d}" / f"v{version_no}.md"
         write_text_atomic(draft_path, content)
-        return {"unit_id": unit_id, "version_id": version_id, "version_no": version_no, "content": content, "model": result.get("model"), "error": result.get("error", "")}
+        return {
+            "unit_id": unit_id,
+            "version_id": version_id,
+            "version_no": version_no,
+            "content": content,
+            "model": result.get("model"),
+            "ai_run_id": result.get("run_id"),
+            "cached": bool(result.get("cached")),
+            "error": result.get("error", ""),
+        }
 
     def review_unit(self, unit_id: int, version_id: int, action: str, reviewer: str, notes: str = "") -> dict[str, Any]:
         if action not in {"approve", "reject"}:
@@ -718,6 +805,17 @@ class KnowledgeService:
     def publish_unit(self, unit_id: int, version_id: int, publisher: str) -> dict[str, Any]:
         if not publisher.strip():
             raise ValueError("发布人不能为空")
+        existing = self.db.row(
+            "SELECT id,publication_version,file_path FROM knowledge_publications WHERE unit_id=? AND version_id=? AND status='published' ORDER BY id DESC LIMIT 1",
+            (unit_id, version_id),
+        )
+        if existing:
+            return {
+                "publication_id": int(existing["id"]),
+                "unit_id": unit_id,
+                "version": int(existing["publication_version"]),
+                "file_path": existing["file_path"],
+            }
         with self.db.connect() as conn:
             version = conn.execute(
                 "SELECT v.*,u.title,u.tags_json,u.industry,u.unit_type,u.unit_key FROM knowledge_versions v JOIN knowledge_units u ON u.id=v.unit_id WHERE v.id=? AND v.unit_id=?",
@@ -747,13 +845,12 @@ class KnowledgeService:
                 (unit_id, version_id, publication_version, publisher.strip(), str(publication_path), version["content_hash"]),
             )
             publication_id = int(cursor.lastrowid)
-            conn.execute("DELETE FROM published_units_fts WHERE unit_id=?", (unit_id,))
-            conn.execute(
-                "INSERT INTO published_units_fts(unit_id,title,content,tags,industry,unit_type) VALUES (?,?,?,?,?,?)",
-                (unit_id, version["title"], version["content"], version["tags_json"], version["industry"] or "通用", version["unit_type"]),
-            )
+            self._replace_sqlite_fts(conn, unit_id, version)
             conn.execute("UPDATE knowledge_units SET status='published', updated_at=CURRENT_TIMESTAMP WHERE id=?", (unit_id,))
-        return {"publication_id": publication_id, "unit_id": unit_id, "version": publication_version, "file_path": str(publication_path)}
+        result = {"publication_id": publication_id, "unit_id": unit_id, "version": publication_version, "file_path": str(publication_path)}
+        if self.on_publication_changed:
+            self.on_publication_changed("published", result)
+        return result
 
     def retire_publication(self, publication_id: int, reviewer: str) -> dict[str, Any]:
         with self.db.connect() as conn:
@@ -762,14 +859,17 @@ class KnowledgeService:
                 raise KeyError("发布记录不存在")
             unit_id = int(publication["unit_id"])
             conn.execute("UPDATE knowledge_publications SET status='retired', retired_at=CURRENT_TIMESTAMP WHERE id=?", (publication_id,))
-            conn.execute("DELETE FROM published_units_fts WHERE unit_id=?", (unit_id,))
+            self._delete_sqlite_fts(conn, unit_id)
             conn.execute("UPDATE knowledge_units SET status='approved', updated_at=CURRENT_TIMESTAMP WHERE id=?", (unit_id,))
             version_id = int(publication["version_id"])
             conn.execute(
                 "INSERT INTO knowledge_reviews(unit_id,version_id,action,reviewer,notes) VALUES (?,?, 'retire', ?, '停用发布版本')",
                 (unit_id, version_id, reviewer or "系统管理员"),
             )
-        return {"publication_id": publication_id, "status": "retired"}
+        result = {"publication_id": publication_id, "unit_id": unit_id, "status": "retired"}
+        if self.on_publication_changed:
+            self.on_publication_changed("retired", result)
+        return result
 
     def restore_publication(self, publication_id: int, reviewer: str) -> dict[str, Any]:
         with self.db.connect() as conn:
@@ -787,17 +887,29 @@ class KnowledgeService:
             unit_id = int(publication["unit_id"])
             conn.execute("UPDATE knowledge_publications SET status='retired',retired_at=CURRENT_TIMESTAMP WHERE unit_id=? AND status='published'", (unit_id,))
             conn.execute("UPDATE knowledge_publications SET status='published',retired_at=NULL WHERE id=?", (publication_id,))
-            conn.execute("DELETE FROM published_units_fts WHERE unit_id=?", (unit_id,))
-            conn.execute(
-                "INSERT INTO published_units_fts(unit_id,title,content,tags,industry,unit_type) VALUES (?,?,?,?,?,?)",
-                (unit_id, publication["title"], publication["content"], publication["tags_json"], publication["industry"] or "通用", publication["unit_type"]),
-            )
+            self._replace_sqlite_fts(conn, unit_id, publication)
             conn.execute("UPDATE knowledge_units SET status='published',updated_at=CURRENT_TIMESTAMP WHERE id=?", (unit_id,))
             conn.execute(
                 "INSERT INTO knowledge_reviews(unit_id,version_id,action,reviewer,notes) VALUES (?,?, 'restore', ?, '恢复历史发布版本')",
                 (unit_id, publication["version_id"], reviewer or "系统管理员"),
             )
-        return {"publication_id": publication_id, "unit_id": unit_id, "status": "published"}
+        result = {"publication_id": publication_id, "unit_id": unit_id, "status": "published"}
+        if self.on_publication_changed:
+            self.on_publication_changed("restored", result)
+        return result
+
+    def _delete_sqlite_fts(self, conn: Any, unit_id: int) -> None:
+        if self.db.backend == "sqlite":
+            conn.execute("DELETE FROM published_units_fts WHERE unit_id=?", (unit_id,))
+
+    def _replace_sqlite_fts(self, conn: Any, unit_id: int, item: dict[str, Any]) -> None:
+        if self.db.backend != "sqlite":
+            return
+        self._delete_sqlite_fts(conn, unit_id)
+        conn.execute(
+            "INSERT INTO published_units_fts(unit_id,title,content,tags,industry,unit_type) VALUES (?,?,?,?,?,?)",
+            (unit_id, item["title"], item["content"], item["tags_json"], item["industry"] or "通用", item["unit_type"]),
+        )
 
     def list_publications(self, limit: int = 100) -> list[dict[str, Any]]:
         with self.db.connect() as conn:
@@ -816,6 +928,8 @@ class KnowledgeService:
     def search(self, query: str, industry: str = "", unit_type: str = "", limit: int = 12) -> list[dict[str, Any]]:
         if not query.strip():
             return []
+        if self.hybrid_search:
+            return self.hybrid_search(query, industry, unit_type, limit)
         domain_terms = [
             value for value in ["施工", "工艺", "质量", "安全", "进度", "工期", "平面", "资源", "人员", "机械", "材料", "重点", "难点", "技术", "管理", "基坑", "防水", "混凝土", "钢筋", "模板"]
             if value in query

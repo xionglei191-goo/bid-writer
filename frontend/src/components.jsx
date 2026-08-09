@@ -11,8 +11,8 @@ export function Metric({ label, value, tone = "default", hint }) {
 
 export function Status({ value }) {
   const normalized = String(value || "pending").toLowerCase();
-  const labels = { discovered: "待处理", pending: "等待中", paused: "已暂停", running: "处理中", waiting_ocr: "等待OCR", completed: "已完成", processed: "已处理", failed: "失败", duplicate: "重复", skipped: "已跳过", review_required: "待审核", approved: "已批准", rejected: "已退回", published: "已发布", retired: "已停用", draft: "草稿", drafted: "已生成", reviewed: "已确认", asset: "素材", archive: "压缩包", metadata_only: "仅登记" };
-  const tone = ["completed", "processed", "approved", "published"].includes(normalized) ? "success" : ["failed", "rejected"].includes(normalized) ? "danger" : ["running", "waiting_ocr", "review_required"].includes(normalized) ? "warning" : "neutral";
+  const labels = { discovered: "待处理", pending: "等待中", paused: "已暂停", running: "处理中", waiting_ocr: "等待OCR", completed: "已完成", completed_with_exceptions: "带异常完成", superseded: "已被新运行替代", processed: "已处理", succeeded: "成功", cached: "缓存命中", failed: "失败", duplicate: "重复", skipped: "已跳过", review_required: "待审核", proposed: "待抽检", ready: "可批量接收", needs_review: "异常待办", accepted: "已接收", approved: "已批准", rejected: "已退回", published: "已发布", retired: "已停用", pass: "复核通过", revise: "建议修订", escalate: "升级复核", missing: "复核缺失", draft: "草稿", drafted: "已生成", reviewed: "已确认", asset: "素材", archive: "压缩包", metadata_only: "仅登记", supported: "证据充分", unsupported: "证据不足", confirmed: "人工确认", resolved: "已处理", invalidated: "已失效", blocked: "已阻断", not_applicable: "无需证据", cancelled: "已取消", retrying: "重试中" };
+  const tone = ["completed", "processed", "succeeded", "cached", "ready", "accepted", "pass", "approved", "published", "supported", "confirmed", "resolved"].includes(normalized) ? "success" : ["failed", "rejected", "escalate", "unsupported", "blocked", "invalidated"].includes(normalized) ? "danger" : ["running", "retrying", "waiting_ocr", "review_required", "needs_review", "revise", "missing"].includes(normalized) ? "warning" : "neutral";
   return <span className={`status status-${tone}`}>{labels[normalized] || value || "待处理"}</span>;
 }
 
