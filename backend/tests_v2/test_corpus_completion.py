@@ -279,6 +279,34 @@ class CorpusCompletionTest(unittest.TestCase):
         self.assertEqual(ai_state, {"status": "failed", "error_code": "worker_restart"})
         self.assertEqual(pipeline_state["status"], "completed_with_exceptions")
 
+    def test_orphan_candidate_review_is_closed_after_pipeline_candidates_are_terminal(self) -> None:
+        document_id = self._document("candidate-orphan.md", "候选复核中断", "施工前复核条件，完成后按标准验收。")
+        with self.db.connect() as conn:
+            pipeline_id = int(conn.execute(
+                """
+                INSERT INTO knowledge_ai_pipeline_runs(document_id,pipeline_key,input_hash,status,completed_at)
+                VALUES (?,?,?,'completed',CURRENT_TIMESTAMP)
+                """,
+                (document_id, "terminal-candidate-pipeline", "input"),
+            ).lastrowid)
+            ai_id = int(conn.execute(
+                """
+                INSERT INTO ai_runs(
+                    task_type,target_type,target_id,prompt_key,prompt_version,prompt_hash,
+                    input_hash,cache_key,status
+                ) VALUES ('knowledge_technical_revision','knowledge_candidate_batch',?,
+                    'fixture','1','p','i','terminal-candidate-ai','running')
+                """,
+                (pipeline_id,),
+            ).lastrowid)
+        run = self.corpus.create_run()
+
+        self.corpus._recover_stale_items(run["id"])
+
+        state = self.db.row("SELECT status,error_code,error_message FROM ai_runs WHERE id=?", (ai_id,))
+        self.assertEqual((state["status"], state["error_code"]), ("failed", "worker_restart"))
+        self.assertIn("无可执行候选", state["error_message"])
+
     def test_ocr_step_processes_one_new_chunk_and_resumes_from_cache(self) -> None:
         pdf = self.settings.raw_root / "three-pages.pdf"
         writer = PdfWriter()
@@ -665,6 +693,7 @@ class CorpusCompletionTest(unittest.TestCase):
             (run["id"], source_id),
         )
         self.assertEqual(result["status"], "running")
+        self.assertEqual(result["checkpoint"]["service_recovery_probe"]["status"], "passed")
         self.assertEqual(item, {"status": "retrying", "error_code": "service_recovery", "next_retry_at": None})
 
 

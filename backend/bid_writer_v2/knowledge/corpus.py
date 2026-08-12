@@ -347,7 +347,8 @@ class CorpusCompletionService:
         run = self._raw_run(run_id)
         if run["status"] == "paused" and str(run.get("pause_reason") or "").startswith("外部服务错误") and preferred_stage == "__recovery__":
             pause_started_at = str(run.get("updated_at") or iso_now())
-            recovery_stage = str(parse_json(run.get("checkpoint_json"), {}).get("service_pause_stage") or "")
+            checkpoint = parse_json(run.get("checkpoint_json"), {})
+            recovery_stage = str(checkpoint.get("service_pause_stage") or "")
             if not recovery_stage:
                 failed_stage = self.db.row(
                     """
@@ -377,7 +378,6 @@ class CorpusCompletionService:
                     16,
                 )
                 if probe.get("error") or not str(probe.get("content") or "").strip():
-                    checkpoint = parse_json(run.get("checkpoint_json"), {})
                     checkpoint["service_recovery_probe"] = {
                         "stage": recovery_stage,
                         "status": "failed",
@@ -396,10 +396,17 @@ class CorpusCompletionService:
                     if self.dispatch:
                         self.dispatch(run_id, 15 * 60 * 1000, 1, "__recovery__")
                     return self.get_run(run_id)
+                checkpoint["service_recovery_probe"] = {
+                    "stage": recovery_stage,
+                    "status": "passed",
+                    "checked_at": iso_now(),
+                    "model": str(probe.get("model") or ""),
+                    "latency_ms": int(probe.get("latency_ms") or 0),
+                }
             with self.db.connect() as conn:
                 conn.execute(
-                    "UPDATE corpus_runs SET status='running',pause_reason='',consecutive_errors=0,recent_results_json='[]',updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (run_id,),
+                    "UPDATE corpus_runs SET status='running',pause_reason='',consecutive_errors=0,recent_results_json='[]',checkpoint_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (json.dumps(checkpoint, ensure_ascii=False), run_id),
                 )
             run = self._raw_run(run_id)
             preferred_stage = recovery_stage
@@ -1680,6 +1687,23 @@ class CorpusCompletionService:
         future_cutoff = (utc_now() + timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
         cutoff = (utc_now() - timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S")
         with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE ai_runs SET status='failed',error_code='worker_restart',
+                    error_message='候选流水线已闭环且无可执行候选，孤立模型调用已自动闭环',
+                    completed_at=CURRENT_TIMESTAMP
+                WHERE status='running' AND target_type='knowledge_candidate_batch'
+                  AND EXISTS (
+                      SELECT 1 FROM knowledge_ai_pipeline_runs p
+                      WHERE p.id=ai_runs.target_id AND p.status<>'running'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM knowledge_ai_candidates c
+                      WHERE c.pipeline_run_id=ai_runs.target_id
+                        AND c.status IN ('ready','needs_review')
+                  )
+                """
+            )
             conn.execute(
                 """
                 UPDATE ai_runs SET status='failed',error_code='worker_restart',
