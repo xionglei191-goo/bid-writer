@@ -55,6 +55,19 @@ class CorpusCompletionTest(unittest.TestCase):
                 (str(path), name, path.name, extension, 7, content_hash(name), path.stem, "raw", duplicate_of, status),
             ).lastrowid)
 
+    def _document(self, name: str, title: str, content: str) -> int:
+        source_id = self._source(name, Path(name).suffix, "processed")
+        with self.db.connect() as conn:
+            document_id = int(conn.execute(
+                "INSERT INTO standard_documents(source_id,title,markdown_path,parser,char_count,text_fingerprint) VALUES (?,?,?,?,?,?)",
+                (source_id, title, name + ".md", "fixture", len(content), content_hash(content)),
+            ).lastrowid)
+            conn.execute(
+                "INSERT INTO document_sections(document_id,order_no,level,heading,content,content_fingerprint) VALUES (?,1,1,?,?,?)",
+                (document_id, title, content, content_hash(content)),
+            )
+        return document_id
+
     def test_snapshot_assigns_every_source_an_auditable_state(self) -> None:
         original = self._source("text.docx", ".docx")
         self._source("copy.docx", ".docx", "duplicate", original)
@@ -106,6 +119,81 @@ class CorpusCompletionTest(unittest.TestCase):
         self.assertIn("需要逐字核验的来源引文", context)
         self.assertIn("[CANDIDATE:9]", context)
         self.assertLess(len(context), 5000)
+
+    def test_visual_only_document_is_closed_without_model_review(self) -> None:
+        document_id = self._document(
+            "drawing.md",
+            "附图-施工现场平面布置图",
+            "![施工现场平面布置图](/workspace/knowledge/fixtures/image_1.png)",
+        )
+        self.assertEqual(
+            self.corpus._deterministic_non_reusable_reason(document_id),
+            "visual_only_without_reusable_text",
+        )
+
+    def test_short_actionable_technical_text_is_not_excluded(self) -> None:
+        content = (
+            "施工前核对图纸、技术标准和现场条件，形成书面复核记录；"
+            "作业完成后按验收标准逐项检查，检查合格并经批准后方可进入下一工序。"
+        )
+        document_id = self._document("measure.md", "施工复核与验收措施", content)
+        self.assertEqual(self.corpus._deterministic_non_reusable_reason(document_id), "")
+
+    def test_single_page_historical_drawing_is_archived_without_ocr(self) -> None:
+        source_id = self._source("建方 01-总平面图.pdf", ".pdf")
+        run = self.corpus.create_run()
+        with self.db.connect() as conn:
+            job_id = int(conn.execute(
+                "INSERT INTO processing_jobs(source_id,job_type,status,current_step,checkpoint_json) VALUES (?,'normalize','waiting_ocr','ocr',?)",
+                (source_id, '{"page_count": 1}'),
+            ).lastrowid)
+            conn.execute(
+                "UPDATE corpus_run_items SET stage='ocr',status='running',processing_job_id=? WHERE run_id=? AND source_id=?",
+                (job_id, run["id"], source_id),
+            )
+        item = self.db.row(
+            "SELECT i.*,s.file_name FROM corpus_run_items i JOIN source_files s ON s.id=i.source_id WHERE i.run_id=? AND i.source_id=?",
+            (run["id"], source_id),
+        )
+        self.knowledge.run_ocr = lambda *_args, **_kwargs: self.fail("historical drawing must not be uploaded to OCR")
+        self.corpus._ocr_item(item)
+        state = self.db.row("SELECT status,terminal_reason,checkpoint_json FROM corpus_run_items WHERE id=?", (item["id"],))
+        job = self.db.row("SELECT status,current_step FROM processing_jobs WHERE id=?", (job_id,))
+        self.assertEqual((state["status"], state["terminal_reason"]), ("terminal", "no_reusable_knowledge"))
+        self.assertEqual((job["status"], job["current_step"]), ("skipped", "archived_visual"))
+
+    def test_single_page_record_is_still_sent_to_ocr(self) -> None:
+        source_id = self._source("单位工程质量竣工验收记录表.pdf", ".pdf")
+        with self.db.connect() as conn:
+            job_id = int(conn.execute(
+                "INSERT INTO processing_jobs(source_id,job_type,status,current_step,checkpoint_json) VALUES (?,'normalize','waiting_ocr','ocr',?)",
+                (source_id, '{"page_count": 1}'),
+            ).lastrowid)
+        self.assertFalse(self.corpus._is_historical_single_page_visual({"file_name": "单位工程质量竣工验收记录表.pdf"}, job_id))
+
+    def test_stale_ai_and_pipeline_records_are_closed_after_restart(self) -> None:
+        document_id = self._document("stale.md", "中断任务", "施工前复核条件，完成后按标准验收。")
+        with self.db.connect() as conn:
+            ai_run_id = int(conn.execute(
+                """
+                INSERT INTO ai_runs(task_type,prompt_key,prompt_version,prompt_hash,input_hash,cache_key,status,created_at)
+                VALUES ('fixture','fixture','1','p','i','c','running',datetime('now','-3 hours'))
+                """
+            ).lastrowid)
+            pipeline_run_id = int(conn.execute(
+                """
+                INSERT INTO knowledge_ai_pipeline_runs(document_id,pipeline_key,input_hash,status,extraction_ai_run_id,created_at)
+                VALUES (?,?,?,'running',?,datetime('now','-3 hours'))
+                """,
+                (document_id, "stale-fixture", "input", ai_run_id),
+            ).lastrowid)
+        run = self.corpus.create_run()
+        self.corpus._recover_stale_items(run["id"])
+        ai_state = self.db.row("SELECT status,error_code FROM ai_runs WHERE id=?", (ai_run_id,))
+        pipeline_state = self.db.row("SELECT status,error_message FROM knowledge_ai_pipeline_runs WHERE id=?", (pipeline_run_id,))
+        self.assertEqual(ai_state, {"status": "failed", "error_code": "worker_restart"})
+        self.assertEqual(pipeline_state["status"], "completed_with_exceptions")
+        self.assertIn("后台进程中断", pipeline_state["error_message"])
 
     def test_manual_asset_resolution_requires_explicit_approve_or_exclude(self) -> None:
         source_id = self._source("batch/table.xlsx", ".xlsx", "asset")

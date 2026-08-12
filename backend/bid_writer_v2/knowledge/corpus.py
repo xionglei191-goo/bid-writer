@@ -51,6 +51,15 @@ BLOCK_PATTERNS = (
     ("provenance_disclosure", r"(?:AI生成|模型生成|历史项目素材|来源路径)"),
     ("absolute_commitment", r"(?:确保|保证).{0,12}(?:100%|零事故|绝不|全部)|完全避免"),
 )
+SCANNED_VISUAL_TITLE_PATTERN = re.compile(
+    r"(?:封面|封皮|平面图|立面图|剖面图|布置图|系统图|示意图|配筋图|机构图|效果图|"
+    r"曲线图|流程图|网络图|进度图|横道图|节点图|大样图|详图|总图|施工图)",
+    re.IGNORECASE,
+)
+SCANNED_TEXTUAL_TITLE_PATTERN = re.compile(
+    r"(?:审查|意见|记录|报告|说明|方案|文本|合同|要求|清单|验收|推荐|申报|表格)",
+    re.IGNORECASE,
+)
 
 
 def utc_now() -> datetime:
@@ -420,7 +429,7 @@ class CorpusCompletionService:
         return None
 
     def _claim_ai_batch(self, item: dict[str, Any]) -> list[dict[str, Any]]:
-        """Claim up to four short AI items without increasing AI concurrency.
+        """Claim up to twelve short AI items without increasing AI concurrency.
 
         The items run in one model request pair and remain independently
         checkpointed.  Long documents keep the existing chunked path.
@@ -513,6 +522,16 @@ class CorpusCompletionService:
             "SELECT * FROM processing_jobs WHERE source_id=? ORDER BY id DESC LIMIT 1",
             (item["source_id"],),
         )
+        if job and str(job.get("status") or "") == "skipped":
+            checkpoint = parse_json(job.get("checkpoint_json"), {})
+            if checkpoint.get("exclusion_reason") == "historical_single_page_visual_archived":
+                self._terminal(
+                    item,
+                    "no_reusable_knowledge",
+                    processing_job_id=int(job["id"]),
+                    checkpoint={"reason": checkpoint["exclusion_reason"], "gate": "scanned_visual_archive"},
+                )
+                return
         if not job or str(job["status"]) in {"failed", "completed", "skipped", "cancelled"}:
             created = self.knowledge.create_jobs([int(item["source_id"])], 1)
             if created["job_ids"]:
@@ -545,6 +564,38 @@ class CorpusCompletionService:
             if not job:
                 raise RuntimeError("OCR任务不存在")
             job_id = int(job["id"])
+        if self._is_historical_single_page_visual(item, job_id):
+            checkpoint = {
+                "page_count": 1,
+                "exclusion_reason": "historical_single_page_visual_archived",
+                "governance": "archived_not_searchable",
+            }
+            source = self.db.row("SELECT * FROM source_files WHERE id=?", (item["source_id"],)) or item
+            path = self.knowledge.resolve_source_path(source)
+            self._upsert_asset(
+                source,
+                path,
+                "scanned_pdf_visual",
+                str(source.get("sha256") or item.get("source_hash") or sha256_file(path)),
+                "",
+                0,
+                0,
+                {"extension": ".pdf", "page_count": 1, "classification": "historical_visual"},
+                "archived",
+                "历史单页图纸，无可复用正文且不进入检索",
+            )
+            with self.db.connect() as conn:
+                conn.execute(
+                    "UPDATE processing_jobs SET status='skipped',progress=100,current_step='archived_visual',checkpoint_json=?,error_message=NULL,finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (json.dumps(checkpoint, ensure_ascii=False), job_id),
+                )
+            self._terminal(
+                item,
+                "no_reusable_knowledge",
+                processing_job_id=job_id,
+                checkpoint={"reason": checkpoint["exclusion_reason"], "gate": "scanned_visual_archive"},
+            )
+            return
         result = self.knowledge.run_ocr(job_id, create_rule_units=False)
         if result.get("status") != "completed":
             raise RuntimeError(str(result.get("error") or f"OCR状态为{result.get('status')}"))
@@ -552,6 +603,16 @@ class CorpusCompletionService:
             self._terminal(item, "content_duplicate", processing_job_id=job_id, document_id=int(result["document_id"]))
             return
         self._advance(item, "ai", processing_job_id=job_id, document_id=int(result["document_id"]))
+
+    def _is_historical_single_page_visual(self, item: dict[str, Any], job_id: int) -> bool:
+        job = self.db.row("SELECT checkpoint_json FROM processing_jobs WHERE id=?", (job_id,)) or {}
+        checkpoint = parse_json(job.get("checkpoint_json"), {})
+        if int(checkpoint.get("page_count") or 0) != 1:
+            return False
+        if str(item.get("source_kind") or "") == "system_generated":
+            return False
+        title = normalize_text(Path(str(item.get("file_name") or "")).stem)
+        return bool(SCANNED_VISUAL_TITLE_PATTERN.search(title)) and not bool(SCANNED_TEXTUAL_TITLE_PATTERN.search(title))
 
     def _govern_asset(self, item: dict[str, Any]) -> None:
         source = self.db.row("SELECT * FROM source_files WHERE id=?", (item["source_id"],)) or item
@@ -649,6 +710,15 @@ class CorpusCompletionService:
             if not row:
                 raise RuntimeError("标准文档不存在")
             document_id = int(row["id"])
+        non_reusable_reason = self._deterministic_non_reusable_reason(document_id)
+        if non_reusable_reason:
+            self._terminal(
+                item,
+                "no_reusable_knowledge",
+                document_id=document_id,
+                checkpoint={"reason": non_reusable_reason, "gate": "deterministic_non_text"},
+            )
+            return
         duplicate = self.db.row(
             "SELECT id,source_id FROM standard_documents WHERE text_fingerprint=(SELECT text_fingerprint FROM standard_documents WHERE id=?) AND id<>? ORDER BY id LIMIT 1",
             (document_id, document_id),
@@ -694,6 +764,15 @@ class CorpusCompletionService:
                 if not row:
                     raise RuntimeError("standard document does not exist")
                 document_id = int(row["id"])
+            non_reusable_reason = self._deterministic_non_reusable_reason(document_id)
+            if non_reusable_reason:
+                self._terminal(
+                    item,
+                    "no_reusable_knowledge",
+                    document_id=document_id,
+                    checkpoint={"reason": non_reusable_reason, "gate": "deterministic_non_text"},
+                )
+                continue
             duplicate = self.db.row(
                 """
                 SELECT id,source_id FROM standard_documents
@@ -757,6 +836,43 @@ class CorpusCompletionService:
                     "batch_totals": {"published": published, "legal": legal, "rejected": rejected},
                 },
             )
+
+    def _deterministic_non_reusable_reason(self, document_id: int) -> str:
+        document = self.db.row(
+            "SELECT title,char_count FROM standard_documents WHERE id=?",
+            (document_id,),
+        ) or {}
+        char_count = int(document.get("char_count") or 0)
+        if char_count > 700:
+            return ""
+        sections = self.db.rows(
+            "SELECT heading,content FROM document_sections WHERE document_id=? ORDER BY order_no",
+            (document_id,),
+        )
+        content = "\n".join(str(section.get("content") or "") for section in sections)
+        has_visual_markup = bool(
+            re.search(r"!\[[^\]]*\]\([^)]+\)|<img\b|/workspace/knowledge/.+?/image_\d+", content, re.IGNORECASE)
+        )
+        cleaned = re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", content)
+        cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+        cleaned = re.sub(r"/workspace/\S+", " ", cleaned)
+        cleaned = re.sub(r"\s+", "", cleaned)
+        meaningful_han = len(re.findall(r"[\u4e00-\u9fff]", cleaned))
+        title = normalize_text(str(document.get("title") or ""))
+        visual_title = bool(
+            re.search(
+                r"(?:^|[-_：:])(?:附图|封面|封皮|目录|COVER)|(?:布置图|系统图|示意图|机构图|效果图|流程图|曲线)$",
+                title,
+                re.IGNORECASE,
+            )
+        )
+        if has_visual_markup and meaningful_han < 80:
+            return "visual_only_without_reusable_text"
+        if visual_title and meaningful_han < 120:
+            return "cover_directory_or_drawing_without_reusable_text"
+        if char_count < 80 and meaningful_han < 40:
+            return "insufficient_reusable_text"
+        return ""
 
     def _prepare_representative_sections(self, run_id: int, document_id: int) -> list[int]:
         sections = self.db.rows(
@@ -1374,8 +1490,36 @@ class CorpusCompletionService:
             )
 
     def _recover_stale_items(self, run_id: int) -> None:
+        # A model request may legitimately spend up to an hour across transport
+        # and one schema-repair retry.  Use a conservative two-hour orphan
+        # window so concurrent API work is never closed while still active.
+        ai_cutoff = (utc_now() - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
         cutoff = (utc_now() - timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S")
         with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE ai_runs SET status='failed',error_code='worker_restart',
+                    error_message='后台进程中断，模型调用记录已自动闭环',completed_at=CURRENT_TIMESTAMP
+                WHERE status='running' AND created_at<?
+                """,
+                (ai_cutoff,),
+            )
+            conn.execute(
+                """
+                UPDATE knowledge_ai_pipeline_runs SET status='completed_with_exceptions',
+                    error_message='后台进程中断，流水线记录已自动闭环',completed_at=CURRENT_TIMESTAMP
+                WHERE status='running' AND created_at<?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM ai_runs a
+                      WHERE a.status='running' AND a.id IN (
+                          knowledge_ai_pipeline_runs.extraction_ai_run_id,
+                          knowledge_ai_pipeline_runs.review_ai_run_id,
+                          knowledge_ai_pipeline_runs.adjudication_ai_run_id
+                      )
+                  )
+                """,
+                (ai_cutoff,),
+            )
             conn.execute(
                 """
                 UPDATE corpus_run_items SET status='retrying',error_code='stale_worker',
