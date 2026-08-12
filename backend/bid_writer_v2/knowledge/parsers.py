@@ -140,11 +140,22 @@ def _convert_doc(path: Path, target_dir: Path) -> Path:
     target_dir.mkdir(parents=True, exist_ok=True)
     libreoffice = shutil.which("soffice") or shutil.which("libreoffice")
     if libreoffice:
+        profile_dir = target_dir / "libreoffice_profile"
+        profile_dir.mkdir(parents=True, exist_ok=True)
         subprocess.run(
-            [libreoffice, "--headless", "--convert-to", "docx", "--outdir", str(target_dir), str(path)],
+            [
+                libreoffice,
+                f"-env:UserInstallation={profile_dir.resolve().as_uri()}",
+                "--headless",
+                "--convert-to",
+                "docx",
+                "--outdir",
+                str(target_dir),
+                str(path),
+            ],
             check=True,
             capture_output=True,
-            timeout=180,
+            timeout=600,
         )
         output = target_dir / f"{path.stem}.docx"
         if output.exists():

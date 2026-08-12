@@ -147,7 +147,10 @@ class KnowledgeCandidateReview(BaseModel):
         reason = str(normalized.pop("reason", "") or "").strip()
         if normalized.get("confidence") is None:
             normalized["confidence"] = 0
-        if normalized.get("corrected_content") is None:
+        corrected = normalized.get("corrected_content")
+        if isinstance(corrected, dict):
+            normalized["corrected_content"] = str(corrected.get("content") or "")
+        elif corrected is None:
             normalized["corrected_content"] = ""
         issues = normalized.get("issues")
         if isinstance(issues, list):

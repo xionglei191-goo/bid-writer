@@ -188,7 +188,9 @@ class CorpusCompletionService:
                 self._terminal(item, "no_reusable_knowledge")
             self._record_result(run_id, True, "")
         except Exception as exc:  # noqa: BLE001
-            service_error = any(marker in f"{type(exc).__name__}: {exc}".lower() for marker in SERVICE_ERROR_MARKERS)
+            service_error = str(item["stage"]) in {"ai", "ocr"} and any(
+                marker in f"{type(exc).__name__}: {exc}".lower() for marker in SERVICE_ERROR_MARKERS
+            )
             self._handle_failure(item, exc, service_error=service_error)
             self._record_result(run_id, not service_error, f"{type(exc).__name__}: {exc}")
         summary = self._refresh(run_id)
@@ -329,9 +331,10 @@ class CorpusCompletionService:
         asset_type = "document_asset"
         if extension in {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff"}:
             asset_type = "image"
-            from PIL import Image, ImageStat
+            from PIL import Image, ImageFile, ImageStat
             import imagehash
 
+            ImageFile.LOAD_TRUNCATED_IMAGES = True
             with Image.open(path) as image:
                 width, height = image.size
                 perceptual = str(imagehash.phash(image.convert("RGB")))

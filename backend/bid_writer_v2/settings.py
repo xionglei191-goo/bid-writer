@@ -49,7 +49,7 @@ class Settings:
     ocr_job_url: str = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
     ocr_model: str = "PaddleOCR-VL-1.5"
     ocr_token_env: str = "PADDLEOCR_TOKEN"
-    ocr_chunk_pages: int = 100
+    ocr_chunk_pages: int = 20
     ocr_poll_interval_seconds: float = 5.0
     ocr_max_polls: int = 720
 
@@ -98,7 +98,7 @@ class Settings:
             ocr_job_url=(os.environ.get("BID_WRITER_OCR_URL") or os.environ.get("PADDLEOCR_JOB_URL") or "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs").rstrip("/"),
             ocr_model=os.environ.get("BID_WRITER_OCR_MODEL") or os.environ.get("PADDLEOCR_MODEL") or "PaddleOCR-VL-1.5",
             ocr_token_env=os.environ.get("BID_WRITER_OCR_TOKEN_ENV", "PADDLEOCR_TOKEN"),
-            ocr_chunk_pages=max(1, int(os.environ.get("BID_WRITER_OCR_CHUNK_PAGES", "100"))),
+            ocr_chunk_pages=max(1, int(os.environ.get("BID_WRITER_OCR_CHUNK_PAGES", "20"))),
             ocr_poll_interval_seconds=max(0.1, float(os.environ.get("BID_WRITER_OCR_POLL_SECONDS", "5"))),
             ocr_max_polls=max(1, int(os.environ.get("BID_WRITER_OCR_MAX_POLLS", "720"))),
         )

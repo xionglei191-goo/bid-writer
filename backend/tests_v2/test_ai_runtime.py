@@ -131,6 +131,18 @@ class AiRuntimeTest(unittest.TestCase):
         self.assertEqual(review.issues, [])
         self.assertEqual(review.corrected_content, "")
 
+    def test_normalizes_structured_corrected_content_from_model(self) -> None:
+        review = KnowledgeCandidateReview.model_validate(
+            {
+                "candidate_index": 0,
+                "decision": "revise",
+                "confidence": 0.97,
+                "issues": [],
+                "corrected_content": {"title": "标题", "content": "完整修订正文"},
+            }
+        )
+        self.assertEqual(review.corrected_content, "完整修订正文")
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.db = Database(Path(self.temp.name) / "runtime.sqlite3")
