@@ -88,6 +88,17 @@ class CorpusCompletionTest(unittest.TestCase):
             self.corpus._number_signature("保护层厚度为25mm，执行GB 50010。"),
         )
 
+    def test_review_context_is_bounded_and_keeps_quote_anchor(self) -> None:
+        source = "前置无关内容" * 20000 + "需要逐字核验的来源引文" + "后置无关内容" * 20000
+        candidate = {"id": 9, "source_section_id": 7, "source_quote": "需要逐字核验的来源引文"}
+        context = self.corpus._review_source_context(
+            [candidate],
+            {7: {"heading": "来源章节", "content": source}},
+        )
+        self.assertIn("需要逐字核验的来源引文", context)
+        self.assertIn("[CANDIDATE:9]", context)
+        self.assertLess(len(context), 5000)
+
     def test_manual_asset_resolution_requires_explicit_approve_or_exclude(self) -> None:
         source_id = self._source("batch/table.xlsx", ".xlsx", "asset")
         run = self.corpus.create_run()
@@ -155,6 +166,25 @@ class CorpusCompletionTest(unittest.TestCase):
         self.assertEqual(state["status"], "paused")
         self.assertTrue(state["pause_reason"].startswith("外部服务错误"))
         self.assertEqual(dispatched, [(run["id"], 15 * 60 * 1000, 1, "__recovery__")])
+
+
+    def test_damaged_run_ledger_can_be_rebuilt_from_persisted_results(self) -> None:
+        source_id = self._source("recovery.txt", ".txt")
+        run = self.corpus.create_run()
+        self.corpus._legal_task(run["id"], source_id, "credentials", "password", "user credential required")
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE corpus_run_items SET stage='complete',status='terminal',terminal_reason='duplicate' WHERE run_id=?",
+                (run["id"],),
+            )
+        rebuilt = self.corpus.rebuild_run_from_persisted_results(run["id"])
+        old = self.db.row("SELECT status,stage FROM corpus_runs WHERE id=?", (run["id"],))
+        item = self.db.row("SELECT stage,status FROM corpus_run_items WHERE run_id=? AND source_id=?", (rebuilt["id"], source_id))
+        tasks = self.db.rows("SELECT task_type,status FROM governance_tasks WHERE run_id=?", (rebuilt["id"],))
+        self.assertEqual(old["status"], "cancelled")
+        self.assertEqual(old["stage"], "operator_recovery")
+        self.assertEqual((item["stage"], item["status"]), ("normalize", "pending"))
+        self.assertEqual(tasks, [{"task_type": "credentials", "status": "open"}])
 
 
 if __name__ == "__main__":

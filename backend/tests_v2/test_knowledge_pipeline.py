@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from docx import Document
+
 from bid_writer_v2.ai_runtime import AiRuntime
 from bid_writer_v2.database import Database
 from bid_writer_v2.knowledge.pipeline import KnowledgePipelineService, RetryableAiAdjudicationError
@@ -133,6 +135,49 @@ class KnowledgePipelineTest(unittest.TestCase):
         replayed = self.pipeline.process_document(self.document_id, max_candidates=6)
         self.assertTrue(replayed["reused"])
         self.assertEqual(self.llm.calls, 2)
+
+    def test_short_document_batch_preserves_real_provenance(self) -> None:
+        second_path = self.settings.raw_root / "hospital" / "second.docx"
+        create_source_docx(second_path)
+        second_docx = Document(second_path)
+        second_docx.add_paragraph("第二份短文档的独立来源内容，用于验证批处理仍保持真实来源关系。")
+        second_docx.save(second_path)
+        self.knowledge.scan_sources()
+        source = self.db.row("SELECT id FROM source_files WHERE absolute_path=?", (str(second_path.resolve()),))
+        jobs = self.knowledge.create_jobs([int(source["id"])], 1)
+        processed = self.knowledge.run_job(jobs["job_ids"][0])
+        second_document_id = int(processed["document_id"])
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE standard_documents SET text_fingerprint=? WHERE id=?",
+                ("second-document-fingerprint", second_document_id),
+            )
+        first_section = int(self.db.row(
+            "SELECT id FROM document_sections WHERE document_id=? ORDER BY id LIMIT 1", (self.document_id,)
+        )["id"])
+        second_section = int(self.db.row(
+            "SELECT id FROM document_sections WHERE document_id=? ORDER BY id LIMIT 1", (second_document_id,)
+        )["id"])
+
+        result = self.pipeline.process_document_batch(
+            [(self.document_id, [first_section]), (second_document_id, [second_section])],
+            max_candidates=6,
+        )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["batched_documents"], 2)
+        self.assertEqual(self.llm.calls, 2)
+        candidate = self.db.row(
+            "SELECT document_id,source_id,source_section_id FROM knowledge_ai_candidates WHERE pipeline_run_id=? ORDER BY id LIMIT 1",
+            (result["id"],),
+        )
+        expected = self.db.row(
+            "SELECT d.id AS document_id,d.source_id FROM document_sections s JOIN standard_documents d ON d.id=s.document_id WHERE s.id=?",
+            (first_section,),
+        )
+        self.assertEqual(candidate["source_section_id"], first_section)
+        self.assertEqual(candidate["document_id"], expected["document_id"])
+        self.assertEqual(candidate["source_id"], expected["source_id"])
 
     def test_discontinuous_exact_quote_lines_are_valid_anchors(self) -> None:
         findings = self.pipeline._rule_findings(

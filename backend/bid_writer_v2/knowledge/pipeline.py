@@ -11,7 +11,7 @@ from ..utils import content_hash, normalize_text, parse_json
 from .service import KnowledgeService
 
 
-PIPELINE_RULE_VERSION = "2.1.0"
+PIPELINE_RULE_VERSION = "2.2.0"
 CHUNK_MAX_CHARS = 48000
 CHUNK_OVERLAP_CHARS = 800
 
@@ -57,7 +57,7 @@ class KnowledgePipelineService:
                 cancelled,
                 should_auto_publish,
             )
-        section_text = self._section_text(sections)
+        section_text = self._section_text(sections, max_chars=CHUNK_MAX_CHARS)
         model_settings = self.ai_runtime.llm.settings()
         pipeline_key = content_hash(
             "|".join(
@@ -156,7 +156,10 @@ class KnowledgePipelineService:
         exception_count = 0
         with self.db.connect() as conn:
             for index, candidate in enumerate(candidates):
-                requested_section_id = int(candidate["source_section_id"])
+                try:
+                    requested_section_id = int(candidate.get("source_section_id") or 0)
+                except (TypeError, ValueError):
+                    requested_section_id = 0
                 section = section_map.get(requested_section_id) or sections[0]
                 model_review = reviews.get(index)
                 model_issues = list((model_review or {}).get("issues") or [])
@@ -298,6 +301,327 @@ class KnowledgePipelineService:
             self.auto_publish_low_risk(run_id)
         progress("completed", 100, "知识加工完成", {"candidates": len(candidates), "ready": ready_count})
         return {**self.get_run(run_id), "reused": False}
+
+    def process_document_batch(
+        self,
+        document_sections: list[tuple[int, list[int]]],
+        max_candidates: int = 20,
+        progress=None,
+        cancelled=None,
+    ) -> dict[str, Any]:
+        """Process several short documents with one extraction/review pair.
+
+        The pipeline run is shared only as an execution envelope.  Every
+        candidate keeps the real document, source and section foreign keys, so
+        batching does not weaken provenance or source-level disposition.
+        """
+        progress = progress or (lambda *_args, **_kwargs: None)
+        cancelled = cancelled or (lambda: False)
+        max_candidates = max(1, min(int(max_candidates), 20))
+        if len(document_sections) < 2:
+            document_id, section_ids = document_sections[0]
+            return self.process_document(
+                document_id,
+                max_candidates=max_candidates,
+                progress=progress,
+                cancelled=cancelled,
+                auto_publish=False,
+                section_ids=section_ids,
+            )
+
+        documents: list[dict[str, Any]] = []
+        sections: list[dict[str, Any]] = []
+        for document_id, section_ids in document_sections:
+            document, available = self._document_context(int(document_id))
+            selected = {int(value) for value in section_ids}
+            chosen = [section for section in available if int(section["id"]) in selected]
+            if not chosen:
+                raise ValueError(f"document {document_id} has no representative sections")
+            documents.append(document)
+            for section in chosen:
+                sections.append(
+                    {
+                        **section,
+                        "document_id": int(document["id"]),
+                        "source_id": int(document["source_id"]),
+                        "document_title": str(document["title"]),
+                    }
+                )
+
+        blocks: list[str] = []
+        used = 0
+        last_document_id = 0
+        for section in sections:
+            prefix = ""
+            if int(section["document_id"]) != last_document_id:
+                prefix = f"[DOCUMENT:{section['document_id']}] {section['document_title']}\n"
+                last_document_id = int(section["document_id"])
+            block = (
+                f"{prefix}[SECTION:{section['id']}] {section['heading']}\n"
+                f"{normalize_text(section['content'])[:12000]}"
+            )
+            if used + len(block) > CHUNK_MAX_CHARS:
+                remaining = CHUNK_MAX_CHARS - used
+                if remaining >= 500:
+                    blocks.append(block[:remaining])
+                break
+            blocks.append(block)
+            used += len(block)
+        section_text = "\n\n".join(blocks)
+        if not section_text:
+            raise ValueError("short-document batch has no processable text")
+
+        model_settings = self.ai_runtime.llm.settings()
+        fingerprint = content_hash(
+            "|".join(f"{document['id']}:{document['text_fingerprint']}" for document in documents)
+        )
+        pipeline_key = content_hash(
+            "|".join(
+                [
+                    "short-document-batch",
+                    fingerprint,
+                    KNOWLEDGE_EXTRACTION_PROMPT.prompt_hash,
+                    KNOWLEDGE_REVIEW_PROMPT.prompt_hash,
+                    PIPELINE_RULE_VERSION,
+                    str(max_candidates),
+                    ",".join(str(section["id"]) for section in sections),
+                    json.dumps(
+                        {
+                            "model": model_settings.get("model", ""),
+                            "base_url": model_settings.get("base_url", ""),
+                            "wire_api": model_settings.get("wire_api", ""),
+                        },
+                        sort_keys=True,
+                    ),
+                ]
+            )
+        )
+        with self.db.connect() as conn:
+            existing = conn.execute(
+                "SELECT id,status FROM knowledge_ai_pipeline_runs WHERE pipeline_key=?",
+                (pipeline_key,),
+            ).fetchone()
+            if existing and existing["status"] == "completed":
+                return {**self.get_run(int(existing["id"])), "reused": True}
+            if existing:
+                run_id = int(existing["id"])
+                conn.execute(
+                    "UPDATE knowledge_ai_pipeline_runs SET status='running',error_message='',completed_at=NULL WHERE id=?",
+                    (run_id,),
+                )
+                conn.execute("DELETE FROM knowledge_ai_candidates WHERE pipeline_run_id=?", (run_id,))
+            else:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO knowledge_ai_pipeline_runs(
+                        document_id,pipeline_key,input_hash,rule_version,chunk_count
+                    ) VALUES (?,?,?,?,?)
+                    """,
+                    (int(documents[0]["id"]), pipeline_key, fingerprint, PIPELINE_RULE_VERSION, len(documents)),
+                )
+                run_id = int(cursor.lastrowid)
+
+        if cancelled():
+            return self._fail_run(run_id, None, "batch cancelled before extraction")
+        title = "全库短文档批次：" + "；".join(str(document["title"]) for document in documents)
+        extraction = self.ai_runtime.execute(
+            KNOWLEDGE_EXTRACTION_PROMPT,
+            KNOWLEDGE_EXTRACTION_PROMPT.render(
+                max_candidates=str(max_candidates),
+                document_title=title,
+                industry="多来源；必须按 SECTION 编号逐条回挂",
+                section_text=section_text,
+            ),
+            {
+                "document_ids": [int(document["id"]) for document in documents],
+                "text_fingerprint": fingerprint,
+                "max_candidates": max_candidates,
+                "section_ids": [int(section["id"]) for section in sections],
+                "section_text": section_text,
+            },
+            task_type="knowledge_batch_candidate_extraction",
+            target_type="standard_document_batch",
+            target_id=int(documents[0]["id"]),
+            max_output_tokens=12000,
+        )
+        candidates = (extraction.get("payload") or {}).get("candidates") or []
+        if not candidates:
+            return self._fail_run(
+                run_id,
+                extraction.get("run_id"),
+                extraction.get("error") or "AI returned no candidates for short-document batch",
+            )
+        review = self.ai_runtime.execute(
+            KNOWLEDGE_REVIEW_PROMPT,
+            KNOWLEDGE_REVIEW_PROMPT.render(
+                section_text=section_text,
+                candidate_json=json.dumps(candidates, ensure_ascii=False, indent=2),
+            ),
+            {
+                "document_ids": [int(document["id"]) for document in documents],
+                "section_text": section_text,
+                "candidates": candidates,
+            },
+            task_type="knowledge_batch_candidate_review",
+            target_type="standard_document_batch",
+            target_id=int(documents[0]["id"]),
+            max_output_tokens=10000,
+        )
+        reviews = {
+            int(item["candidate_index"]): item
+            for item in ((review.get("payload") or {}).get("reviews") or [])
+            if int(item["candidate_index"]) < len(candidates)
+        }
+        section_map = {int(section["id"]): section for section in sections}
+        ready_count = 0
+        exception_count = 0
+        with self.db.connect() as conn:
+            for index, candidate in enumerate(candidates):
+                try:
+                    requested_section_id = int(candidate.get("source_section_id") or 0)
+                except (TypeError, ValueError):
+                    requested_section_id = 0
+                section = section_map.get(requested_section_id) or sections[0]
+                model_review = reviews.get(index)
+                model_issues = list((model_review or {}).get("issues") or [])
+                if not model_review:
+                    model_issues.append(
+                        {"code": "review_missing", "severity": "high", "message": "独立复核未返回该候选结论"}
+                    )
+                rule_findings = self._rule_findings(
+                    candidate,
+                    section,
+                    requested_section_id in section_map,
+                )
+                if candidate["risk_level"] == "high":
+                    rule_findings.append(
+                        {
+                            "code": "candidate_risk",
+                            "severity": "high",
+                            "message": "模型将候选标记为高风险，需执行双重复核和最终裁决",
+                            "source": "risk_router",
+                        }
+                    )
+                decision = str((model_review or {}).get("decision") or "missing")
+                confidence = float((model_review or {}).get("confidence") or 0)
+                corrected = normalize_text(str((model_review or {}).get("corrected_content") or ""))
+                content = corrected if decision == "revise" and corrected else normalize_text(candidate["content"])
+                blocking = [
+                    finding
+                    for finding in [*model_issues, *rule_findings]
+                    if finding.get("severity") in {"medium", "high"}
+                ]
+                ready = (
+                    decision == "pass"
+                    and confidence >= (0.92 if candidate["risk_level"] == "medium" else 0.85)
+                    and candidate["risk_level"] in {"low", "medium"}
+                    and not blocking
+                )
+                cursor = conn.execute(
+                    """
+                    INSERT INTO knowledge_ai_candidates(
+                        pipeline_run_id,document_id,source_id,source_section_id,candidate_index,title,unit_type,
+                        content,summary,tags_json,applicability,risk_level,source_quote,review_decision,
+                        review_confidence,review_issues_json,rule_findings_json,status
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        run_id,
+                        int(section["document_id"]),
+                        int(section["source_id"]),
+                        int(section["id"]),
+                        index,
+                        candidate["title"],
+                        candidate["unit_type"],
+                        content,
+                        candidate["summary"],
+                        json.dumps(candidate.get("tags") or [], ensure_ascii=False),
+                        candidate["applicability"],
+                        candidate["risk_level"],
+                        candidate["source_quote"],
+                        decision,
+                        confidence,
+                        json.dumps(model_issues, ensure_ascii=False),
+                        json.dumps(rule_findings, ensure_ascii=False),
+                        "ready" if ready else "needs_review",
+                    ),
+                )
+                candidate_id = int(cursor.lastrowid)
+                findings = [*model_issues, *rule_findings]
+                if decision != "pass" and not findings:
+                    findings.append(
+                        {"code": f"review_{decision}", "severity": "medium", "message": "独立复核未判定直接通过"}
+                    )
+                for finding in findings:
+                    conn.execute(
+                        "INSERT INTO knowledge_exception_tasks(candidate_id,issue_code,severity,message,source) VALUES (?,?,?,?,?)",
+                        (
+                            candidate_id,
+                            str(finding.get("code") or "unspecified"),
+                            str(finding.get("severity") or "medium"),
+                            str(finding.get("message") or "需要自动复核"),
+                            str(finding.get("source") or "model_or_rule"),
+                        ),
+                    )
+                ready_count += int(ready)
+                exception_count += len(findings)
+            conn.execute(
+                """
+                UPDATE knowledge_ai_pipeline_runs SET status=?,extraction_ai_run_id=?,review_ai_run_id=?,
+                    candidate_count=?,ready_count=?,exception_count=?,completed_chunks=?,failed_chunks=0,
+                    coverage_rate=1,error_message=?,completed_at=CURRENT_TIMESTAMP WHERE id=?
+                """,
+                (
+                    "completed" if not review.get("error") else "completed_with_exceptions",
+                    extraction.get("run_id"),
+                    review.get("run_id"),
+                    len(candidates),
+                    ready_count,
+                    exception_count,
+                    len(documents),
+                    review.get("error") or "",
+                    run_id,
+                ),
+            )
+            document_ids = [int(document["id"]) for document in documents]
+            placeholders = ",".join("?" for _ in document_ids)
+            prior_candidates = [
+                int(row[0])
+                for row in conn.execute(
+                    f"""
+                    SELECT c.id FROM knowledge_ai_candidates c
+                    WHERE c.document_id IN ({placeholders}) AND c.pipeline_run_id<>?
+                      AND c.status IN ('ready','needs_review')
+                    """,
+                    (*document_ids, run_id),
+                ).fetchall()
+            ]
+            if prior_candidates:
+                candidate_placeholders = ",".join("?" for _ in prior_candidates)
+                conn.execute(
+                    f"""
+                    UPDATE knowledge_exception_tasks SET status='resolved',resolved_by='system',
+                        resolution='新成功批次已替代旧候选',resolved_at=CURRENT_TIMESTAMP
+                    WHERE status='open' AND candidate_id IN ({candidate_placeholders})
+                    """,
+                    prior_candidates,
+                )
+                conn.execute(
+                    f"UPDATE knowledge_ai_candidates SET status='superseded' WHERE id IN ({candidate_placeholders})",
+                    prior_candidates,
+                )
+            conn.execute(
+                f"UPDATE document_chunks SET status='completed',attempt_count=attempt_count+1,updated_at=CURRENT_TIMESTAMP WHERE document_id IN ({placeholders})",
+                document_ids,
+            )
+        self._deduplicate_candidates(run_id)
+        progress(
+            "completed",
+            100,
+            "短文档合批知识加工完成",
+            {"documents": len(documents), "candidates": len(candidates), "ready": ready_count},
+        )
+        return {**self.get_run(run_id), "reused": False, "batched_documents": len(documents)}
 
     def prepare_chunks(self, document_id: int, sections: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         if sections is None:
@@ -518,7 +842,10 @@ class KnowledgePipelineService:
                 model_issues = list((model_review or {}).get("issues") or [])
                 if not model_review:
                     model_issues.append({"code": "review_missing", "severity": "high", "message": "独立复核未返回该候选的结论"})
-                requested_section_id = int(candidate["source_section_id"])
+                try:
+                    requested_section_id = int(candidate.get("source_section_id") or 0)
+                except (TypeError, ValueError):
+                    requested_section_id = 0
                 rule_findings = self._rule_findings(candidate, section, requested_section_id in section_map)
                 if candidate["risk_level"] == "high":
                     rule_findings.append({"code": "candidate_risk", "severity": "high", "message": "高风险候选必须人工复核", "source": "risk_router"})
@@ -580,14 +907,19 @@ class KnowledgePipelineService:
 
     def _deduplicate_candidates(self, run_id: int) -> None:
         candidates = self.db.rows(
-            "SELECT id,title,content,status FROM knowledge_ai_candidates WHERE pipeline_run_id=? ORDER BY id",
+            "SELECT id,document_id,title,content,status FROM knowledge_ai_candidates WHERE pipeline_run_id=? ORDER BY id",
             (run_id,),
         )
         seen: dict[str, int] = {}
         with self.db.connect() as conn:
             for candidate in candidates:
                 normalized_title = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", candidate["title"]).lower()
-                key = content_hash(f"{normalized_title}|{normalize_text(candidate['content'])}")
+                # Cross-document similarities are handled by corpus clusters,
+                # which preserve every source attachment.  This local pass
+                # removes only duplicate candidates emitted for one document.
+                key = content_hash(
+                    f"{candidate['document_id']}|{normalized_title}|{normalize_text(candidate['content'])}"
+                )
                 if key in seen:
                     conn.execute(
                         "INSERT INTO candidate_relations(candidate_id,related_candidate_id,relation_type,lexical_score,explanation) VALUES (?,?, 'duplicate',1,'标题和正文完全重复')",

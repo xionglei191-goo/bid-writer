@@ -144,6 +144,177 @@ class CorpusCompletionService:
             return "metadata", "terminal", "complete", "metadata_only_excluded"
         return "unsupported", "terminal", "complete", "unsupported_excluded"
 
+    def rebuild_run_from_persisted_results(self, previous_run_id: int, created_by: int | None = None) -> dict[str, Any]:
+        """Recreate a damaged run ledger without discarding durable outcomes.
+
+        Standard documents, final AI candidates/publications, asset governance,
+        and legal task dispositions are authoritative durable records.  Only
+        unfinished stages are re-queued; the previous ledger remains auditable.
+        """
+        previous = self._raw_run(previous_run_id)
+        if str(previous.get("status") or "") in {"pending", "running", "paused"}:
+            with self.db.connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE corpus_runs SET status='cancelled',stage='operator_recovery',pause_reason=?,
+                        completed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?
+                    """,
+                    ("运行台账操作异常；已依据持久化成果重建，源文件与成果未受影响", previous_run_id),
+                )
+        rows = self.db.rows(
+            "SELECT id,sha256,extension,status,source_kind,duplicate_of,error_message FROM source_files ORDER BY id"
+        )
+        snapshot_hash = content_hash("|".join(f"{row['id']}:{row['sha256']}" for row in rows))
+        policy = parse_json(previous.get("policy_json"), {})
+        with self.db.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO corpus_runs(snapshot_hash,status,stage,policy_json,checkpoint_json,created_by,
+                    started_at,updated_at)
+                VALUES (?,'running','normalize',?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+                """,
+                (
+                    snapshot_hash,
+                    json.dumps(policy, ensure_ascii=False),
+                    json.dumps(
+                        {
+                            "recovered_from_run_id": previous_run_id,
+                            "recovery_method": "persisted_result_reconciliation",
+                            "recovered_at": iso_now(),
+                            "previous_checkpoint": parse_json(previous.get("checkpoint_json"), {}),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    created_by,
+                ),
+            )
+            run_id = int(cursor.lastrowid)
+
+        for row in rows:
+            source_id = int(row["id"])
+            kind, status, stage, reason = self._initial_state(row)
+            processing_job_id: int | None = None
+            document_id: int | None = None
+            pipeline_run_id: int | None = None
+            checkpoint: dict[str, Any] = {"reconciled_from_persisted_results": True}
+            if kind == "text":
+                document = self.db.row("SELECT id FROM standard_documents WHERE source_id=?", (source_id,))
+                job = self.db.row("SELECT id,status FROM processing_jobs WHERE source_id=? ORDER BY id DESC LIMIT 1", (source_id,))
+                processing_job_id = int(job["id"]) if job else None
+                if document:
+                    document_id = int(document["id"])
+                    candidate = self.db.row(
+                        """
+                        SELECT c.pipeline_run_id,
+                            SUM(CASE WHEN c.status='accepted' THEN 1 ELSE 0 END) AS accepted,
+                            SUM(CASE WHEN c.status='rejected' THEN 1 ELSE 0 END) AS rejected,
+                            SUM(CASE WHEN c.status IN ('ready','needs_review') THEN 1 ELSE 0 END) AS unfinished
+                        FROM knowledge_ai_candidates c
+                        WHERE c.document_id=? AND c.status<>'superseded'
+                        GROUP BY c.pipeline_run_id ORDER BY c.pipeline_run_id DESC LIMIT 1
+                        """,
+                        (document_id,),
+                    )
+                    if candidate and not int(candidate.get("unfinished") or 0):
+                        pipeline_run_id = int(candidate["pipeline_run_id"])
+                        status, stage = "terminal", "complete"
+                        if int(candidate.get("accepted") or 0):
+                            reason = "knowledge_published"
+                        else:
+                            manual = self.db.row(
+                                "SELECT COUNT(*) AS count FROM governance_tasks WHERE source_id=? AND status='open'",
+                                (source_id,),
+                            ) or {}
+                            reason = "manual_legal_pending" if int(manual.get("count") or 0) else "no_reusable_knowledge"
+                        checkpoint.update(
+                            {
+                                "published": int(candidate.get("accepted") or 0),
+                                "rejected": int(candidate.get("rejected") or 0),
+                            }
+                        )
+                    else:
+                        status, stage, reason = "pending", "ai", ""
+                elif job and str(job.get("status") or "") == "waiting_ocr":
+                    status, stage, reason = "pending", "ocr", ""
+            elif kind == "asset":
+                asset = self.db.row(
+                    """
+                    SELECT governance_status,COUNT(*) AS count FROM knowledge_assets
+                    WHERE source_id=? GROUP BY governance_status ORDER BY COUNT(*) DESC LIMIT 1
+                    """,
+                    (source_id,),
+                )
+                if asset:
+                    governance = str(asset.get("governance_status") or "")
+                    status, stage = "terminal", "complete"
+                    if governance == "duplicate":
+                        reason = "asset_duplicate"
+                    elif governance == "approved":
+                        reason = "asset_registered"
+                    elif governance == "pending_legal":
+                        reason = "manual_legal_pending"
+                    else:
+                        reason = "asset_archived_unlicensed"
+            with self.db.connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO corpus_run_items(
+                        run_id,source_id,source_hash,item_kind,stage,status,terminal_reason,
+                        processing_job_id,document_id,pipeline_run_id,checkpoint_json,completed_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        run_id,
+                        source_id,
+                        row["sha256"],
+                        kind,
+                        stage,
+                        status,
+                        reason,
+                        processing_job_id,
+                        document_id,
+                        pipeline_run_id,
+                        json.dumps(checkpoint, ensure_ascii=False),
+                        iso_now() if status == "terminal" else None,
+                    ),
+                )
+        old_tasks = self.db.rows("SELECT * FROM governance_tasks WHERE run_id=?", (previous_run_id,))
+        with self.db.connect() as conn:
+            for task in old_tasks:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO governance_tasks(
+                        run_id,source_id,task_key,task_type,severity,status,title,message,requires_human,
+                        resolution,resolved_by,created_at,resolved_at
+                    )
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        run_id,
+                        task.get("source_id"),
+                        task["task_key"],
+                        task["task_type"],
+                        task["severity"],
+                        task["status"],
+                        task["title"],
+                        task["message"],
+                        task["requires_human"],
+                        task.get("resolution") or "",
+                        task.get("resolved_by"),
+                        task["created_at"],
+                        task.get("resolved_at"),
+                    ),
+                )
+                new_task_id = int(cursor.lastrowid)
+                for link in self.db.rows("SELECT source_id FROM governance_task_sources WHERE task_id=?", (task["id"],)):
+                    conn.execute(
+                        "INSERT INTO governance_task_sources(task_id,source_id) VALUES (?,?) ON CONFLICT(task_id,source_id) DO NOTHING",
+                        (new_task_id, link["source_id"]),
+                    )
+        self._refresh(run_id)
+        self._dispatch_next(run_id)
+        return self.get_run(run_id)
+
     def run_tick(self, run_id: int, progress=None, cancelled=None, preferred_stage: str = "") -> dict[str, Any]:
         progress = progress or (lambda *_args, **_kwargs: None)
         cancelled = cancelled or (lambda: False)
@@ -175,6 +346,7 @@ class CorpusCompletionService:
                 return self.get_run(run_id)
             return self._finalize_run(run_id, progress)
         progress(str(item["stage"]), 5, f"处理 {item['file_name']}", {"source_id": item["source_id"]})
+        active_items = [item]
         try:
             if item["stage"] == "normalize":
                 self._normalize_item(item)
@@ -183,7 +355,8 @@ class CorpusCompletionService:
             elif item["stage"] == "governance":
                 self._govern_asset(item)
             elif item["stage"] == "ai":
-                self._process_ai(item, progress=progress, cancelled=cancelled)
+                active_items = self._claim_ai_batch(item)
+                self._process_ai_batch(active_items, progress=progress, cancelled=cancelled)
             else:
                 self._terminal(item, "no_reusable_knowledge")
             self._record_result(run_id, True, "")
@@ -191,7 +364,10 @@ class CorpusCompletionService:
             service_error = str(item["stage"]) in {"ai", "ocr"} and any(
                 marker in f"{type(exc).__name__}: {exc}".lower() for marker in SERVICE_ERROR_MARKERS
             )
-            self._handle_failure(item, exc, service_error=service_error)
+            for active_item in active_items:
+                state = self.db.row("SELECT status FROM corpus_run_items WHERE id=?", (active_item["id"],)) or {}
+                if state.get("status") == "running":
+                    self._handle_failure(active_item, exc, service_error=service_error)
             self._record_result(run_id, not service_error, f"{type(exc).__name__}: {exc}")
         summary = self._refresh(run_id)
         progress(str(summary["stage"]), int(summary["progress"]), "全库批次检查点已保存", summary.get("counters"))
@@ -237,6 +413,55 @@ class CorpusCompletionService:
                     conn.execute("UPDATE corpus_runs SET stage=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (item["stage"], run_id))
                     return item
         return None
+
+    def _claim_ai_batch(self, item: dict[str, Any]) -> list[dict[str, Any]]:
+        """Claim up to four short AI items without increasing AI concurrency.
+
+        The items run in one model request pair and remain independently
+        checkpointed.  Long documents keep the existing chunked path.
+        """
+        document_id = int(item.get("document_id") or 0)
+        if not document_id:
+            return [item]
+        current = self.db.row("SELECT char_count FROM standard_documents WHERE id=?", (document_id,)) or {}
+        current_chars = int(current.get("char_count") or 0)
+        if current_chars <= 0 or current_chars > 12_000:
+            return [item]
+        claimed = [item]
+        used_chars = current_chars
+        candidates = self.db.rows(
+            """
+            SELECT i.*,s.absolute_path,s.relative_path,s.file_name,s.extension,s.source_kind,s.parent_source_id,
+                s.status AS source_status,s.error_message AS source_error,s.industry,d.char_count AS document_char_count
+            FROM corpus_run_items i
+            JOIN source_files s ON s.id=i.source_id
+            JOIN standard_documents d ON d.id=i.document_id
+            WHERE i.run_id=? AND i.stage='ai' AND i.status IN ('pending','retrying')
+              AND (i.next_retry_at IS NULL OR i.next_retry_at<=?)
+              AND d.char_count<=12000 AND i.id<>?
+            ORDER BY i.id LIMIT 12
+            """,
+            (item["run_id"], iso_now(), item["id"]),
+        )
+        for candidate in candidates:
+            candidate_chars = int(candidate.get("document_char_count") or 0)
+            if candidate_chars <= 0 or used_chars + candidate_chars > 42_000:
+                continue
+            with self.db.connect() as conn:
+                updated = conn.execute(
+                    """
+                    UPDATE corpus_run_items SET status='running',attempt_count=attempt_count+1,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE id=? AND status IN ('pending','retrying')
+                    """,
+                    (candidate["id"],),
+                )
+            if updated.rowcount:
+                claimed.append(candidate)
+                used_chars += candidate_chars
+            if len(claimed) >= 4:
+                break
+        return claimed
 
     def _dispatch_next(self, run_id: int, delay_ms: int = 0, *, current_running_stage: str = "") -> None:
         if not self.dispatch:
@@ -445,6 +670,83 @@ class CorpusCompletionService:
         )
         reason = "knowledge_published" if published else ("manual_legal_pending" if legal or int((open_manual or {}).get("count", 0)) else "no_reusable_knowledge")
         self._terminal(item, reason, document_id=document_id, pipeline_run_id=run_id, checkpoint={"published": published, "legal": legal, "rejected": rejected})
+
+    def _process_ai_batch(self, items: list[dict[str, Any]], progress=None, cancelled=None) -> None:
+        if len(items) == 1:
+            self._process_ai(items[0], progress=progress, cancelled=cancelled)
+            return
+
+        prepared: list[tuple[dict[str, Any], int, list[int]]] = []
+        for item in items:
+            document_id = int(item.get("document_id") or 0)
+            if not document_id:
+                row = self.db.row("SELECT id FROM standard_documents WHERE source_id=?", (item["source_id"],))
+                if not row:
+                    raise RuntimeError("standard document does not exist")
+                document_id = int(row["id"])
+            duplicate = self.db.row(
+                """
+                SELECT id,source_id FROM standard_documents
+                WHERE text_fingerprint=(SELECT text_fingerprint FROM standard_documents WHERE id=?)
+                  AND id<>? ORDER BY id LIMIT 1
+                """,
+                (document_id, document_id),
+            )
+            if duplicate:
+                self._terminal(item, "content_duplicate", document_id=document_id)
+                continue
+            representative_sections = self._prepare_representative_sections(int(item["run_id"]), document_id)
+            if not representative_sections:
+                self._terminal(item, "content_duplicate", document_id=document_id)
+                continue
+            prepared.append((item, document_id, representative_sections))
+        if not prepared:
+            return
+        if len(prepared) == 1:
+            # Representatives were already persisted and are idempotent.
+            self._process_ai(prepared[0][0], progress=progress, cancelled=cancelled)
+            return
+
+        result = self.pipeline.process_document_batch(
+            [(document_id, section_ids) for _item, document_id, section_ids in prepared],
+            max_candidates=20,
+            progress=progress,
+            cancelled=cancelled,
+        )
+        if str(result.get("status") or "") != "completed":
+            raise RuntimeError(f"model batch pipeline incomplete: {result.get('error_message') or result.get('status')}")
+        pipeline_run_id = int(result["id"])
+        published, legal, rejected = self._final_review(pipeline_run_id, int(prepared[0][0]["run_id"]))
+        for item, document_id, _section_ids in prepared:
+            source_counts = self.db.row(
+                """
+                SELECT SUM(CASE WHEN status='accepted' THEN 1 ELSE 0 END) AS accepted,
+                    SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END) AS rejected
+                FROM knowledge_ai_candidates WHERE pipeline_run_id=? AND source_id=?
+                """,
+                (pipeline_run_id, item["source_id"]),
+            ) or {}
+            open_manual = self.db.row(
+                "SELECT COUNT(*) AS count FROM governance_tasks WHERE run_id=? AND source_id=? AND status='open'",
+                (item["run_id"], item["source_id"]),
+            ) or {}
+            source_published = int(source_counts.get("accepted") or 0)
+            source_rejected = int(source_counts.get("rejected") or 0)
+            source_legal = int(open_manual.get("count") or 0)
+            reason = "knowledge_published" if source_published else ("manual_legal_pending" if source_legal else "no_reusable_knowledge")
+            self._terminal(
+                item,
+                reason,
+                document_id=document_id,
+                pipeline_run_id=pipeline_run_id,
+                checkpoint={
+                    "batch_documents": len(prepared),
+                    "published": source_published,
+                    "legal": source_legal,
+                    "rejected": source_rejected,
+                    "batch_totals": {"published": published, "legal": legal, "rejected": rejected},
+                },
+            )
 
     def _prepare_representative_sections(self, run_id: int, document_id: int) -> list[int]:
         sections = self.db.rows(
@@ -787,10 +1089,10 @@ class CorpusCompletionService:
     def _ai_review_batch(self, candidates: list[dict[str, Any]], task_type: str, formal: bool = False) -> dict[int, dict[str, Any]]:
         if not candidates:
             return {}
-        if len(candidates) > 20:
+        if len(candidates) > 12:
             combined: dict[int, dict[str, Any]] = {}
-            for start in range(0, len(candidates), 20):
-                combined.update(self._ai_review_batch(candidates[start:start + 20], task_type, formal=formal))
+            for start in range(0, len(candidates), 12):
+                combined.update(self._ai_review_batch(candidates[start:start + 12], task_type, formal=formal))
             return combined
         spec = KNOWLEDGE_FORMAL_REVIEW_PROMPT if formal else KNOWLEDGE_REVIEW_PROMPT
         section_ids = sorted({int(candidate.get("source_section_id") or 0) for candidate in candidates if candidate.get("source_section_id")})
@@ -804,10 +1106,7 @@ class CorpusCompletionService:
                     section_ids,
                 )
             }
-        section_text = "\n\n".join(
-            f"[SECTION:{section_id}] {sections.get(section_id, {}).get('heading', '')}\n{sections.get(section_id, {}).get('content', '')}"
-            for section_id in section_ids
-        )
+        section_text = self._review_source_context(candidates, sections, max_chars=48_000)
         candidate_json = []
         for index, candidate in enumerate(candidates):
             candidate_json.append({
@@ -835,6 +1134,64 @@ class CorpusCompletionService:
             int(candidate["id"]): {**by_index[index], "run_id": result.get("run_id")}
             for index, candidate in enumerate(candidates)
         }
+
+    @staticmethod
+    def _review_source_context(
+        candidates: list[dict[str, Any]],
+        sections: dict[int, dict[str, Any]],
+        max_chars: int = 48_000,
+    ) -> str:
+        """Build bounded, quote-centred source windows for independent review.
+
+        Candidate provenance has already passed the deterministic full-section
+        quote gate.  The review model therefore needs the exact quote and its
+        surrounding source text, not hundreds of thousands of unrelated chars.
+        """
+        by_section: dict[int, list[dict[str, Any]]] = {}
+        for candidate in candidates:
+            section_id = int(candidate.get("source_section_id") or 0)
+            by_section.setdefault(section_id, []).append(candidate)
+        blocks: list[str] = []
+        used = 0
+        for section_id in sorted(by_section):
+            section = sections.get(section_id, {})
+            content = normalize_text(str(section.get("content") or ""))
+            windows: list[tuple[int, int]] = []
+            for candidate in by_section[section_id]:
+                quote = normalize_text(str(candidate.get("source_quote") or ""))
+                quote_lines = [line.strip() for line in quote.splitlines() if len(line.strip()) >= 8]
+                anchors = quote_lines or ([quote] if quote else [])
+                found = False
+                for anchor in anchors:
+                    position = content.find(anchor)
+                    if position < 0:
+                        continue
+                    start = max(0, position - 900)
+                    end = min(len(content), position + len(anchor) + 900)
+                    windows.append((start, end))
+                    found = True
+                if not found and content:
+                    windows.append((0, min(len(content), 3500)))
+            merged: list[tuple[int, int]] = []
+            for start, end in sorted(windows):
+                if merged and start <= merged[-1][1] + 200:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                else:
+                    merged.append((start, end))
+            source_window = "\n...\n".join(content[start:end] for start, end in merged)
+            quotes = "\n".join(
+                f"[CANDIDATE:{candidate['id']}] SOURCE_QUOTE: {normalize_text(str(candidate.get('source_quote') or ''))}"
+                for candidate in by_section[section_id]
+            )
+            block = f"[SECTION:{section_id}] {section.get('heading', '')}\n{source_window}\n{quotes}"
+            if used + len(block) > max_chars:
+                remaining = max_chars - used
+                if remaining >= 500:
+                    blocks.append(block[:remaining])
+                break
+            blocks.append(block)
+            used += len(block)
+        return "\n\n".join(blocks)
 
     def _ai_review(self, candidate: dict[str, Any], task_type: str, formal: bool = False) -> dict[str, Any]:
         section_id = int(candidate.get("source_section_id") or 0)
@@ -1255,9 +1612,9 @@ class CorpusCompletionService:
         totals = self.db.row("SELECT COUNT(*) AS total,SUM(CASE WHEN status='terminal' THEN 1 ELSE 0 END) AS terminal FROM corpus_run_items WHERE run_id=?", (run_id,)) or {}
         candidate = self.db.row(
             """
-            SELECT SUM(CASE WHEN c.status IN ('accepted','rejected') THEN 1 ELSE 0 END) AS terminal,
-                SUM(CASE WHEN c.status='accepted' AND p.id IS NOT NULL THEN 1 ELSE 0 END) AS published,
-                SUM(CASE WHEN c.status='accepted' THEN 1 ELSE 0 END) AS eligible
+            SELECT COUNT(DISTINCT CASE WHEN c.status IN ('accepted','rejected') THEN c.id END) AS terminal,
+                COUNT(DISTINCT CASE WHEN c.status='accepted' AND p.id IS NOT NULL THEN c.id END) AS published,
+                COUNT(DISTINCT CASE WHEN c.status='accepted' THEN c.id END) AS eligible
             FROM knowledge_ai_candidates c
             JOIN knowledge_ai_pipeline_runs r ON r.id=c.pipeline_run_id
             JOIN corpus_run_items i ON i.pipeline_run_id=r.id AND i.run_id=?
