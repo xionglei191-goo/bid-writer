@@ -118,12 +118,13 @@ class KnowledgeService:
         except ValueError:
             relative = absolute
         digest = sha256_file(path)
+        office_lock = path.name.startswith("~$") and path.suffix.lower() in {".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"}
         duplicate = conn.execute(
             "SELECT id FROM source_files WHERE sha256 = ? AND absolute_path <> ? ORDER BY id LIMIT 1",
             (digest, absolute),
         ).fetchone()
         existing = conn.execute("SELECT * FROM source_files WHERE absolute_path = ?", (absolute,)).fetchone()
-        status = self._source_status(path.suffix.lower(), bool(duplicate))
+        status = "metadata_only" if office_lock else self._source_status(path.suffix.lower(), bool(duplicate))
         if existing and str(existing["sha256"] or "") == digest and not duplicate:
             previous = str(existing["status"] or "")
             if previous in {"processed", "asset", "metadata_only", "archive"}:

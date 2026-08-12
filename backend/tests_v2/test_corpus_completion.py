@@ -82,6 +82,14 @@ class CorpusCompletionTest(unittest.TestCase):
         self.assertEqual(second["updated"], 1)
         self.assertEqual((self.db.row("SELECT status FROM source_files WHERE id=?", (source["id"],)) or {})["status"], "processed")
 
+    def test_office_lock_files_are_metadata_only(self) -> None:
+        lock = self.settings.raw_root / "~$temporary.docx"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_bytes(b"office-lock")
+        self.knowledge.scan_sources()
+        source = self.db.row("SELECT status FROM source_files WHERE absolute_path=?", (str(lock.resolve()),))
+        self.assertEqual(source["status"], "metadata_only")
+
     def test_number_conflicts_are_never_merged(self) -> None:
         self.assertNotEqual(
             self.corpus._number_signature("保护层厚度为20mm，执行GB 50010。"),
