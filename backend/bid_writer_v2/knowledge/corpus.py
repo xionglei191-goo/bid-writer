@@ -34,7 +34,7 @@ TERMINAL_REASONS = {
     "no_reusable_knowledge",
     "manual_legal_pending",
 }
-SERVICE_ERROR_MARKERS = ("timeout", "timed out", "connection", "429", "503", "model", "http", "未配置")
+SERVICE_ERROR_MARKERS = ("timeout", "timed out", "connection", "429", "500", "502", "503", "504", "http", "未配置")
 LEGAL_PATTERNS = (
     ("confidentiality", r"(?:保密|机密|秘密|不得泄露)"),
     ("copyright", r"(?:著作权|版权|未经授权|禁止复制)"),
@@ -344,6 +344,7 @@ class CorpusCompletionService:
             self._set_run(run_id, "cancelled", "cancelled", "用户取消")
             return self.get_run(run_id)
         self._recover_stale_items(run_id)
+        self._requeue_uncovered_batch_sources(run_id)
         disk = shutil.disk_usage(self.knowledge.settings.knowledge_root)
         policy = parse_json(run.get("policy_json"), {})
         if disk.free < max(int(policy.get("disk_min_bytes", 100 * 1024**3)), int(disk.total * float(policy.get("disk_min_ratio", 0.1)))):
@@ -437,6 +438,8 @@ class CorpusCompletionService:
         document_id = int(item.get("document_id") or 0)
         if not document_id:
             return [item]
+        if parse_json(item.get("checkpoint_json"), {}).get("requires_individual_ai"):
+            return [item]
         current = self.db.row("SELECT char_count FROM standard_documents WHERE id=?", (document_id,)) or {}
         current_chars = int(current.get("char_count") or 0)
         if current_chars <= 0 or current_chars > 24_000:
@@ -458,6 +461,8 @@ class CorpusCompletionService:
             (item["run_id"], iso_now(), item["id"]),
         )
         for candidate in candidates:
+            if parse_json(candidate.get("checkpoint_json"), {}).get("requires_individual_ai"):
+                continue
             candidate_chars = int(candidate.get("document_char_count") or 0)
             if candidate_chars <= 0 or used_chars + candidate_chars > 82_000:
                 continue
@@ -749,9 +754,10 @@ class CorpusCompletionService:
             progress=progress,
             cancelled=cancelled,
         )
-        if int(result.get("failed_chunks") or 0) or str(result.get("status") or "") == "completed_with_exceptions":
+        if str(result.get("status") or "") != "completed" or int(result.get("failed_chunks") or 0):
             raise RuntimeError(
-                f"model pipeline incomplete: failed_chunks={int(result.get('failed_chunks') or 0)}; {result.get('error_message') or ''}"
+                f"model pipeline incomplete: status={result.get('status') or 'unknown'}; "
+                f"failed_chunks={int(result.get('failed_chunks') or 0)}; {result.get('error_message') or ''}"
             )
         run_id = int(result["id"])
         published, legal, rejected = self._final_review(run_id, int(item["run_id"]))
@@ -833,6 +839,17 @@ class CorpusCompletionService:
             source_published = int(source_counts.get("accepted") or 0)
             source_rejected = int(source_counts.get("rejected") or 0)
             source_legal = int(open_manual.get("count") or 0)
+            if not source_published and not source_rejected and not source_legal:
+                self._advance(
+                    item,
+                    "ai",
+                    document_id=document_id,
+                    requires_individual_ai=True,
+                    clear_pipeline_run_id=True,
+                    coverage_repair="batch_source_returned_no_candidate",
+                    batch_pipeline_run_id=pipeline_run_id,
+                )
+                continue
             reason = "knowledge_published" if source_published else ("manual_legal_pending" if source_legal else "no_reusable_knowledge")
             self._terminal(
                 item,
@@ -850,12 +867,14 @@ class CorpusCompletionService:
 
     def _deterministic_non_reusable_reason(self, document_id: int) -> str:
         document = self.db.row(
-            "SELECT title,char_count FROM standard_documents WHERE id=?",
+            """
+            SELECT d.title,d.char_count,s.source_kind
+            FROM standard_documents d JOIN source_files s ON s.id=d.source_id
+            WHERE d.id=?
+            """,
             (document_id,),
         ) or {}
         char_count = int(document.get("char_count") or 0)
-        if char_count > 700:
-            return ""
         sections = self.db.rows(
             "SELECT heading,content FROM document_sections WHERE document_id=? ORDER BY order_no",
             (document_id,),
@@ -872,13 +891,25 @@ class CorpusCompletionService:
         title = normalize_text(str(document.get("title") or ""))
         visual_title = bool(
             re.search(
-                r"(?:^|[-_：:])(?:附图|封面|封皮|目录|COVER)|(?:布置图|系统图|示意图|机构图|效果图|流程图|曲线)$",
+                r"(?:^附图|(?:平面图|立面图|剖面图|布置图|系统图|示意图|配筋图|机构图|效果图|"
+                r"曲线图|流程图|网络图|进度图|横道图|节点图|大样图|详图|总图|施工图)$)",
+                title,
+                re.IGNORECASE,
+            )
+        ) and not bool(SCANNED_TEXTUAL_TITLE_PATTERN.search(title))
+        cover_or_directory = bool(
+            re.search(
+                r"(?:^|[-_：:])(?:封面|封皮|目录|COVER)(?:$|[-_：:（）()一二三四五六七八九十0-9])|(?:封面|封皮|目录)$",
                 title,
                 re.IGNORECASE,
             )
         )
         if has_visual_markup and meaningful_han < 80:
             return "visual_only_without_reusable_text"
+        if str(document.get("source_kind") or "") != "system_generated" and (visual_title or cover_or_directory):
+            return "historical_visual_or_front_matter_archived"
+        if char_count > 700:
+            return ""
         if visual_title and meaningful_han < 120:
             return "cover_directory_or_drawing_without_reusable_text"
         if char_count < 80 and meaningful_han < 40:
@@ -1454,11 +1485,22 @@ class CorpusCompletionService:
                         )
 
     def _advance(self, item: dict[str, Any], stage: str, **values: Any) -> None:
-        checkpoint = {key: value for key, value in values.items() if value is not None}
+        checkpoint = {
+            key: value
+            for key, value in values.items()
+            if value is not None and key not in {"clear_pipeline_run_id"}
+        }
         with self.db.connect() as conn:
             conn.execute(
-                "UPDATE corpus_run_items SET stage=?,status='pending',processing_job_id=COALESCE(?,processing_job_id),document_id=COALESCE(?,document_id),checkpoint_json=?,error_code='',error_message='',next_retry_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (stage, values.get("processing_job_id"), values.get("document_id"), json.dumps(checkpoint, ensure_ascii=False), item["id"]),
+                "UPDATE corpus_run_items SET stage=?,status='pending',attempt_count=0,processing_job_id=COALESCE(?,processing_job_id),document_id=COALESCE(?,document_id),pipeline_run_id=CASE WHEN ? THEN NULL ELSE pipeline_run_id END,checkpoint_json=?,error_code='',error_message='',next_retry_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (
+                    stage,
+                    values.get("processing_job_id"),
+                    values.get("document_id"),
+                    bool(values.get("clear_pipeline_run_id")),
+                    json.dumps(checkpoint, ensure_ascii=False),
+                    item["id"],
+                ),
             )
 
     def _terminal(self, item: dict[str, Any], reason: str, **values: Any) -> None:
@@ -1489,7 +1531,14 @@ class CorpusCompletionService:
             self._terminal(item, "encrypted_manual")
             return
         if effective_attempts >= 3 and not service_error:
-            self._terminal(item, "unreadable_excluded", checkpoint={"error": message, "attempts": effective_attempts})
+            if str(item.get("stage") or "") == "ai":
+                self._terminal(
+                    item,
+                    "no_reusable_knowledge",
+                    checkpoint={"reason": "insufficient_evidence_after_model_failures", "error": message, "attempts": effective_attempts},
+                )
+            else:
+                self._terminal(item, "unreadable_excluded", checkpoint={"error": message, "attempts": effective_attempts})
             return
         retry_index = min(effective_attempts - 1, 2) if not service_error else min(effective_attempts - 1, 2)
         delay = [1, 5, 15][retry_index]
@@ -1539,6 +1588,44 @@ class CorpusCompletionService:
                 """,
                 (run_id, cutoff),
             )
+
+    def _requeue_uncovered_batch_sources(self, run_id: int) -> int:
+        """Repair old batch outcomes that had no source-level model decision.
+
+        A shared extraction may legitimately find no reusable content for one
+        source, but silence is not an auditable decision.  Such sources get one
+        individual extraction/review route before they can be closed.
+        """
+        with self.db.connect() as conn:
+            updated = conn.execute(
+                """
+                UPDATE corpus_run_items SET stage='ai',status='pending',attempt_count=0,terminal_reason='',pipeline_run_id=NULL,
+                    checkpoint_json=?,completed_at=NULL,next_retry_at=NULL,updated_at=CURRENT_TIMESTAMP
+                WHERE run_id=? AND status='terminal' AND terminal_reason='no_reusable_knowledge'
+                  AND pipeline_run_id IS NOT NULL
+                  AND checkpoint_json LIKE '%"batch_documents"%'
+                  AND EXISTS (
+                      SELECT 1 FROM knowledge_ai_pipeline_runs p
+                      WHERE p.id=corpus_run_items.pipeline_run_id AND p.chunk_count>1
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM knowledge_ai_candidates c
+                      WHERE c.pipeline_run_id=corpus_run_items.pipeline_run_id
+                        AND c.source_id=corpus_run_items.source_id
+                  )
+                """,
+                (
+                    json.dumps(
+                        {
+                            "requires_individual_ai": True,
+                            "coverage_repair": "historical_batch_source_returned_no_candidate",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    run_id,
+                ),
+            )
+            return int(updated.rowcount or 0)
 
     def _record_result(self, run_id: int, succeeded: bool, error: str) -> None:
         run = self._raw_run(run_id)

@@ -45,7 +45,14 @@ class CorpusCompletionTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def _source(self, name: str, extension: str, status: str = "discovered", duplicate_of: int | None = None) -> int:
+    def _source(
+        self,
+        name: str,
+        extension: str,
+        status: str = "discovered",
+        duplicate_of: int | None = None,
+        source_kind: str = "raw",
+    ) -> int:
         path = self.settings.raw_root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"fixture")
@@ -57,11 +64,11 @@ class CorpusCompletionTest(unittest.TestCase):
                     source_kind,duplicate_of,status
                 ) VALUES (?,?,?,?,?,?,?,?,?,?)
                 """,
-                (str(path), name, path.name, extension, 7, content_hash(name), path.stem, "raw", duplicate_of, status),
+                (str(path), name, path.name, extension, 7, content_hash(name), path.stem, source_kind, duplicate_of, status),
             ).lastrowid)
 
-    def _document(self, name: str, title: str, content: str) -> int:
-        source_id = self._source(name, Path(name).suffix, "processed")
+    def _document(self, name: str, title: str, content: str, source_kind: str = "raw") -> int:
+        source_id = self._source(name, Path(name).suffix, "processed", source_kind=source_kind)
         with self.db.connect() as conn:
             document_id = int(conn.execute(
                 "INSERT INTO standard_documents(source_id,title,markdown_path,parser,char_count,text_fingerprint) VALUES (?,?,?,?,?,?)",
@@ -144,6 +151,28 @@ class CorpusCompletionTest(unittest.TestCase):
         document_id = self._document("measure.md", "施工复核与验收措施", content)
         self.assertEqual(self.corpus._deterministic_non_reusable_reason(document_id), "")
 
+    def test_long_historical_drawing_is_archived_but_system_generated_chart_is_allowed(self) -> None:
+        drawing = "塔吊 道路 围挡 加工区 材料堆场 " * 100
+        historical_id = self._document("old-layout.md", "主体阶段施工平面布置图", drawing)
+        generated_id = self._document(
+            "generated-flow.md",
+            "混凝土浇筑验收流程图",
+            "施工准备、隐蔽验收、浇筑申请、旁站检查和养护记录按顺序执行。" * 30,
+            source_kind="system_generated",
+        )
+        self.assertEqual(
+            self.corpus._deterministic_non_reusable_reason(historical_id),
+            "historical_visual_or_front_matter_archived",
+        )
+        self.assertEqual(self.corpus._deterministic_non_reusable_reason(generated_id), "")
+
+    def test_drawing_design_explanation_is_not_archived_by_title_only(self) -> None:
+        explanation = "施工平面布置应结合现场复核结果编制，明确道路、消防、临电和材料堆场，审批后实施。" * 30
+        document_id = self._document("layout-explanation.md", "施工平面布置图设计说明", explanation)
+        self.assertEqual(self.corpus._deterministic_non_reusable_reason(document_id), "")
+        attachment_id = self._document("attachment-explanation.md", "附图编制说明", explanation)
+        self.assertEqual(self.corpus._deterministic_non_reusable_reason(attachment_id), "")
+
     def test_single_page_historical_drawing_is_archived_without_ocr(self) -> None:
         source_id = self._source("建方 01-总平面图.pdf", ".pdf")
         run = self.corpus.create_run()
@@ -221,6 +250,67 @@ class CorpusCompletionTest(unittest.TestCase):
         self.assertEqual(second["markdown"], "chunk-0\n\nchunk-2")
         self.assertTrue(third["completed"])
         self.assertEqual(provider.call_count, 2)
+
+    def test_uncovered_batch_source_is_requeued_for_individual_review(self) -> None:
+        document_id = self._document("coverage.md", "批次覆盖补审", "施工前复核条件，完成后按标准验收。")
+        source_id = int((self.db.row("SELECT source_id FROM standard_documents WHERE id=?", (document_id,)) or {})["source_id"])
+        run = self.corpus.create_run()
+        with self.db.connect() as conn:
+            pipeline_run_id = int(conn.execute(
+                """
+                INSERT INTO knowledge_ai_pipeline_runs(document_id,pipeline_key,input_hash,status,chunk_count,completed_at)
+                VALUES (?,?,?,'completed',2,CURRENT_TIMESTAMP)
+                """,
+                (document_id, "coverage-repair", "input"),
+            ).lastrowid)
+            conn.execute(
+                """
+                UPDATE corpus_run_items SET stage='complete',status='terminal',terminal_reason='no_reusable_knowledge',
+                    document_id=?,pipeline_run_id=?,checkpoint_json=?,completed_at=CURRENT_TIMESTAMP
+                WHERE run_id=? AND source_id=?
+                """,
+                (document_id, pipeline_run_id, '{"batch_documents": 2}', run["id"], source_id),
+            )
+        self.assertEqual(self.corpus._requeue_uncovered_batch_sources(run["id"]), 1)
+        item = self.db.row("SELECT * FROM corpus_run_items WHERE run_id=? AND source_id=?", (run["id"], source_id))
+        self.assertEqual((item["stage"], item["status"], item["pipeline_run_id"], item["attempt_count"]), ("ai", "pending", None, 0))
+        self.assertTrue(self.corpus._claim_ai_batch(item)[0]["id"] == item["id"])
+        self.assertEqual(len(self.corpus._claim_ai_batch(item)), 1)
+
+    def test_ai_source_failure_closes_as_insufficient_evidence_not_unreadable(self) -> None:
+        source_id = self._source("model-failure.txt", ".txt")
+        run = self.corpus.create_run()
+        item = self.db.row("SELECT * FROM corpus_run_items WHERE run_id=? AND source_id=?", (run["id"], source_id))
+        with self.db.connect() as conn:
+            conn.execute("UPDATE corpus_run_items SET stage='ai',status='running',attempt_count=2 WHERE id=?", (item["id"],))
+        item = self.db.row("SELECT * FROM corpus_run_items WHERE id=?", (item["id"],))
+        self.corpus._handle_failure(item, RuntimeError("invalid candidate output"), service_error=False)
+        state = self.db.row("SELECT terminal_reason,checkpoint_json FROM corpus_run_items WHERE id=?", (item["id"],))
+        self.assertEqual(state["terminal_reason"], "no_reusable_knowledge")
+        self.assertIn("insufficient_evidence_after_model_failures", state["checkpoint_json"])
+
+    def test_failed_individual_pipeline_is_retried_not_closed_as_empty(self) -> None:
+        document_id = self._document(
+            "failed-pipeline.md",
+            "施工质量复核",
+            "施工前核对图纸和标准，完成后逐项检查并形成验收记录。" * 5,
+        )
+        source_id = int((self.db.row("SELECT source_id FROM standard_documents WHERE id=?", (document_id,)) or {})["source_id"])
+        run = self.corpus.create_run()
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE corpus_run_items SET stage='ai',status='running',document_id=? WHERE run_id=? AND source_id=?",
+                (document_id, run["id"], source_id),
+            )
+        item = self.db.row("SELECT * FROM corpus_run_items WHERE run_id=? AND source_id=?", (run["id"], source_id))
+        self.pipeline.process_document = lambda *_args, **_kwargs: {
+            "id": 999,
+            "status": "failed",
+            "failed_chunks": 0,
+            "error_message": "AI未生成候选知识",
+        }
+        with self.assertRaisesRegex(RuntimeError, "status=failed"):
+            self.corpus._process_ai(item)
 
     def test_manual_asset_resolution_requires_explicit_approve_or_exclude(self) -> None:
         source_id = self._source("batch/table.xlsx", ".xlsx", "asset")
