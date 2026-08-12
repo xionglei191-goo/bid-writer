@@ -901,6 +901,9 @@ class CorpusCompletionService:
             task = conn.execute("SELECT id FROM governance_tasks WHERE run_id=? AND task_key=?", (run_id, key)).fetchone()
             if task:
                 conn.execute("INSERT OR IGNORE INTO governance_task_sources(task_id,source_id) VALUES (?,?)", (task["id"], source_id))
+        # Keep the human queue grouped while governance continues to discover
+        # additional members of an already-seen source batch.
+        self._consolidate_manual_tasks(run_id)
 
     @staticmethod
     def _governance_task_key(source: dict[str, Any], source_id: int, task_type: str) -> str:
