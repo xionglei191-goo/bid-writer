@@ -455,6 +455,7 @@ class CorpusCompletionService:
             JOIN standard_documents d ON d.id=i.document_id
             WHERE i.run_id=? AND i.stage='ai' AND i.status IN ('pending','retrying')
               AND (i.next_retry_at IS NULL OR i.next_retry_at<=?)
+              AND i.checkpoint_json NOT LIKE '%"requires_individual_ai": true%'
               AND d.char_count<=24000 AND i.id<>?
             ORDER BY i.id LIMIT 12
             """,

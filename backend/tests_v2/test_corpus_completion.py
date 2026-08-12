@@ -277,6 +277,31 @@ class CorpusCompletionTest(unittest.TestCase):
         self.assertTrue(self.corpus._claim_ai_batch(item)[0]["id"] == item["id"])
         self.assertEqual(len(self.corpus._claim_ai_batch(item)), 1)
 
+    def test_individual_repairs_do_not_fill_batch_candidate_limit(self) -> None:
+        document_ids = [
+            self._document(
+                f"batch-limit-{index}.md",
+                f"批次调度{index}",
+                "施工前复核条件，完成后逐项检查并形成记录。" * 3,
+            )
+            for index in range(14)
+        ]
+        run = self.corpus.create_run()
+        with self.db.connect() as conn:
+            for index, document_id in enumerate(document_ids):
+                source_id = int((self.db.row("SELECT source_id FROM standard_documents WHERE id=?", (document_id,)) or {})["source_id"])
+                checkpoint = '{"requires_individual_ai": true}' if 0 < index < 13 else '{}'
+                conn.execute(
+                    "UPDATE corpus_run_items SET stage='ai',status='pending',document_id=?,checkpoint_json=? WHERE run_id=? AND source_id=?",
+                    (document_id, checkpoint, run["id"], source_id),
+                )
+        first = self.db.row(
+            "SELECT i.* FROM corpus_run_items i WHERE i.run_id=? AND i.document_id=?",
+            (run["id"], document_ids[0]),
+        )
+        claimed = self.corpus._claim_ai_batch(first)
+        self.assertEqual({int(item["document_id"]) for item in claimed}, {document_ids[0], document_ids[-1]})
+
     def test_ai_source_failure_closes_as_insufficient_evidence_not_unreadable(self) -> None:
         source_id = self._source("model-failure.txt", ".txt")
         run = self.corpus.create_run()
