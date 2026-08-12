@@ -277,6 +277,41 @@ class CorpusCompletionTest(unittest.TestCase):
         self.assertTrue(self.corpus._claim_ai_batch(item)[0]["id"] == item["id"])
         self.assertEqual(len(self.corpus._claim_ai_batch(item)), 1)
 
+    def test_audited_batch_source_is_not_reopened_by_legacy_coverage_repair(self) -> None:
+        document_id = self._document("audited.md", "已审计批次", "该资料仅含历史项目专属事实，不能形成跨项目通用知识。")
+        source_id = int((self.db.row("SELECT source_id FROM standard_documents WHERE id=?", (document_id,)) or {})["source_id"])
+        run = self.corpus.create_run()
+        with self.db.connect() as conn:
+            pipeline_run_id = int(conn.execute(
+                """
+                INSERT INTO knowledge_ai_pipeline_runs(document_id,pipeline_key,input_hash,status,chunk_count,completed_at)
+                VALUES (?,?,?,'completed',2,CURRENT_TIMESTAMP)
+                """,
+                (document_id, "audited-coverage", "input"),
+            ).lastrowid)
+            conn.execute(
+                """
+                UPDATE corpus_run_items SET stage='complete',status='terminal',terminal_reason='no_reusable_knowledge',
+                    document_id=?,pipeline_run_id=?,checkpoint_json=?,completed_at=CURRENT_TIMESTAMP
+                WHERE run_id=? AND source_id=?
+                """,
+                (document_id, pipeline_run_id, '{"batch_documents": 2}', run["id"], source_id),
+            )
+            for stage in ("extraction", "independent_review"):
+                conn.execute(
+                    """
+                    INSERT INTO knowledge_source_dispositions(
+                        pipeline_run_id,document_id,source_id,decision_stage,decision,confidence,reason,
+                        actor_type,prompt_key,prompt_version
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (pipeline_run_id, document_id, source_id, stage, "not_reusable", 0.99,
+                     "两阶段均确认只有历史项目专属事实。", "ai", "fixture", "1"),
+                )
+        self.assertEqual(self.corpus._requeue_uncovered_batch_sources(run["id"]), 0)
+        item = self.db.row("SELECT stage,status,terminal_reason FROM corpus_run_items WHERE run_id=? AND source_id=?", (run["id"], source_id))
+        self.assertEqual(item, {"stage": "complete", "status": "terminal", "terminal_reason": "no_reusable_knowledge"})
+
     def test_individual_repairs_do_not_fill_batch_candidate_limit(self) -> None:
         document_ids = [
             self._document(

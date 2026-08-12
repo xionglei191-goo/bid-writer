@@ -1644,6 +1644,11 @@ class CorpusCompletionService:
                       WHERE c.pipeline_run_id=corpus_run_items.pipeline_run_id
                         AND c.source_id=corpus_run_items.source_id
                   )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM knowledge_source_dispositions d
+                      WHERE d.pipeline_run_id=corpus_run_items.pipeline_run_id
+                        AND d.source_id=corpus_run_items.source_id
+                  )
                 """,
                 (
                     json.dumps(
