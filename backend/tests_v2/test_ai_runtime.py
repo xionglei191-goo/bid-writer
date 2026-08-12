@@ -46,6 +46,9 @@ class FakeLlm:
 
 
 class AiRuntimeTest(unittest.TestCase):
+    def test_llm_timeout_has_safe_long_task_default(self) -> None:
+        self.assertGreaterEqual(LlmClient().settings()["timeout_seconds"], 600)
+
     def test_repairs_only_json_trailing_commas(self) -> None:
         payload = LlmClient.json_payload('{"text":"keep ,} here","items":[{"value":1,},],}')
         self.assertEqual(payload, {"text": "keep ,} here", "items": [{"value": 1}]})

@@ -395,13 +395,15 @@ class CorpusCompletionService:
             item = self.db.row(
                 f"""
                 SELECT i.*,s.absolute_path,s.relative_path,s.file_name,s.extension,s.source_kind,s.parent_source_id,
-                    s.status AS source_status,s.error_message AS source_error,s.industry
+                    s.status AS source_status,s.error_message AS source_error,s.industry,d.char_count AS document_char_count
                 FROM corpus_run_items i JOIN source_files s ON s.id=i.source_id
+                LEFT JOIN standard_documents d ON d.id=i.document_id
                 WHERE i.run_id=? AND i.status IN ('pending','retrying')
                   AND (i.next_retry_at IS NULL OR i.next_retry_at<=?)
                   {stage_clause}
                 ORDER BY CASE i.stage WHEN 'normalize' THEN 1 WHEN 'ocr' THEN 2 WHEN 'governance' THEN 3 WHEN 'ai' THEN 4 ELSE 5 END,
-                    CASE WHEN i.stage IN ('normalize','ocr') THEN s.size_bytes ELSE 0 END,i.id LIMIT 1
+                    CASE WHEN i.stage IN ('normalize','ocr') THEN s.size_bytes ELSE 0 END,
+                    CASE WHEN i.stage='ai' THEN COALESCE(d.char_count,2147483647) ELSE 0 END,i.id LIMIT 1
                 """,
                 params,
             )
@@ -462,7 +464,7 @@ class CorpusCompletionService:
             if updated.rowcount:
                 claimed.append(candidate)
                 used_chars += candidate_chars
-            if len(claimed) >= 4:
+            if len(claimed) >= 8:
                 break
         return claimed
 
@@ -494,6 +496,11 @@ class CorpusCompletionService:
             self.dispatch(run_id, delay_ms, desired, stage)
 
     def _normalize_item(self, item: dict[str, Any]) -> None:
+        if str(item.get("file_name") or "").startswith("~$"):
+            with self.db.connect() as conn:
+                conn.execute("UPDATE source_files SET status='metadata_only',updated_at=CURRENT_TIMESTAMP WHERE id=?", (item["source_id"],))
+            self._terminal(item, "metadata_only_excluded", checkpoint={"reason": "office_lock_file"})
+            return
         existing = self.db.row("SELECT * FROM standard_documents WHERE source_id=?", (item["source_id"],))
         if (
             existing

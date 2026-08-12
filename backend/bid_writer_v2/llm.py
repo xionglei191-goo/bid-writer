@@ -33,6 +33,7 @@ class LlmClient:
             "base_url": environment_value("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/"),
             "model": environment_value("OPENAI_MODEL", "gpt-5.6-luna"),
             "wire_api": environment_value("OPENAI_WIRE_API", "responses").lower(),
+            "timeout_seconds": max(60, int(environment_value("OPENAI_TIMEOUT_SECONDS", "600"))),
         }
 
     def generate(self, instructions: str, prompt: str, max_output_tokens: int = 8000) -> dict[str, Any]:
@@ -107,7 +108,7 @@ class LlmClient:
                     "input": prompt,
                     "max_output_tokens": max_output_tokens,
                 },
-                timeout=180,
+                timeout=int(settings.get("timeout_seconds") or 600),
             )
         return requests.post(
             f"{settings['base_url']}/chat/completions",
@@ -121,7 +122,7 @@ class LlmClient:
                 "temperature": 0.2,
                 "max_tokens": max_output_tokens,
             },
-            timeout=180,
+            timeout=int(settings.get("timeout_seconds") or 600),
         )
 
     @staticmethod
