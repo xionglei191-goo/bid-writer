@@ -611,8 +611,8 @@ class CorpusCompletionTest(unittest.TestCase):
         self.corpus.dispatch = lambda run_id, delay, desired, stage: dispatched.append((run_id, delay, desired, stage))
         with self.db.connect() as conn:
             conn.execute(
-                "UPDATE corpus_runs SET consecutive_errors=4,recent_results_json=? WHERE id=?",
-                ('[{"ok": false}]', run["id"]),
+                "UPDATE corpus_runs SET checkpoint_json=? WHERE id=?",
+                ('{"service_health":{"ai":{"consecutive_errors":4,"recent_results":[{"ok":false}]}}}', run["id"]),
             )
         self.corpus._record_result(run["id"], False, "HTTP 503", service_stage="ai")
         state = self.db.row("SELECT status,pause_reason,checkpoint_json FROM corpus_runs WHERE id=?", (run["id"],))
@@ -620,6 +620,19 @@ class CorpusCompletionTest(unittest.TestCase):
         self.assertTrue(state["pause_reason"].startswith("外部服务错误"))
         self.assertIn('"service_pause_stage": "ai"', state["checkpoint_json"])
         self.assertEqual(dispatched, [(run["id"], 15 * 60 * 1000, 1, "__recovery__")])
+
+    def test_other_stage_success_does_not_dilute_ai_failure_window(self) -> None:
+        self._source("stage-health.txt", ".txt")
+        run = self.corpus.create_run()
+        self.corpus._record_result(run["id"], False, "HTTP 429", service_stage="ai")
+        self.corpus._record_result(run["id"], True, "", service_stage="ocr")
+        self.corpus._record_result(run["id"], True, "")
+
+        state = self.corpus.get_run(run["id"])
+        health = state["checkpoint"]["service_health"]
+        self.assertEqual(health["ai"]["consecutive_errors"], 1)
+        self.assertEqual(len(health["ai"]["recent_results"]), 1)
+        self.assertEqual(health["ocr"]["consecutive_errors"], 0)
 
     def test_failed_ai_recovery_probe_keeps_run_paused(self) -> None:
         self._source("recovery-probe.txt", ".txt")

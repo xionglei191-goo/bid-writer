@@ -443,7 +443,12 @@ class CorpusCompletionService:
                 self._process_ai_batch(active_items, progress=progress, cancelled=cancelled)
             else:
                 self._terminal(item, "no_reusable_knowledge")
-            self._record_result(run_id, True, "")
+            self._record_result(
+                run_id,
+                True,
+                "",
+                service_stage=str(item["stage"]) if str(item["stage"]) in {"ai", "ocr"} else "",
+            )
         except Exception as exc:  # noqa: BLE001
             service_error = str(item["stage"]) in {"ai", "ocr"} and any(
                 marker in f"{type(exc).__name__}: {exc}".lower() for marker in SERVICE_ERROR_MARKERS
@@ -1806,13 +1811,25 @@ class CorpusCompletionService:
         run = self._raw_run(run_id)
         policy = parse_json(run.get("policy_json"), {})
         checkpoint = parse_json(run.get("checkpoint_json"), {})
-        recent = parse_json(run.get("recent_results_json"), [])
+        if not service_stage:
+            return
+        health = checkpoint.setdefault("service_health", {})
+        stage_health = health.setdefault(service_stage, {})
+        recent = list(stage_health.get("recent_results") or [])
         recent.append({"ok": bool(succeeded), "at": iso_now(), "error": error[:300]})
         recent = recent[-int(policy.get("recent_window", 20)):]
-        consecutive = 0 if succeeded else int(run.get("consecutive_errors") or 0) + 1
+        consecutive = 0 if succeeded else int(stage_health.get("consecutive_errors") or 0) + 1
         failures = sum(not item["ok"] for item in recent)
         rate = failures / len(recent) if recent else 0
         should_pause = consecutive >= int(policy.get("service_consecutive_error_limit", 5)) or (len(recent) >= 20 and rate > float(policy.get("recent_failure_rate", 0.2)))
+        stage_health.update(
+            {
+                "consecutive_errors": consecutive,
+                "recent_results": recent,
+                "failure_rate": round(rate, 4),
+                "updated_at": iso_now(),
+            }
+        )
         if should_pause and service_stage:
             checkpoint["service_pause_stage"] = service_stage
             checkpoint["service_recovery_probe"] = {
