@@ -56,9 +56,9 @@ def build_router(service: CorpusCompletionService) -> APIRouter:
         return service.completion(run_id)
 
     @router.get("/manual-tasks")
-    def manual_tasks(request: Request, status: str = "open", limit: int = Query(default=500, ge=1, le=500)) -> list[dict[str, Any]]:
+    def manual_tasks(request: Request, status: str = "open", limit: int = Query(default=500, ge=1, le=500), run_id: int | None = None) -> list[dict[str, Any]]:
         _admin(request)
-        return service.list_manual_tasks(status, limit)
+        return service.list_manual_tasks(status, limit, run_id)
 
     @router.post("/manual-tasks/{task_id}/resolve")
     def resolve_manual_task(task_id: int, payload: ResolveTaskRequest, request: Request) -> dict[str, Any]:

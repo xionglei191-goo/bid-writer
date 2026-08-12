@@ -515,6 +515,18 @@ class CorpusCompletionTest(unittest.TestCase):
         self.assertEqual(len(tasks), 1)
         self.assertEqual({row["source_id"] for row in links}, {first, second})
 
+    def test_manual_task_list_defaults_to_latest_run(self) -> None:
+        first_source = self._source("old-license.png", ".png", "asset")
+        first = self.corpus.create_run()
+        self.corpus._legal_task(first["id"], first_source, "asset_license", "old", "old task")
+        self.corpus.cancel(first["id"])
+        second = self.corpus.create_run()
+        second_source = self._source("new-license.png", ".png", "asset")
+        self.corpus._legal_task(second["id"], second_source, "asset_license", "new", "new task")
+        tasks = self.corpus.list_manual_tasks("open")
+        self.assertTrue(tasks)
+        self.assertEqual({task["run_id"] for task in tasks}, {second["id"]})
+
     def test_service_fuse_schedules_automatic_recovery_probe(self) -> None:
         source_id = self._source("fuse.txt", ".txt")
         run = self.corpus.create_run()

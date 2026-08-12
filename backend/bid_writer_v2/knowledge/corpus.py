@@ -1952,9 +1952,16 @@ class CorpusCompletionService:
             "index_consistent": bool(index) and int(index.get("publication_count") or 0) == published_count,
         }
 
-    def list_manual_tasks(self, status: str = "open", limit: int = 500) -> list[dict[str, Any]]:
-        where = "WHERE t.status=?" if status else ""
-        params: list[Any] = [status] if status else []
+    def list_manual_tasks(self, status: str = "open", limit: int = 500, run_id: int | None = None) -> list[dict[str, Any]]:
+        if run_id is None:
+            latest = self.db.row("SELECT id FROM corpus_runs ORDER BY id DESC LIMIT 1")
+            run_id = int(latest["id"]) if latest else 0
+        clauses = ["t.run_id=?"]
+        params: list[Any] = [run_id]
+        if status:
+            clauses.append("t.status=?")
+            params.append(status)
+        where = "WHERE " + " AND ".join(clauses)
         return self.db.rows(f"SELECT t.*,s.file_name,s.relative_path FROM governance_tasks t LEFT JOIN source_files s ON s.id=t.source_id {where} ORDER BY t.id DESC LIMIT ?", [*params, max(1, min(limit, 500))])
 
     def resolve_manual_task(self, task_id: int, action: str, resolution: str, user_id: int | None) -> dict[str, Any]:
