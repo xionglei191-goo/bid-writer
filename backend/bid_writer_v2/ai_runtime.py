@@ -455,6 +455,31 @@ class AiRuntime:
             error_code = "model_unavailable" if not settings.get("configured") else "model_call_failed"
             error_message = error_message or "模型未返回内容"
 
+        if payload is None and error_code in {"schema_validation_failed", "invalid_json"}:
+            retry_prompt = (
+                f"{prompt}\n\n"
+                "上次输出未通过JSON结构校验。请严格按照要求的JSON对象结构重新完整输出；"
+                "不要使用Markdown代码块，不要省略必填字段，不要添加说明文字。"
+            )
+            retried = self.llm.generate(spec.instructions, retry_prompt, max_output_tokens)
+            retry_text = str(retried.get("content") or "")
+            retry_parsed = self.llm.json_payload(retry_text) if retry_text else None
+            if retry_parsed is not None:
+                retry_payload, retry_errors = self._validate_payload(spec, retry_parsed)
+                if retry_payload is not None:
+                    result = {
+                        **retried,
+                        "latency_ms": int(result.get("latency_ms") or 0) + int(retried.get("latency_ms") or 0),
+                        "attempts": int(result.get("attempts") or 0) + int(retried.get("attempts") or 0),
+                        "input_tokens": int(result.get("input_tokens") or 0) + int(retried.get("input_tokens") or 0),
+                        "output_tokens": int(result.get("output_tokens") or 0) + int(retried.get("output_tokens") or 0),
+                    }
+                    output_text = retry_text
+                    payload = retry_payload
+                    validation_errors = retry_errors
+                    error_code = ""
+                    error_message = ""
+
         status = "succeeded" if payload is not None else "failed"
         with self.db.connect() as conn:
             conn.execute(

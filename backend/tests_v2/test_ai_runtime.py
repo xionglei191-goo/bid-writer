@@ -45,9 +45,52 @@ class FakeLlm:
     json_payload = staticmethod(LlmClient.json_payload)
 
 
+class RetrySchemaLlm(FakeLlm):
+    def generate(self, instructions: str, prompt: str, max_output_tokens: int = 8000) -> dict:
+        self.calls += 1
+        content = "not-json" if self.calls == 1 else json.dumps(self.payload, ensure_ascii=False)
+        return {
+            **self.settings(),
+            "content": content,
+            "error": "",
+            "latency_ms": 25,
+            "attempts": 1,
+            "input_tokens": 120,
+            "output_tokens": 60,
+        }
+
+
 class AiRuntimeTest(unittest.TestCase):
     def test_llm_timeout_has_safe_long_task_default(self) -> None:
         self.assertGreaterEqual(LlmClient().settings()["timeout_seconds"], 600)
+
+    def test_schema_failure_gets_one_targeted_model_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            db = Database(Path(root) / "retry.sqlite3")
+            db.migrate()
+            llm = RetrySchemaLlm({
+                "candidates": [{
+                    "source_section_id": 1,
+                    "title": "可复用管理措施",
+                    "unit_type": "management_measure",
+                    "content": "施工前完成条件复核，施工中执行检查，发现偏差后整改并形成闭环记录。",
+                    "summary": "复核、检查和整改闭环。",
+                    "tags": ["闭环"],
+                    "applicability": "建设工程施工管理",
+                    "risk_level": "low",
+                    "source_quote": "施工前完成条件复核，施工中执行检查，发现偏差后整改并形成闭环记录。",
+                }]
+            })
+            runtime = AiRuntime(db, llm)
+            result = runtime.execute(
+                KNOWLEDGE_EXTRACTION_PROMPT,
+                "extract",
+                {"source": "fixture"},
+                task_type="schema_retry",
+            )
+            self.assertEqual(llm.calls, 2)
+            self.assertEqual(len(result["payload"]["candidates"]), 1)
+            self.assertFalse(result["error"])
 
     def test_repairs_only_json_trailing_commas(self) -> None:
         payload = LlmClient.json_payload('{"text":"keep ,} here","items":[{"value":1,},],}')
