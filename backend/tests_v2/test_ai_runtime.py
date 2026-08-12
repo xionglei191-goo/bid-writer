@@ -127,6 +127,57 @@ class AiRuntimeTest(unittest.TestCase):
         self.assertEqual(result["payload"]["source_dispositions"][0]["confidence"], 0)
         self.assertTrue(any(item["type"] == "truncated" for item in result["validation_errors"]))
 
+    def test_batch_extraction_revalidates_exact_failed_input_after_prompt_upgrade(self) -> None:
+        payload = {
+            "candidates": [],
+            "source_dispositions": [{
+                "document_id": 7,
+                "decision": "not_reusable",
+                "reason": "仅含历史项目专属事实，不能形成跨项目通用知识。",
+                "evidence_quote": "",
+            }],
+        }
+        source_input = {"document_ids": [7], "section_text": "[DOCUMENT:7]仅有封面"}
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ai_runs(
+                    task_type,target_type,target_id,prompt_key,prompt_version,prompt_hash,input_hash,cache_key,
+                    model,base_url,wire_api,status,input_json,output_text,error_code,error_message,completed_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,'failed',?,?,?,? ,CURRENT_TIMESTAMP)
+                """,
+                (
+                    "knowledge_batch_candidate_extraction",
+                    "standard_document_batch",
+                    7,
+                    KNOWLEDGE_BATCH_EXTRACTION_PROMPT.key,
+                    "1.0.0",
+                    "old-prompt-hash",
+                    "old-input-hash",
+                    "old-cache-key",
+                    "test-model",
+                    "http://model.test/v1",
+                    "responses",
+                    json.dumps({"payload": source_input, "rendered_prompt": "old prompt"}, ensure_ascii=False),
+                    json.dumps(payload, ensure_ascii=False),
+                    "schema_validation_failed",
+                    "old schema rejected missing confidence",
+                ),
+            )
+        llm = FakeLlm({"should": "not be called"})
+        runtime = AiRuntime(self.db, llm)  # type: ignore[arg-type]
+        result = runtime.execute(
+            KNOWLEDGE_BATCH_EXTRACTION_PROMPT,
+            "new prompt",
+            source_input,
+            task_type="knowledge_batch_candidate_extraction",
+            target_type="standard_document_batch",
+            target_id=7,
+        )
+        self.assertTrue(result["cached"])
+        self.assertEqual(result["payload"]["source_dispositions"][0]["confidence"], 0)
+        self.assertEqual(llm.calls, 0)
+
     def test_repairs_only_json_trailing_commas(self) -> None:
         payload = LlmClient.json_payload('{"text":"keep ,} here","items":[{"value":1,},],}')
         self.assertEqual(payload, {"text": "keep ,} here", "items": [{"value": 1}]})

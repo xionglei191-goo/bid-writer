@@ -473,6 +473,8 @@ class AiRuntime:
             if cached:
                 return self._record_cache_hit(spec, task_type, target_type, target_id, input_json, input_hash, cache_key, settings, cached)
             recovered = self._revalidate_failed_run(cache_key, spec)
+            if recovered is None:
+                recovered = self._revalidate_compatible_failed_batch_run(spec, task_type, input_payload)
             if recovered:
                 return self._record_cache_hit(spec, task_type, target_type, target_id, input_json, input_hash, cache_key, settings, recovered)
 
@@ -662,6 +664,56 @@ class AiRuntime:
         recovered["output_json"] = json.dumps(payload, ensure_ascii=False)
         recovered["validation_errors_json"] = json.dumps(validation_errors, ensure_ascii=False)
         return recovered
+
+    def _revalidate_compatible_failed_batch_run(
+        self,
+        spec: PromptSpec,
+        task_type: str,
+        input_payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Reuse an exact failed batch input after a compatible prompt/schema repair.
+
+        The full structured input is compared before revalidation. This deliberately
+        ignores only the rendered prompt and prompt hash, so an output can never leak
+        between different documents, sections, or source text.
+        """
+        if spec.output_model is not KnowledgeBatchExtractionOutput:
+            return None
+        expected = json.dumps(input_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM ai_runs
+                WHERE task_type=? AND prompt_key=? AND status='failed' AND output_text<>''
+                ORDER BY id DESC LIMIT 50
+                """,
+                (task_type, spec.key),
+            ).fetchall()
+        for row in rows:
+            try:
+                previous_input = json.loads(str(row["input_json"] or "{}"))
+                previous_payload = previous_input.get("payload")
+                comparable = json.dumps(
+                    previous_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if comparable != expected:
+                continue
+            parsed = self.llm.json_payload(str(row["output_text"] or ""))
+            if parsed is None:
+                continue
+            payload, validation_errors = self._validate_payload(spec, parsed)
+            if payload is None:
+                continue
+            recovered = dict(row)
+            recovered["output_json"] = json.dumps(payload, ensure_ascii=False)
+            recovered["validation_errors_json"] = json.dumps(validation_errors, ensure_ascii=False)
+            return recovered
+        return None
 
     @staticmethod
     def _validate_payload(spec: PromptSpec, parsed: dict[str, Any]) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
