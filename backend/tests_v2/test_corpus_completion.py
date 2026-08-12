@@ -525,6 +525,38 @@ class CorpusCompletionTest(unittest.TestCase):
         self.assertEqual((item["stage"], item["status"]), ("normalize", "pending"))
         self.assertEqual(tasks, [{"task_type": "credentials", "status": "open"}])
 
+    def test_rebuild_preserves_two_stage_verified_exclusion(self) -> None:
+        document_id = self._document("recovered-disposition.md", "已复核排除", "该资料仅含历史项目专属事实，不能形成通用知识。")
+        source_id = int((self.db.row("SELECT source_id FROM standard_documents WHERE id=?", (document_id,)) or {})["source_id"])
+        run = self.corpus.create_run()
+        with self.db.connect() as conn:
+            pipeline_run_id = int(conn.execute(
+                """
+                INSERT INTO knowledge_ai_pipeline_runs(document_id,pipeline_key,input_hash,status,chunk_count,completed_at)
+                VALUES (?,?,?,'completed',2,CURRENT_TIMESTAMP)
+                """,
+                (document_id, "recovery-disposition", "input"),
+            ).lastrowid)
+            for stage in ("extraction", "independent_review"):
+                conn.execute(
+                    """
+                    INSERT INTO knowledge_source_dispositions(
+                        pipeline_run_id,document_id,source_id,decision_stage,decision,confidence,reason,
+                        actor_type,prompt_key,prompt_version
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (pipeline_run_id, document_id, source_id, stage, "not_reusable", 0.99,
+                     "两阶段均确认只有历史项目专属事实。", "ai", "fixture", "1"),
+                )
+        rebuilt = self.corpus.rebuild_run_from_persisted_results(run["id"])
+        item = self.db.row(
+            "SELECT stage,status,terminal_reason,pipeline_run_id,checkpoint_json FROM corpus_run_items WHERE run_id=? AND source_id=?",
+            (rebuilt["id"], source_id),
+        )
+        self.assertEqual((item["stage"], item["status"], item["terminal_reason"]), ("complete", "terminal", "no_reusable_knowledge"))
+        self.assertEqual(item["pipeline_run_id"], pipeline_run_id)
+        self.assertIn("source_disposition_recovered", item["checkpoint_json"])
+
     def test_deployment_restart_does_not_consume_source_retry_budget(self) -> None:
         source_id = self._source("restart.txt", ".txt")
         run = self.corpus.create_run()

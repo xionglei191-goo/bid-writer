@@ -214,6 +214,17 @@ class CorpusCompletionService:
                 processing_job_id = int(job["id"]) if job else None
                 if document:
                     document_id = int(document["id"])
+                    disposition = self.db.row(
+                        """
+                        SELECT pipeline_run_id,
+                            COUNT(DISTINCT decision_stage) AS stages,
+                            SUM(CASE WHEN decision='not_reusable' AND confidence>=0.95 THEN 1 ELSE 0 END) AS verified
+                        FROM knowledge_source_dispositions
+                        WHERE document_id=? AND decision_stage IN ('extraction','independent_review')
+                        GROUP BY pipeline_run_id ORDER BY pipeline_run_id DESC LIMIT 1
+                        """,
+                        (document_id,),
+                    )
                     candidate = self.db.row(
                         """
                         SELECT c.pipeline_run_id,
@@ -226,7 +237,11 @@ class CorpusCompletionService:
                         """,
                         (document_id,),
                     )
-                    if candidate and not int(candidate.get("unfinished") or 0):
+                    if disposition and int(disposition.get("stages") or 0) == 2 and int(disposition.get("verified") or 0) == 2:
+                        pipeline_run_id = int(disposition["pipeline_run_id"])
+                        status, stage, reason = "terminal", "complete", "no_reusable_knowledge"
+                        checkpoint.update({"reason": "two_stage_ai_verified_not_reusable", "source_disposition_recovered": True})
+                    elif candidate and not int(candidate.get("unfinished") or 0):
                         pipeline_run_id = int(candidate["pipeline_run_id"])
                         status, stage = "terminal", "complete"
                         if int(candidate.get("accepted") or 0):
