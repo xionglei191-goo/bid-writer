@@ -7,6 +7,7 @@ from pathlib import Path
 
 from bid_writer_v2.ai_runtime import (
     AiRuntime,
+    KNOWLEDGE_BATCH_EXTRACTION_PROMPT,
     KnowledgeCandidateReview,
     KnowledgeExtractionCandidate,
     KNOWLEDGE_EXTRACTION_PROMPT,
@@ -91,6 +92,40 @@ class AiRuntimeTest(unittest.TestCase):
             self.assertEqual(llm.calls, 2)
             self.assertEqual(len(result["payload"]["candidates"]), 1)
             self.assertFalse(result["error"])
+
+    def test_batch_extraction_safely_truncates_candidates_and_defaults_missing_confidence_to_zero(self) -> None:
+        candidate = {
+            "source_section_id": 1,
+            "title": "可复用管理措施",
+            "unit_type": "management_measure",
+            "content": "施工前完成条件复核，施工中实施检查，发现偏差后整改并形成闭环记录。",
+            "summary": "复核、检查和整改闭环。",
+            "tags": ["闭环"],
+            "applicability": "建设工程施工管理",
+            "risk_level": "low",
+            "source_quote": "施工前完成条件复核，施工中实施检查，发现偏差后整改并形成闭环记录。",
+        }
+        payload = {
+            "candidates": [{**candidate, "title": f"可复用管理措施{index}"} for index in range(21)],
+            "source_dispositions": [
+                {
+                    "document_id": 7,
+                    "decision": "not_reusable",
+                    "reason": "仅含历史项目专属事实，不能形成跨项目通用知识。",
+                    "evidence_quote": "",
+                }
+            ],
+        }
+        runtime = AiRuntime(self.db, FakeLlm(payload))  # type: ignore[arg-type]
+        result = runtime.execute(
+            KNOWLEDGE_BATCH_EXTRACTION_PROMPT,
+            "batch",
+            {"document_ids": [7]},
+            task_type="knowledge_batch_candidate_extraction",
+        )
+        self.assertEqual(len(result["payload"]["candidates"]), 20)
+        self.assertEqual(result["payload"]["source_dispositions"][0]["confidence"], 0)
+        self.assertTrue(any(item["type"] == "truncated" for item in result["validation_errors"]))
 
     def test_repairs_only_json_trailing_commas(self) -> None:
         payload = LlmClient.json_payload('{"text":"keep ,} here","items":[{"value":1,},],}')

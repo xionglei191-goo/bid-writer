@@ -120,7 +120,7 @@ class KnowledgeSourceDisposition(BaseModel):
 
     document_id: int = Field(gt=0)
     decision: Literal["reusable", "not_reusable", "escalate"]
-    confidence: float = Field(ge=0, le=1)
+    confidence: float = Field(default=0, ge=0, le=1)
     reason: str = Field(min_length=5, max_length=500)
     evidence_quote: str = Field(default="", max_length=1200)
 
@@ -331,7 +331,7 @@ KNOWLEDGE_EXTRACTION_PROMPT = PromptSpec(
 
 KNOWLEDGE_BATCH_EXTRACTION_PROMPT = PromptSpec(
     key="knowledge.extract-batch-with-source-disposition",
-    version="1.0.0",
+    version="1.0.1",
     instructions=(
         "你是建设工程知识工程师。逐份判断输入文档是否含有原文明确支持、可跨项目复用的知识。"
         "不得补充原文没有的参数、规范编号、设备数量、工期或承诺。每份文档必须给出独立处置结论。"
@@ -339,8 +339,9 @@ KNOWLEDGE_BATCH_EXTRACTION_PROMPT = PromptSpec(
     template=(
         "处理以下由[DOCUMENT:编号]和[SECTION:编号]标记的多份标准文档。输出JSON对象，完整包含candidates和"
         "source_dispositions。source_dispositions必须为每个DOCUMENT编号恰好输出一条，decision只能为reusable、"
-        "not_reusable或escalate；只有确实存在可形成候选的通用技术或管理内容才判reusable，纯封面、目录、历史项目"
-        "参数、纯图形、乱码或证据不足判not_reusable，不确定判escalate。reason必须说明依据，evidence_quote有可引用"
+        "not_reusable或escalate；confidence必须为0到1，且不得省略。只有确实存在可形成候选的通用技术或管理内容"
+        "才判reusable，纯封面、目录、历史项目参数、纯图形、乱码或证据不足判not_reusable，不确定判escalate。"
+        "reason必须说明依据，evidence_quote有可引用"
         "文字时应逐字摘录。对判reusable的文档至少输出1条候选，但总候选不得超过{max_candidates}条。每条候选包含"
         "source_section_id、title、unit_type、content、summary、tags、applicability、risk_level、source_quote；"
         "source_quote必须逐字来自对应SECTION，content至少20个中文字符。unit_type只能使用construction_method、"
@@ -369,7 +370,7 @@ KNOWLEDGE_REVIEW_PROMPT = PromptSpec(
 
 KNOWLEDGE_BATCH_REVIEW_PROMPT = PromptSpec(
     key="knowledge.review-batch-source-disposition",
-    version="1.0.0",
+    version="1.0.1",
     instructions=(
         "你是独立的建设工程知识复核人。逐条核验候选忠实性，并独立复核每份来源是否真的具有可复用内容。"
         "不得照抄抽取结论，不得因为文字通顺而判定可复用。"
@@ -671,6 +672,45 @@ class AiRuntime:
                 {"path": ".".join(str(value) for value in item["loc"]), "message": item["msg"], "type": item["type"]}
                 for item in exc.errors()
             ]
+        if spec.output_model is KnowledgeBatchExtractionOutput and set(parsed) == {"candidates", "source_dispositions"}:
+            isolated_errors: list[dict[str, Any]] = []
+            valid_candidates: list[dict[str, Any]] = []
+            raw_candidates = parsed.get("candidates")
+            raw_dispositions = parsed.get("source_dispositions")
+            if not isinstance(raw_candidates, list) or not isinstance(raw_dispositions, list):
+                return None, errors
+            for index, candidate in enumerate(raw_candidates[:20]):
+                try:
+                    valid_candidates.append(KnowledgeExtractionCandidate.model_validate(candidate).model_dump())
+                except ValidationError as exc:
+                    isolated_errors.extend(
+                        {
+                            "path": ".".join(["candidates", str(index), *(str(value) for value in item["loc"])]),
+                            "message": item["msg"],
+                            "type": item["type"],
+                        }
+                        for item in exc.errors()
+                    )
+            valid_dispositions: list[dict[str, Any]] = []
+            for index, disposition in enumerate(raw_dispositions[:20]):
+                try:
+                    valid_dispositions.append(KnowledgeSourceDisposition.model_validate(disposition).model_dump())
+                except ValidationError as exc:
+                    isolated_errors.extend(
+                        {
+                            "path": ".".join(["source_dispositions", str(index), *(str(value) for value in item["loc"])]),
+                            "message": item["msg"],
+                            "type": item["type"],
+                        }
+                        for item in exc.errors()
+                    )
+            if valid_dispositions:
+                if len(raw_candidates) > 20:
+                    isolated_errors.append(
+                        {"path": "candidates", "message": "超出20条的候选已安全截断", "type": "truncated"}
+                    )
+                return {"candidates": valid_candidates, "source_dispositions": valid_dispositions}, isolated_errors
+            return None, isolated_errors or errors
         if spec.output_model is not KnowledgeExtractionOutput or set(parsed) != {"candidates"}:
             return None, errors
         raw_candidates = parsed.get("candidates")
