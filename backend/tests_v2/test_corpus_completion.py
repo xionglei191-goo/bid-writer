@@ -140,6 +140,22 @@ class CorpusCompletionTest(unittest.TestCase):
         self.assertEqual(len(tasks), 1)
         self.assertEqual({row["source_id"] for row in links}, {first, second})
 
+    def test_service_fuse_schedules_automatic_recovery_probe(self) -> None:
+        source_id = self._source("fuse.txt", ".txt")
+        run = self.corpus.create_run()
+        dispatched: list[tuple[int, int, int, str]] = []
+        self.corpus.dispatch = lambda run_id, delay, desired, stage: dispatched.append((run_id, delay, desired, stage))
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE corpus_runs SET consecutive_errors=4,recent_results_json=? WHERE id=?",
+                ('[{"ok": false}]', run["id"]),
+            )
+        self.corpus._record_result(run["id"], False, "HTTP 503")
+        state = self.db.row("SELECT status,pause_reason FROM corpus_runs WHERE id=?", (run["id"],))
+        self.assertEqual(state["status"], "paused")
+        self.assertTrue(state["pause_reason"].startswith("外部服务错误"))
+        self.assertEqual(dispatched, [(run["id"], 15 * 60 * 1000, 1, "__recovery__")])
+
 
 if __name__ == "__main__":
     unittest.main()
