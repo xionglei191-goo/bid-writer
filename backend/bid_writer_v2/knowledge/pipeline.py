@@ -11,9 +11,9 @@ from ..utils import content_hash, normalize_text, parse_json
 from .service import KnowledgeService
 
 
-PIPELINE_RULE_VERSION = "2.2.0"
-CHUNK_MAX_CHARS = 48000
-CHUNK_OVERLAP_CHARS = 800
+PIPELINE_RULE_VERSION = "2.3.0"
+CHUNK_MAX_CHARS = 90000
+CHUNK_OVERLAP_CHARS = 1200
 
 
 class RetryableAiAdjudicationError(RuntimeError):
@@ -350,6 +350,7 @@ class KnowledgePipelineService:
 
         blocks: list[str] = []
         used = 0
+        included_section_ids: set[int] = set()
         last_document_id = 0
         for section in sections:
             prefix = ""
@@ -358,18 +359,21 @@ class KnowledgePipelineService:
                 last_document_id = int(section["document_id"])
             block = (
                 f"{prefix}[SECTION:{section['id']}] {section['heading']}\n"
-                f"{normalize_text(section['content'])[:12000]}"
+                        f"{normalize_text(section['content'])}"
             )
             if used + len(block) > CHUNK_MAX_CHARS:
                 remaining = CHUNK_MAX_CHARS - used
                 if remaining >= 500:
                     blocks.append(block[:remaining])
+                    included_section_ids.add(int(section["id"]))
                 break
             blocks.append(block)
+            included_section_ids.add(int(section["id"]))
             used += len(block)
         section_text = "\n\n".join(blocks)
         if not section_text:
             raise ValueError("short-document batch has no processable text")
+        sections = [section for section in sections if int(section["id"]) in included_section_ids]
 
         model_settings = self.ai_runtime.llm.settings()
         fingerprint = content_hash(
@@ -1124,11 +1128,11 @@ class KnowledgePipelineService:
         return dict(row), sections
 
     @staticmethod
-    def _section_text(sections: list[dict[str, Any]], max_chars: int = 30000) -> str:
+    def _section_text(sections: list[dict[str, Any]], max_chars: int = CHUNK_MAX_CHARS) -> str:
         blocks: list[str] = []
         used = 0
         for section in sections:
-            block = f"[SECTION:{section['id']}] {section['heading']}\n{normalize_text(section['content'])[:5000]}"
+            block = f"[SECTION:{section['id']}] {section['heading']}\n{normalize_text(section['content'])}"
             if used + len(block) > max_chars:
                 remaining = max_chars - used
                 if remaining > 300:

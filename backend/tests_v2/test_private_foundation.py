@@ -45,7 +45,7 @@ class PrivateFoundationTest(unittest.TestCase):
                     (source_id, "超长方案", "long.md", "markdown", 60000, "b" * 64),
                 ).lastrowid
             )
-            body = "施工准备完成后组织复核，确认无误后进入下一工序。\n" * 2200
+            body = "施工准备完成后组织复核，确认无误后进入下一工序。\n" * 5000
             conn.execute(
                 "INSERT INTO document_sections(document_id,order_no,level,heading,content,content_fingerprint) VALUES (?,1,1,?,?,?)",
                 (document_id, "超长章节", body, content_hash(body)),

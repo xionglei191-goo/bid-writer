@@ -425,7 +425,7 @@ class CorpusCompletionService:
             return [item]
         current = self.db.row("SELECT char_count FROM standard_documents WHERE id=?", (document_id,)) or {}
         current_chars = int(current.get("char_count") or 0)
-        if current_chars <= 0 or current_chars > 12_000:
+        if current_chars <= 0 or current_chars > 24_000:
             return [item]
         claimed = [item]
         used_chars = current_chars
@@ -438,14 +438,14 @@ class CorpusCompletionService:
             JOIN standard_documents d ON d.id=i.document_id
             WHERE i.run_id=? AND i.stage='ai' AND i.status IN ('pending','retrying')
               AND (i.next_retry_at IS NULL OR i.next_retry_at<=?)
-              AND d.char_count<=12000 AND i.id<>?
+              AND d.char_count<=24000 AND i.id<>?
             ORDER BY i.id LIMIT 12
             """,
             (item["run_id"], iso_now(), item["id"]),
         )
         for candidate in candidates:
             candidate_chars = int(candidate.get("document_char_count") or 0)
-            if candidate_chars <= 0 or used_chars + candidate_chars > 42_000:
+            if candidate_chars <= 0 or used_chars + candidate_chars > 82_000:
                 continue
             with self.db.connect() as conn:
                 updated = conn.execute(
