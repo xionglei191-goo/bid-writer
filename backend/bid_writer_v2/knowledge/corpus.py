@@ -148,6 +148,14 @@ class CorpusCompletionService:
         progress = progress or (lambda *_args, **_kwargs: None)
         cancelled = cancelled or (lambda: False)
         run = self._raw_run(run_id)
+        if run["status"] == "paused" and str(run.get("pause_reason") or "").startswith("外部服务错误") and preferred_stage == "__recovery__":
+            with self.db.connect() as conn:
+                conn.execute(
+                    "UPDATE corpus_runs SET status='running',pause_reason='',consecutive_errors=0,recent_results_json='[]',updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (run_id,),
+                )
+            run = self._raw_run(run_id)
+            preferred_stage = ""
         if run["status"] not in {"pending", "running"}:
             return self.get_run(run_id)
         if cancelled():
@@ -197,6 +205,8 @@ class CorpusCompletionService:
         return self.get_run(run_id)
 
     def _claim_next_item(self, run_id: int, preferred_stage: str = "") -> dict[str, Any] | None:
+        if preferred_stage == "__recovery__":
+            preferred_stage = ""
         for _attempt in range(5):
             stage_clause = "AND i.stage=?" if preferred_stage else ""
             params: list[Any] = [run_id, iso_now()]
@@ -242,6 +252,8 @@ class CorpusCompletionService:
         policy = parse_json(self._raw_run(run_id).get("policy_json"), {})
         for row in pending:
             stage = str(row["stage"])
+            if stage == "__recovery__":
+                continue
             capacity = {
                 "normalize": int(policy.get("normalize_concurrency", 2)),
                 "ocr": int(policy.get("ocr_concurrency", 1)),
@@ -418,6 +430,10 @@ class CorpusCompletionService:
             progress=progress,
             cancelled=cancelled,
         )
+        if int(result.get("failed_chunks") or 0) or str(result.get("status") or "") == "completed_with_exceptions":
+            raise RuntimeError(
+                f"model pipeline incomplete: failed_chunks={int(result.get('failed_chunks') or 0)}; {result.get('error_message') or ''}"
+            )
         run_id = int(result["id"])
         published, legal, rejected = self._final_review(run_id, int(item["run_id"]))
         open_manual = self.db.row(
@@ -1007,6 +1023,8 @@ class CorpusCompletionService:
                 "UPDATE corpus_runs SET consecutive_errors=?,recent_results_json=?,status=?,pause_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
                 (consecutive, json.dumps(recent, ensure_ascii=False), "paused" if should_pause else run["status"], "外部服务错误达到熔断阈值" if should_pause else run.get("pause_reason", ""), run_id),
             )
+        if should_pause and self.dispatch:
+            self.dispatch(run_id, 15 * 60 * 1000, 1, "__recovery__")
 
     def _finalize_run(self, run_id: int, progress) -> dict[str, Any]:
         publication_audit = self._audit_active_publications(run_id)
@@ -1170,8 +1188,7 @@ class CorpusCompletionService:
         self._consolidate_manual_tasks(run_id)
         with self.db.connect() as conn:
             conn.execute("UPDATE corpus_runs SET status='running',pause_reason='',consecutive_errors=0,recent_results_json='[]',updated_at=CURRENT_TIMESTAMP WHERE id=?", (run_id,))
-        if self.dispatch:
-            self.dispatch(run_id, 0)
+        self._dispatch_next(run_id)
         return self.get_run(run_id)
 
     def cancel(self, run_id: int) -> dict[str, Any]:
