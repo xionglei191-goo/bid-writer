@@ -1342,21 +1342,25 @@ class CorpusCompletionService:
     def _handle_failure(self, item: dict[str, Any], exc: Exception, *, service_error: bool = False) -> None:
         attempts = int(item.get("attempt_count") or 0) + 1
         message = f"{type(exc).__name__}: {exc}"[:1000]
+        # Deployment restarts are operational checkpoints, not source failures,
+        # and must never consume the three real processing attempts.
+        checkpoint_restarts = int(item.get("attempt_count") or 0) if str(item.get("error_code") or "").startswith(("image_rollout", "deployment_restart", "worker_restart")) else 0
+        effective_attempts = max(1, attempts - checkpoint_restarts)
         encrypted = any(word in message.lower() for word in ("password", "encrypted", "密码", "加密"))
         if encrypted:
             self._legal_task(int(item["run_id"]), int(item["source_id"]), "credentials", item["file_name"], message)
             self._terminal(item, "encrypted_manual")
             return
-        if attempts >= 3 and not service_error:
-            self._terminal(item, "unreadable_excluded", checkpoint={"error": message, "attempts": attempts})
+        if effective_attempts >= 3 and not service_error:
+            self._terminal(item, "unreadable_excluded", checkpoint={"error": message, "attempts": effective_attempts})
             return
-        retry_index = min(attempts - 1, 2) if not service_error else min(int(item.get("attempt_count") or 0), 2)
+        retry_index = min(effective_attempts - 1, 2) if not service_error else min(effective_attempts - 1, 2)
         delay = [1, 5, 15][retry_index]
         retry_at = (utc_now() + timedelta(minutes=delay)).isoformat(timespec="seconds")
         with self.db.connect() as conn:
             conn.execute(
-                "UPDATE corpus_run_items SET status='retrying',error_code=?,error_message=?,next_retry_at=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (type(exc).__name__.lower(), message, retry_at, item["id"]),
+                "UPDATE corpus_run_items SET status='retrying',attempt_count=?,error_code=?,error_message=?,next_retry_at=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (effective_attempts, type(exc).__name__.lower(), message, retry_at, item["id"]),
             )
 
     def _recover_stale_items(self, run_id: int) -> None:

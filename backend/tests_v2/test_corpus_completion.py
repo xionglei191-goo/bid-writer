@@ -186,6 +186,22 @@ class CorpusCompletionTest(unittest.TestCase):
         self.assertEqual((item["stage"], item["status"]), ("normalize", "pending"))
         self.assertEqual(tasks, [{"task_type": "credentials", "status": "open"}])
 
+    def test_deployment_restart_does_not_consume_source_retry_budget(self) -> None:
+        source_id = self._source("restart.txt", ".txt")
+        run = self.corpus.create_run()
+        item = self.db.row("SELECT * FROM corpus_run_items WHERE run_id=? AND source_id=?", (run["id"], source_id))
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE corpus_run_items SET status='running',attempt_count=3,error_code='image_rollout_23' WHERE id=?",
+                (item["id"],),
+            )
+        item = self.db.row("SELECT * FROM corpus_run_items WHERE id=?", (item["id"],))
+        self.corpus._handle_failure(item, RuntimeError("parser failed"), service_error=False)
+        state = self.db.row("SELECT status,attempt_count,terminal_reason FROM corpus_run_items WHERE id=?", (item["id"],))
+        self.assertEqual(state["status"], "retrying")
+        self.assertEqual(state["attempt_count"], 1)
+        self.assertEqual(state["terminal_reason"], "")
+
 
 if __name__ == "__main__":
     unittest.main()
