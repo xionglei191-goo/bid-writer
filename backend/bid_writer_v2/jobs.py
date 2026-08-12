@@ -25,6 +25,19 @@ class JobService:
     def register(self, job_type: str, handler: JobHandler) -> None:
         self.handlers[job_type] = handler
 
+    def redispatch_unfinished(self) -> int:
+        """Re-publish durable jobs whose broker message may have been lost."""
+        if not self.settings.background_jobs_enabled or not self.settings.redis_url:
+            return 0
+        from .worker import run_app_job
+
+        rows = self.db.rows(
+            "SELECT id FROM app_jobs WHERE status IN ('pending','retrying') ORDER BY id"
+        )
+        for row in rows:
+            run_app_job.send(int(row["id"]))
+        return len(rows)
+
     def enqueue(
         self,
         job_type: str,

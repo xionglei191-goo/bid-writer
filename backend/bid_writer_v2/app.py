@@ -158,6 +158,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(_: FastAPI):
         settings.ensure_directories()
         db.migrate()
+        jobs.redispatch_unfinished()
         yield
 
     app = FastAPI(title="技术标生产与知识工程系统", version="2.0.0", lifespan=lifespan)

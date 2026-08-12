@@ -78,6 +78,13 @@ class PrivateFoundationTest(unittest.TestCase):
             conn.execute("UPDATE audit_events SET details_json='{}' WHERE id=(SELECT MIN(id) FROM audit_events)")
         self.assertFalse(self.audit.verify_chain()["valid"])
 
+    def test_job_redispatch_is_noop_without_background_worker(self) -> None:
+        jobs = JobService(self.db, self.settings, self.audit)
+        jobs.register("test.noop", lambda payload, report, cancelled: payload)
+        queued = jobs.enqueue("test.noop", "fixture", 1, {})
+        self.assertEqual(queued["status"], "pending")
+        self.assertEqual(jobs.redispatch_unfinished(), 0)
+
     def test_audit_verifier_accepts_cryptographically_valid_concurrent_branch(self) -> None:
         first = self.audit.record("test.first", "fixture", 1)
         self.audit.record("test.second", "fixture", 2)
