@@ -82,8 +82,9 @@ class PilotWorkflowTest(unittest.TestCase):
                     ]
                     production.confirm_draft(draft["id"], "演练技术负责人", resolutions)
                 quality = production.quality_gate(project["id"])
-                self.assertTrue(quality["ready"], quality)
-                delivery = production.export_project(project["id"], "docx")
+                self.assertTrue(quality["review_ready"], quality)
+                self.assertFalse(quality["formal_ready"], quality)
+                delivery = production.export_project(project["id"], "docx", "review")
                 self.assertTrue(Path(delivery["file_path"]).is_file())
                 self.assertTrue(production.list_manifests(project["id"])[0]["manifest_hash"])
                 rendered = Document(delivery["file_path"])

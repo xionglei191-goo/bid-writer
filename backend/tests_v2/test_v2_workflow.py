@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 from docx import Document
@@ -152,6 +153,35 @@ class V2WorkflowTest(unittest.TestCase):
                 self.production.confirm_draft(draft_id, "测试技术负责人")
 
             quality = self.production.quality_gate(project["id"])
+            self.assertTrue(quality["review_ready"], quality)
+            self.assertFalse(quality["formal_ready"], quality)
+            self.assertFalse(quality["ready"], quality)
+            self.assertEqual(quality["readiness_level"], "review")
+            with self.assertRaisesRegex(ValueError, "正式"):
+                self.production.export_project(project["id"], "docx")
+            review_export = self.production.export_project(project["id"], "docx", "review")
+            self.assertEqual(review_export["mode"], "review")
+            review_package = self.production.export_project(project["id"], "package", "review")
+            with zipfile.ZipFile(review_package["file_path"]) as archive:
+                names = set(archive.namelist())
+            self.assertEqual(len(names), 4)
+            self.assertTrue(any(name.endswith(".docx") for name in names))
+            self.assertTrue(any(name.endswith(".pdf") for name in names))
+            self.assertIn("送审说明.md", names)
+            self.assertIn("文件清单.txt", names)
+            self.production.update_project(
+                project["id"],
+                {
+                    "profile": {
+                        "bidder_name": "河南建设工程有限公司",
+                        "professional_reviewer": "注册建造师复核人",
+                        "compliance_confirmed": True,
+                        "manual_finalized": True,
+                    }
+                },
+            )
+            quality = self.production.quality_gate(project["id"])
+            self.assertTrue(quality["formal_ready"], quality)
             self.assertTrue(quality["ready"], quality)
             exported = self.production.export_project(project["id"], "docx")
             path = Path(exported["file_path"])

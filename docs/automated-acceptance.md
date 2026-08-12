@@ -27,7 +27,7 @@ docker compose exec -T app python /app/backend/scripts_v2/run_automated_acceptan
 ## 完整技术回归
 
 ```powershell
-docker compose exec -T app pytest -q /app/backend/tests_v2
+docker compose exec -T app python -m unittest discover -s /app/backend/tests_v2 -v
 
 Set-Location frontend
 npm ci
@@ -52,10 +52,10 @@ npm run test:e2e
 docker compose --profile monitoring up -d
 ```
 
-- 应用：`http://127.0.0.1:8765`
+- 应用：`http://127.0.0.1:8876`
 - Prometheus：`http://127.0.0.1:9090`
 - Grafana：`http://127.0.0.1:3000`
-- 指标端点：`http://127.0.0.1:8765/metrics`
+- 指标端点：`http://127.0.0.1:8876/metrics`
 
 Grafana 自动装载 `Bid Writer Overview` 面板，覆盖任务积压、AI 运行与 Token、模型耗时、检索延迟、已发布知识、存储健康和审计链状态。
 

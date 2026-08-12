@@ -10,11 +10,11 @@ Copy-Item .env.example .env
 .\deploy\install.ps1
 ```
 
-默认地址为`http://127.0.0.1:8765`。首次启动使用`.env`中的管理员账号；登录后应立即创建日常账号。监控通过`docker compose --profile monitoring up -d`启用。
+默认地址为`http://127.0.0.1:8876`。首次启动使用`.env`中的管理员账号；登录后应立即创建日常账号。监控通过`docker compose --profile monitoring up -d`启用。
 
 ## 自动验收与监控
 
-技术回归、检索门槛、监控地址和人工签审边界见`docs/automated-acceptance.md`。当前监控栈会自动装载 `Bid Writer Overview` Grafana 面板；应用、Prometheus 和 Grafana 默认分别使用 8765、9090 和 3000 端口。
+技术回归、检索门槛、监控地址和人工签审边界见`docs/automated-acceptance.md`。当前监控栈会自动装载 `Bid Writer Overview` Grafana 面板；应用、Prometheus 和 Grafana 默认分别使用 8876、9090 和 3000 端口。
 
 ## 升级与回退
 

@@ -6,7 +6,7 @@ export default defineConfig({
   fullyParallel: false,
   reporter: "line",
   use: {
-    baseURL: process.env.BID_WRITER_E2E_URL || "http://127.0.0.1:8765",
+    baseURL: process.env.BID_WRITER_E2E_URL || "http://127.0.0.1:8876",
     channel: process.env.BID_WRITER_E2E_CHANNEL || "chrome",
     screenshot: "only-on-failure",
     trace: "retain-on-failure",

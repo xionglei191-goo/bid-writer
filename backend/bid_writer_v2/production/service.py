@@ -17,6 +17,8 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt
 
+from bid_writer.artifact_audit import audit_docx_path, audit_text, audit_zip_path
+
 from ..ai_runtime import AiRuntime, SECTION_DRAFT_PROMPT
 from ..database import Database
 from ..audit import AuditService
@@ -559,9 +561,10 @@ class ProductionService:
         sections = project["sections"]
         drafts = [item["draft"] for item in sections if item.get("draft")]
         text = "\n".join(item["content"] for item in drafts)
-        blockers: list[dict[str, str]] = []
+        review_blockers: list[dict[str, str]] = []
+        formal_only_blockers: list[dict[str, str]] = []
         if len(drafts) < len(sections):
-            blockers.append({"key": "missing_sections", "title": "章节未全部生成", "detail": f"{len(drafts)}/{len(sections)}章已有草稿"})
+            review_blockers.append({"key": "missing_sections", "title": "章节未全部生成", "detail": f"{len(drafts)}/{len(sections)}章已有草稿"})
         confirmation_count = 0
         unreviewed_drafts = 0
         with self.db.connect() as conn:
@@ -582,9 +585,9 @@ class ProductionService:
                 if not reviewed:
                     unreviewed_drafts += 1
         if confirmation_count:
-            blockers.append({"key": "confirmations", "title": "存在待确认事项", "detail": f"共{confirmation_count}项"})
+            review_blockers.append({"key": "confirmations", "title": "存在待确认事项", "detail": f"共{confirmation_count}项"})
         if unreviewed_drafts:
-            blockers.append({"key": "unreviewed_drafts", "title": "章节尚未绑定当前版本签审", "detail": f"共{unreviewed_drafts}章"})
+            formal_only_blockers.append({"key": "unreviewed_drafts", "title": "章节尚未绑定当前版本签审", "detail": f"共{unreviewed_drafts}章"})
         invalid_citations = 0
         with self.db.connect() as conn:
             for draft in drafts:
@@ -596,13 +599,14 @@ class ProductionService:
                     if not valid:
                         invalid_citations += 1
         if invalid_citations:
-            blockers.append({"key": "invalid_citations", "title": "引用已失效", "detail": f"共{invalid_citations}项"})
+            review_blockers.append({"key": "invalid_citations", "title": "引用已失效", "detail": f"共{invalid_citations}项"})
         evidence_metrics = self.evidence.metrics(project_id)
         if evidence_metrics["high_unsupported"]:
-            blockers.append({"key": "unsupported_high_claims", "title": "高风险表述缺少证据", "detail": f"共{evidence_metrics['high_unsupported']}项"})
-        placeholders = re.findall(r"\[(?:项目名称|联系电话|待确认[^\]]*)\]|<[^>]+>|TODO", text, flags=re.IGNORECASE)
-        if placeholders:
-            blockers.append({"key": "placeholders", "title": "存在占位符", "detail": f"共{len(placeholders)}处"})
+            review_blockers.append({"key": "unsupported_high_claims", "title": "高风险表述缺少证据", "detail": f"共{evidence_metrics['high_unsupported']}项"})
+        artifact_audit = audit_text(self._project_markdown(project), source="assembled_markdown")
+        if not artifact_audit["ready"]:
+            detail = "、".join(f"{key}={value}" for key, value in artifact_audit["counts"].items() if value)
+            review_blockers.append({"key": "artifact_audit", "title": "最终产物审计未通过", "detail": detail or "发现禁止内容"})
         coverage_total = len(project["requirements"])
         with self.db.connect() as conn:
             covered = int(conn.execute(
@@ -628,17 +632,39 @@ class ProductionService:
             ).fetchone()[0])
         coverage = round(covered / coverage_total * 100, 2) if coverage_total else 100.0
         if coverage < 95:
-            blockers.append({"key": "coverage", "title": "条款证据覆盖不足", "detail": f"当前{coverage}%"})
+            review_blockers.append({"key": "coverage", "title": "条款证据覆盖不足", "detail": f"当前{coverage}%"})
         consistency_issues = self._consistency_issues(project)
         warnings = [item for item in consistency_issues if item["key"] == "duplicate_sections"]
-        blockers.extend(item for item in consistency_issues if item["key"] != "duplicate_sections")
-        score = max(0, 100 - len(blockers) * 12)
+        review_blockers.extend(item for item in consistency_issues if item["key"] != "duplicate_sections")
+        profile = project.get("profile") or {}
+        bidder_name = normalize_text(str(profile.get("bidder_name") or profile.get("tenderer_name") or profile.get("bidder") or ""))
+        if not bidder_name or audit_text(bidder_name, source="bidder_name")["counts"]["test_data"]:
+            formal_only_blockers.append({"key": "bidder_identity", "title": "缺少真实投标单位", "detail": "正式版必须登记真实投标单位"})
+        reviewer = normalize_text(str(profile.get("professional_reviewer") or profile.get("reviewed_by") or ""))
+        if not reviewer:
+            formal_only_blockers.append({"key": "professional_reviewer", "title": "缺少专业复核人", "detail": "正式版必须由专业复核人署名"})
+        if profile.get("compliance_confirmed") is not True:
+            formal_only_blockers.append({"key": "compliance_confirmation", "title": "合规确认未完成", "detail": "正式版必须完成合规清单确认"})
+        if profile.get("manual_finalized") is not True and profile.get("final_approved") is not True:
+            formal_only_blockers.append({"key": "manual_finalization", "title": "人工定稿未完成", "detail": "正式版必须由责任人完成整本定稿"})
+        formal_blockers = [*review_blockers, *formal_only_blockers]
+        review_score = max(0, 100 - len(review_blockers) * 12)
+        score = max(0, 100 - len(formal_blockers) * 12)
+        review_ready = not review_blockers and review_score >= 90
+        formal_ready = review_ready and not formal_only_blockers and score >= 90
         report = {
             "project_id": project_id,
-            "ready": not blockers and score >= 90,
+            "ready": formal_ready,
+            "review_ready": review_ready,
+            "formal_ready": formal_ready,
+            "readiness_level": "formal" if formal_ready else "review" if review_ready else "blocked",
             "score": score,
-            "blockers": blockers,
+            "review_score": review_score,
+            "blockers": formal_blockers,
+            "review_blockers": review_blockers,
+            "formal_blockers": formal_only_blockers,
             "warnings": warnings,
+            "artifact_audit": artifact_audit,
             "metrics": {
                 "sections": len(sections),
                 "drafts": len(drafts),
@@ -649,9 +675,10 @@ class ProductionService:
                 "unreviewed_drafts": unreviewed_drafts,
                 "invalid_citations": invalid_citations,
                 "claims": evidence_metrics,
+                "artifact_findings": len(artifact_audit["findings"]),
             },
         }
-        self._sync_quality_issues(project_id, [*blockers, *warnings])
+        self._sync_quality_issues(project_id, [*formal_blockers, *warnings])
         return report
 
     @staticmethod
@@ -727,12 +754,15 @@ class ProductionService:
             row["manifest"] = parse_json(row.pop("manifest_json", "{}"), {})
         return rows
 
-    def export_project(self, project_id: int, file_format: str, progress=None) -> dict[str, Any]:
+    def export_project(self, project_id: int, file_format: str, mode: str = "formal", progress=None) -> dict[str, Any]:
         progress = progress or (lambda *_args, **_kwargs: None)
+        if mode not in {"review", "formal"}:
+            raise ValueError("导出mode仅支持review或formal")
         project = self.get_project(project_id)
         quality = self.quality_gate(project_id)
-        if not quality["ready"]:
-            raise ValueError("质量门禁未通过，不能正式导出")
+        if not quality[f"{mode}_ready"]:
+            label = "送审" if mode == "review" else "正式"
+            raise ValueError(f"质量门禁未通过，不能导出{label}版")
         safe_name = re.sub(r"[\\/:*?\"<>|]", "_", project["name"])
         progress("rendering", 20, "生成交付文件")
         files: list[Path] = []
@@ -764,7 +794,7 @@ class ProductionService:
         with self.db.connect() as conn:
             cursor = conn.execute(
                 "INSERT INTO deliveries(project_id,format,file_path,quality_json) VALUES (?,?,?,?)",
-                (project_id, file_format, str(path), json.dumps(quality, ensure_ascii=False)),
+                (project_id, f"{mode}_{file_format}", str(path), json.dumps(quality, ensure_ascii=False)),
             )
             delivery_id = int(cursor.lastrowid)
         manifest = {
@@ -792,13 +822,30 @@ class ProductionService:
         write_text_atomic(manifest_path, manifest_json)
         files.append(manifest_path)
         if file_format == "package":
-            package_path = self.settings.export_root / f"{safe_name}_{project_id}_delivery.zip"
+            package_path = self.settings.export_root / f"{safe_name}_{project_id}_{'review' if mode == 'review' else 'delivery'}.zip"
             with zipfile.ZipFile(package_path, "w", zipfile.ZIP_DEFLATED) as archive:
-                for item in files:
-                    archive.write(item, item.name)
-                archive.writestr("质量门禁报告.json", json.dumps(quality, ensure_ascii=False, indent=2))
-                archive.writestr("要求覆盖矩阵.json", json.dumps(self.coverage_matrix(project_id), ensure_ascii=False, indent=2))
-                archive.writestr("证据审计.json", json.dumps({section["title"]: section["draft"].get("claims", []) for section in project["sections"] if section.get("draft")}, ensure_ascii=False, indent=2))
+                if mode == "review":
+                    deliverables = [item for item in files if item.suffix.lower() in {".docx", ".pdf"}]
+                    for item in deliverables:
+                        archive.write(item, item.name)
+                    note = "# 送审说明\n\n本包用于专业送审。正式投标前须补齐真实投标单位、专业复核人、合规确认、签章及人工定稿。\n"
+                    names = [item.name for item in deliverables]
+                    archive.writestr("送审说明.md", note)
+                    archive.writestr("文件清单.txt", "\n".join([*names, "送审说明.md", "文件清单.txt"]) + "\n")
+                else:
+                    for item in files:
+                        archive.write(item, item.name)
+                    archive.writestr("质量门禁报告.json", json.dumps(quality, ensure_ascii=False, indent=2))
+                    archive.writestr("要求覆盖矩阵.json", json.dumps(self.coverage_matrix(project_id), ensure_ascii=False, indent=2))
+                    archive.writestr("证据审计.json", json.dumps({section["title"]: section["draft"].get("claims", []) for section in project["sections"] if section.get("draft")}, ensure_ascii=False, indent=2))
+            if mode == "review":
+                package_audit = audit_zip_path(
+                    package_path,
+                    allowed_names={*[item.name for item in deliverables], "送审说明.md", "文件清单.txt"},
+                    require_review_package_types=True,
+                )
+                if not package_audit["ready"]:
+                    raise ValueError("送审包产物审计失败")
             path = package_path
             file_items.append({"name": package_path.name, "size_bytes": package_path.stat().st_size, "sha256": hashlib.sha256(package_path.read_bytes()).hexdigest()})
         stored = []
@@ -821,6 +868,7 @@ class ProductionService:
             "manifest_id": manifest_id,
             "manifest_hash": manifest_hash,
             "format": file_format,
+            "mode": mode,
             "file_path": str(path),
             "object_key": stored[-1]["object_key"] if stored else "",
             "files": file_items,
@@ -845,17 +893,17 @@ class ProductionService:
     @staticmethod
     def _preflight_docx(path: Path) -> dict[str, Any]:
         document = Document(path)
-        text = "\n".join(paragraph.text for paragraph in document.paragraphs)
         issues = []
-        if not text.strip():
+        if not any(paragraph.text.strip() for paragraph in document.paragraphs):
             issues.append("文档正文为空")
-        if re.search(r"\[(?:项目名称|待确认[^\]]*)\]|TODO", text, flags=re.IGNORECASE):
-            issues.append("文档包含未处理占位符")
+        audit = audit_docx_path(path)
+        if not audit["ready"]:
+            issues.append("文档最终产物审计未通过")
         if not document.sections:
             issues.append("文档缺少页面设置")
         if issues:
             raise ValueError("DOCX预检失败：" + "；".join(issues))
-        return {"paragraphs": len(document.paragraphs), "tables": len(document.tables), "size_bytes": path.stat().st_size}
+        return {"paragraphs": len(document.paragraphs), "tables": len(document.tables), "size_bytes": path.stat().st_size, "artifact_audit": audit}
 
     @staticmethod
     def _convert_pdf(docx_path: Path) -> Path:

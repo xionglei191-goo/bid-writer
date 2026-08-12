@@ -114,7 +114,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     jobs.register(
         "production.export",
         lambda payload, report, _cancelled: production.export_project(
-            int(payload["project_id"]), str(payload.get("format", "docx")), progress=report
+            int(payload["project_id"]),
+            str(payload.get("format", "docx")),
+            str(payload.get("mode", "formal")),
+            progress=report,
         ),
     )
 

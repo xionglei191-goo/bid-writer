@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -34,6 +34,7 @@ class DraftUpdatePayload(BaseModel):
 
 class ExportPayload(BaseModel):
     format: str
+    mode: Literal["review", "formal"] = "formal"
     background: bool = True
 
 
@@ -208,13 +209,13 @@ def build_router(service: ProductionService, jobs: JobService | None = None) -> 
                     "production.export",
                     "project",
                     project_id,
-                    {"project_id": project_id, "format": payload.format},
+                    {"project_id": project_id, "format": payload.format, "mode": payload.mode},
                     user.get("id"),
                 )
                 if not jobs.settings.background_jobs_enabled:
                     background_tasks.add_task(jobs.run, int(job["id"]))
                 return job
-            return public_payload(service.export_project(project_id, payload.format))
+            return public_payload(service.export_project(project_id, payload.format, payload.mode))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:

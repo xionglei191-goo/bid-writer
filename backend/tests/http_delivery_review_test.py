@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 
-BASE_URL = os.environ.get("BID_WRITER_TEST_BASE_URL", "http://127.0.0.1:8765")
+BASE_URL = os.environ.get("BID_WRITER_TEST_BASE_URL", "http://127.0.0.1:8876")
 TEMP_NAME = "交付审查验证项目临时"
 
 
