@@ -101,6 +101,8 @@ class CorpusCompletionService:
             "recent_failure_rate": 0.20,
             "ocr_provider": "paddleocr_aistudio_allowed",
             "technical_review": "ai",
+            "defer_large_sources": True,
+            "large_source_bytes": 150 * 1024 * 1024,
         }
         self._supersede_legacy_rule_units()
         with self.db.connect() as conn:
@@ -398,7 +400,8 @@ class CorpusCompletionService:
                 WHERE i.run_id=? AND i.status IN ('pending','retrying')
                   AND (i.next_retry_at IS NULL OR i.next_retry_at<=?)
                   {stage_clause}
-                ORDER BY CASE i.stage WHEN 'normalize' THEN 1 WHEN 'ocr' THEN 2 WHEN 'governance' THEN 3 WHEN 'ai' THEN 4 ELSE 5 END,i.id LIMIT 1
+                ORDER BY CASE i.stage WHEN 'normalize' THEN 1 WHEN 'ocr' THEN 2 WHEN 'governance' THEN 3 WHEN 'ai' THEN 4 ELSE 5 END,
+                    CASE WHEN i.stage IN ('normalize','ocr') THEN s.size_bytes ELSE 0 END,i.id LIMIT 1
                 """,
                 params,
             )
