@@ -626,6 +626,7 @@ class CorpusCompletionService:
         self.knowledge.on_publication_changed = None
         try:
             survivors: list[tuple[dict[str, Any], float, bool]] = []
+            revision_queue: list[tuple[dict[str, Any], float]] = []
             for candidate in candidates:
                 legal_hits = [code for code, pattern in LEGAL_PATTERNS if re.search(pattern, candidate["content"])]
                 deterministic = [code for code, pattern in BLOCK_PATTERNS if re.search(pattern, candidate["content"], re.IGNORECASE)]
@@ -652,9 +653,19 @@ class CorpusCompletionService:
                 ]
                 first_pass = str(candidate.get("review_decision")) in {"pass", "revise"} and float(candidate.get("review_confidence") or 0) >= threshold and not blocking_findings
                 self._decision(corpus_run_id, candidate, "independent_review", str(candidate.get("review_decision")), float(candidate.get("review_confidence") or 0), findings, candidate.get("review_ai_run_id"))
-                revision_used = False
                 if deterministic or not first_pass:
-                    repair = self._ai_review(candidate, "knowledge_technical_revision", formal=True)
+                    revision_queue.append((candidate, threshold))
+                    continue
+                survivors.append((candidate, threshold, False))
+
+            repair_reviews = self._ai_review_batch(
+                [candidate for candidate, _threshold in revision_queue],
+                "knowledge_technical_revision",
+                formal=True,
+            )
+            revised_candidates: list[tuple[dict[str, Any], float]] = []
+            for candidate, threshold in revision_queue:
+                    repair = repair_reviews[int(candidate["id"])]
                     self._decision(corpus_run_id, candidate, "automatic_revision", repair["decision"], repair["confidence"], repair["issues"], repair.get("run_id"))
                     corrected = normalize_text(repair.get("corrected_content") or "")
                     if repair["decision"] != "revise" or not corrected:
@@ -662,14 +673,20 @@ class CorpusCompletionService:
                         self._reject_candidate(candidate, "自动修订未能消除确定性风险或达到独立复核阈值")
                         continue
                     candidate = self._apply_revision(candidate, corrected)
-                    revision_used = True
-                    post = self._ai_review(candidate, "knowledge_post_revision_review")
+                    revised_candidates.append((candidate, threshold))
+
+            post_reviews = self._ai_review_batch(
+                [candidate for candidate, _threshold in revised_candidates],
+                "knowledge_post_revision_review",
+            )
+            for candidate, threshold in revised_candidates:
+                    post = post_reviews[int(candidate["id"])]
                     self._decision(corpus_run_id, candidate, "post_revision_review", post["decision"], post["confidence"], post["issues"], post.get("run_id"))
                     if not self._review_passes(post, threshold) or self._blocking_codes(candidate):
                         rejected += 1
                         self._reject_candidate(candidate, "自动修订后的独立复核未达到风险阈值")
                         continue
-                survivors.append((candidate, threshold, revision_used))
+                    survivors.append((candidate, threshold, True))
 
             high_risk = [candidate for candidate, _threshold, _revision_used in survivors if str(candidate.get("risk_level")) == "high"]
             second_reviews = self._ai_review_batch(high_risk, "high_risk_second_review")
@@ -689,16 +706,45 @@ class CorpusCompletionService:
                 "formal_adjudication",
                 formal=True,
             )
+            final_revision_queue: list[tuple[dict[str, Any], float]] = []
             for candidate, threshold, revision_used in adjudication_ready:
                 final = final_reviews[int(candidate["id"])]
                 self._decision(corpus_run_id, candidate, "final_adjudication", final["decision"], final["confidence"], final["issues"], final.get("run_id"))
                 if final["decision"] == "revise" and not revision_used and normalize_text(final.get("corrected_content") or ""):
                     candidate = self._apply_revision(candidate, final["corrected_content"])
-                    final = self._ai_review(candidate, "formal_adjudication_after_revision", formal=True)
-                    self._decision(corpus_run_id, candidate, "final_adjudication_after_revision", final["decision"], final["confidence"], final["issues"], final.get("run_id"))
+                    final_revision_queue.append((candidate, threshold))
+                    continue
                 if not self._review_passes(final, threshold) or self._blocking_codes(candidate):
                     rejected += 1
                     self._reject_candidate(candidate, "最终裁决未达到风险阈值")
+                    continue
+                promoted = self.knowledge.create_unit_from_ai_candidate(candidate)
+                unit_id = int(promoted["unit_id"])
+                self._attach_cluster_sources(corpus_run_id, int(candidate["source_section_id"]), unit_id, str(candidate["source_quote"]))
+                self._attach_exact_document_sources(int(candidate["source_id"]), int(candidate["source_section_id"]), unit_id, str(candidate["source_quote"]))
+                detail = self.knowledge.get_unit(unit_id)
+                if detail["status"] != "published":
+                    version = detail["versions"][0]
+                    if version["status"] != "approved":
+                        self.knowledge.review_unit(unit_id, int(version["id"]), "approve", "AI复核系统（非人工）", "全库收口独立复核通过")
+                    self.knowledge.publish_unit(unit_id, int(version["id"]), "AI复核系统（非人工）")
+                with self.db.connect() as conn:
+                    conn.execute("UPDATE knowledge_ai_candidates SET status='accepted',unit_id=?,reviewed_by='AI复核系统（非人工）',review_notes='全库收口自动复核通过',reviewed_at=CURRENT_TIMESTAMP WHERE id=?", (unit_id, candidate["id"]))
+                    conn.execute("UPDATE knowledge_exception_tasks SET status='resolved',resolved_by='AI复核系统（非人工）',resolution='自动技术复核闭环',resolved_at=CURRENT_TIMESTAMP WHERE candidate_id=? AND status='open'", (candidate["id"],))
+                self._decision(corpus_run_id, {**candidate, "unit_id": unit_id}, "publication", "publish", final["confidence"], [])
+                published += 1
+
+            revised_finals = self._ai_review_batch(
+                [candidate for candidate, _threshold in final_revision_queue],
+                "formal_adjudication_after_revision",
+                formal=True,
+            )
+            for candidate, threshold in final_revision_queue:
+                final = revised_finals[int(candidate["id"])]
+                self._decision(corpus_run_id, candidate, "final_adjudication_after_revision", final["decision"], final["confidence"], final["issues"], final.get("run_id"))
+                if not self._review_passes(final, threshold) or self._blocking_codes(candidate):
+                    rejected += 1
+                    self._reject_candidate(candidate, "最终修订裁决未达到风险阈值")
                     continue
                 promoted = self.knowledge.create_unit_from_ai_candidate(candidate)
                 unit_id = int(promoted["unit_id"])

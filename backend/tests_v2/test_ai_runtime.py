@@ -117,6 +117,20 @@ class AiRuntimeTest(unittest.TestCase):
         self.assertEqual(review.issues[0].severity, "medium")
         self.assertIn("扩大", review.issues[0].message)
 
+    def test_normalizes_nullable_review_fields_from_model(self) -> None:
+        review = KnowledgeCandidateReview.model_validate(
+            {
+                "candidate_index": 0,
+                "decision": "reject",
+                "confidence": None,
+                "issues": None,
+                "corrected_content": None,
+            }
+        )
+        self.assertEqual(review.confidence, 0)
+        self.assertEqual(review.issues, [])
+        self.assertEqual(review.corrected_content, "")
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.db = Database(Path(self.temp.name) / "runtime.sqlite3")

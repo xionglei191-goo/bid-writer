@@ -145,8 +145,10 @@ class KnowledgeCandidateReview(BaseModel):
         normalized = dict(value)
         severity = normalized.pop("severity", "medium")
         reason = str(normalized.pop("reason", "") or "").strip()
-        normalized.setdefault("confidence", 0)
-        normalized.setdefault("corrected_content", "")
+        if normalized.get("confidence") is None:
+            normalized["confidence"] = 0
+        if normalized.get("corrected_content") is None:
+            normalized["corrected_content"] = ""
         issues = normalized.get("issues")
         if isinstance(issues, list):
             normalized["issues"] = [
@@ -159,6 +161,8 @@ class KnowledgeCandidateReview(BaseModel):
             normalized["issues"] = [
                 {"code": "model_review_reason", "severity": severity, "message": reason[:500]}
             ]
+        elif issues is None:
+            normalized["issues"] = []
         if reason and not normalized.get("issues"):
             normalized["issues"] = [
                 {"code": "model_review_reason", "severity": severity, "message": reason[:500]}
