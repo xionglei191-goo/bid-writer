@@ -120,6 +120,24 @@ class RetrievalEvaluationTest(unittest.TestCase):
         self.assertEqual(evaluation.list_datasets()[0]["dataset_name"], "ai-review")
         self.assertTrue(audit.verify_chain()["valid"])
 
+    def test_generation_round_bypasses_cache_for_automatic_coverage_repair(self) -> None:
+        llm = SilverCaseLlm()
+        runtime = AiRuntime(self.db, llm)  # type: ignore[arg-type]
+        evaluation = RetrievalEvaluationService(self.db, self.knowledge, runtime)
+        first = evaluation.generate_silver_cases(self.unit_id, count=4, dataset_name="repair")
+        second = evaluation.generate_silver_cases(
+            self.unit_id,
+            count=4,
+            dataset_name="repair",
+            generation_round=2,
+            required_query_kinds=["synonym"],
+        )
+
+        self.assertEqual(first["generation_round"], 1)
+        self.assertEqual(second["generation_round"], 2)
+        self.assertEqual(llm.calls, 2)
+        self.assertEqual(len(first["case_ids"]), 4)
+
     def test_calculates_recall_mrr_and_negative_rejection(self) -> None:
         with self.db.connect() as conn:
             conn.execute(

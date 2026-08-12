@@ -230,6 +230,55 @@ class CorpusCompletionTest(unittest.TestCase):
         self.assertEqual(pipeline_state["status"], "completed_with_exceptions")
         self.assertIn("后台进程中断", pipeline_state["error_message"])
 
+    def test_future_dated_orphan_is_closed_only_after_new_request_takes_over(self) -> None:
+        document_id = self._document("clock-rollback.md", "时钟回拨任务", "施工前复核条件，完成后按标准验收。")
+        with self.db.connect() as conn:
+            orphan_ai_id = int(conn.execute(
+                """
+                INSERT INTO ai_runs(
+                    task_type,target_type,target_id,prompt_key,prompt_version,prompt_hash,
+                    input_hash,cache_key,status,created_at
+                ) VALUES ('fixture','standard_document',?,'fixture','1','p','future','future-cache',
+                    'running',datetime('now','+3 hours'))
+                """,
+                (document_id,),
+            ).lastrowid)
+            orphan_pipeline_id = int(conn.execute(
+                """
+                INSERT INTO knowledge_ai_pipeline_runs(
+                    document_id,pipeline_key,input_hash,status,extraction_ai_run_id,created_at
+                ) VALUES (?,?,?,'running',?,datetime('now','+3 hours'))
+                """,
+                (document_id, "future-pipeline", "future", orphan_ai_id),
+            ).lastrowid)
+        run = self.corpus.create_run()
+        self.corpus._recover_stale_items(run["id"])
+        self.assertEqual((self.db.row("SELECT status FROM ai_runs WHERE id=?", (orphan_ai_id,)) or {})["status"], "running")
+
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ai_runs(
+                    task_type,target_type,target_id,prompt_key,prompt_version,prompt_hash,
+                    input_hash,cache_key,status,created_at
+                ) VALUES ('fixture','standard_document',?,'fixture','1','p','replacement','replacement-cache',
+                    'running',CURRENT_TIMESTAMP)
+                """,
+                (document_id,),
+            )
+            conn.execute(
+                """
+                INSERT INTO knowledge_ai_pipeline_runs(document_id,pipeline_key,input_hash,status,created_at)
+                VALUES (?,?,?,'running',CURRENT_TIMESTAMP)
+                """,
+                (document_id, "replacement-pipeline", "replacement"),
+            )
+        self.corpus._recover_stale_items(run["id"])
+        ai_state = self.db.row("SELECT status,error_code FROM ai_runs WHERE id=?", (orphan_ai_id,))
+        pipeline_state = self.db.row("SELECT status FROM knowledge_ai_pipeline_runs WHERE id=?", (orphan_pipeline_id,))
+        self.assertEqual(ai_state, {"status": "failed", "error_code": "worker_restart"})
+        self.assertEqual(pipeline_state["status"], "completed_with_exceptions")
+
     def test_ocr_step_processes_one_new_chunk_and_resumes_from_cache(self) -> None:
         pdf = self.settings.raw_root / "three-pages.pdf"
         writer = PdfWriter()

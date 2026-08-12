@@ -18,8 +18,24 @@ class RetrievalEvaluationService:
         self.ai_runtime = ai_runtime
         self.audit = audit
 
-    def generate_silver_cases(self, unit_id: int, count: int = 8, dataset_name: str = "default") -> dict[str, Any]:
+    def generate_silver_cases(
+        self,
+        unit_id: int,
+        count: int = 8,
+        dataset_name: str = "default",
+        *,
+        generation_round: int = 1,
+        required_query_kinds: list[str] | None = None,
+    ) -> dict[str, Any]:
         count = max(4, min(int(count), 12))
+        generation_round = max(1, min(int(generation_round), 3))
+        required_query_kinds = sorted(
+            {
+                str(value)
+                for value in (required_query_kinds or [])
+                if str(value) in {"direct", "synonym", "tender_clause", "confusing_negative"}
+            }
+        )
         with self.db.connect() as conn:
             row = conn.execute(
                 """
@@ -41,6 +57,11 @@ class RetrievalEvaluationService:
             unit_type=unit["unit_type"],
             content=unit["content"][:12000],
         )
+        if generation_round > 1 or required_query_kinds:
+            prompt += (
+                f"\n\n这是自动补齐第{generation_round}轮。请生成与之前不同的问法；"
+                f"本轮必须覆盖：{','.join(required_query_kinds) or 'direct,synonym'}。"
+            )
         result = self.ai_runtime.execute(
             SILVER_QUERY_PROMPT,
             prompt,
@@ -51,6 +72,8 @@ class RetrievalEvaluationService:
                 "publication_id": unit["publication_id"],
                 "publication_content_hash": unit["content_hash"],
                 "content": unit["content"][:12000],
+                "generation_round": generation_round,
+                "required_query_kinds": required_query_kinds,
             },
             task_type="silver_query_generation",
             target_type="knowledge_unit",
@@ -61,6 +84,7 @@ class RetrievalEvaluationService:
         if not payload:
             raise ValueError(result.get("error") or "白银评测问题生成失败")
         created = 0
+        case_ids: list[int] = []
         with self.db.connect() as conn:
             for item in payload["cases"][:count]:
                 query = normalize_text(item["query"])
@@ -85,11 +109,15 @@ class RetrievalEvaluationService:
                         result["run_id"],
                     ),
                 )
-                created += max(0, cursor.rowcount)
+                if cursor.rowcount:
+                    created += 1
+                    case_ids.append(int(cursor.lastrowid))
         return {
             "dataset_name": dataset_name,
             "unit_id": unit_id,
             "created": created,
+            "case_ids": case_ids,
+            "generation_round": generation_round,
             "ai_run_id": result["run_id"],
             "cached": bool(result.get("cached")),
         }

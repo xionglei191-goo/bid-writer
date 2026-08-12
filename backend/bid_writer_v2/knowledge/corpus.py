@@ -1599,22 +1599,47 @@ class CorpusCompletionService:
         # A model request may legitimately spend up to an hour across transport
         # and one schema-repair retry.  Use a conservative two-hour orphan
         # window so concurrent API work is never closed while still active.
+        # If the host clock moved backwards, only close a future-dated record
+        # after a newer request for the same target has demonstrably taken over.
         ai_cutoff = (utc_now() - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
+        future_cutoff = (utc_now() + timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
         cutoff = (utc_now() - timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S")
         with self.db.connect() as conn:
             conn.execute(
                 """
                 UPDATE ai_runs SET status='failed',error_code='worker_restart',
                     error_message='后台进程中断，模型调用记录已自动闭环',completed_at=CURRENT_TIMESTAMP
-                WHERE status='running' AND created_at<?
+                WHERE status='running' AND (
+                    created_at<? OR (
+                        created_at>? AND EXISTS (
+                            SELECT 1 FROM ai_runs newer
+                            WHERE newer.id>ai_runs.id
+                              AND newer.status IN ('running','succeeded')
+                              AND newer.task_type=ai_runs.task_type
+                              AND COALESCE(newer.target_type,'')=COALESCE(ai_runs.target_type,'')
+                              AND COALESCE(newer.target_id,-1)=COALESCE(ai_runs.target_id,-1)
+                              AND newer.created_at<=?
+                        )
+                    )
+                )
                 """,
-                (ai_cutoff,),
+                (ai_cutoff, future_cutoff, future_cutoff),
             )
             conn.execute(
                 """
                 UPDATE knowledge_ai_pipeline_runs SET status='completed_with_exceptions',
                     error_message='后台进程中断，流水线记录已自动闭环',completed_at=CURRENT_TIMESTAMP
-                WHERE status='running' AND created_at<?
+                WHERE status='running' AND (
+                    created_at<? OR (
+                        created_at>? AND EXISTS (
+                            SELECT 1 FROM knowledge_ai_pipeline_runs newer
+                            WHERE newer.id>knowledge_ai_pipeline_runs.id
+                              AND newer.document_id=knowledge_ai_pipeline_runs.document_id
+                              AND newer.status IN ('running','completed')
+                              AND newer.created_at<=?
+                        )
+                    )
+                )
                   AND NOT EXISTS (
                       SELECT 1 FROM ai_runs a
                       WHERE a.status='running' AND a.id IN (
@@ -1624,7 +1649,7 @@ class CorpusCompletionService:
                       )
                   )
                 """,
-                (ai_cutoff,),
+                (ai_cutoff, future_cutoff, future_cutoff),
             )
             conn.execute(
                 """
@@ -1768,27 +1793,7 @@ class CorpusCompletionService:
         publications = self.db.rows(
             "SELECT DISTINCT unit_id FROM knowledge_publications WHERE status='published' ORDER BY unit_id"
         )
-        failures: list[dict[str, Any]] = []
-        for index, publication in enumerate(publications, 1):
-            unit_id = int(publication["unit_id"])
-            existing = self.db.row(
-                "SELECT COUNT(*) AS count FROM retrieval_eval_cases WHERE dataset_name=? AND source_unit_id=? AND status='approved'",
-                (dataset, unit_id),
-            )
-            if int((existing or {}).get("count", 0)) >= 4:
-                continue
-            progress("evaluation", 97, f"生成评测问题 {index}/{len(publications)}", {"unit_id": unit_id})
-            error = ""
-            for attempt in range(1, 4):
-                try:
-                    self.evaluation.generate_silver_cases(unit_id, 8, dataset)
-                    self.evaluation.review_silver_cases_ai(dataset)
-                    error = ""
-                    break
-                except Exception as exc:  # noqa: BLE001
-                    error = f"{type(exc).__name__}: {exc}"
-            if error:
-                failures.append({"unit_id": unit_id, "error": error})
+        failures = self._ensure_evaluation_case_coverage(dataset, publications, progress)
         if failures:
             return {"passed": False, "technical_failures": failures, "dataset_name": dataset}
         search_fn = lambda query, industry, unit_type, top_k: self.retrieval.search_index(
@@ -1817,6 +1822,118 @@ class CorpusCompletionService:
         result["passed"] = not failed
         result["failed_thresholds"] = failed
         return result
+
+    def _ensure_evaluation_case_coverage(
+        self,
+        dataset: str,
+        publications: list[dict[str, Any]],
+        progress,
+    ) -> list[dict[str, Any]]:
+        """Generate and independently review evaluation cases with bounded repair.
+
+        Direct and synonym coverage is checked after every review round.  A
+        rejected or incomplete model response therefore triggers a genuinely
+        new (non-cached) generation round instead of immediately pausing the
+        corpus run or leaving a technical task for a person.
+        """
+        if not self.evaluation:
+            return [{"error": "evaluation service is not configured"}]
+        publication_ids = [int(item["unit_id"]) for item in publications]
+        errors: dict[int, str] = {}
+        for generation_round in range(1, 4):
+            coverage = self._evaluation_unit_case_coverage(dataset, publication_ids)
+            missing = [unit_id for unit_id in publication_ids if not self._unit_eval_covered(coverage.get(unit_id, {}))]
+            if not missing:
+                return []
+            for index, unit_id in enumerate(missing, 1):
+                state = coverage.get(unit_id, {})
+                kinds = set(state.get("kinds") or [])
+                required = sorted({"direct", "synonym"} - kinds)
+                progress(
+                    "evaluation",
+                    97,
+                    f"生成评测问题（补齐轮次 {generation_round}/3）{index}/{len(missing)}",
+                    {"unit_id": unit_id, "required_query_kinds": required},
+                )
+                try:
+                    self.evaluation.generate_silver_cases(
+                        unit_id,
+                        8,
+                        dataset,
+                        generation_round=generation_round,
+                        required_query_kinds=required,
+                    )
+                    errors.pop(unit_id, None)
+                except Exception as exc:  # noqa: BLE001
+                    errors[unit_id] = f"{type(exc).__name__}: {exc}"
+
+            # Review proposed cases in bounded groups.  The service itself
+            # caps each request at 100, so repeat until no candidates remain.
+            while True:
+                proposed = self.db.rows(
+                    """
+                    SELECT id FROM retrieval_eval_cases
+                    WHERE dataset_name=? AND status='proposed' AND source_type='silver'
+                      AND ai_review_status='pending'
+                    ORDER BY id LIMIT 100
+                    """,
+                    (dataset,),
+                )
+                if not proposed:
+                    break
+                try:
+                    result = self.evaluation.review_silver_cases_ai(
+                        dataset,
+                        [int(item["id"]) for item in proposed],
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    for unit_id in missing:
+                        errors[unit_id] = f"{type(exc).__name__}: {exc}"
+                    break
+                if int(result.get("case_count") or 0) == 0:
+                    break
+
+        coverage = self._evaluation_unit_case_coverage(dataset, publication_ids)
+        failures: list[dict[str, Any]] = []
+        for unit_id in publication_ids:
+            state = coverage.get(unit_id, {})
+            if self._unit_eval_covered(state):
+                continue
+            failures.append(
+                {
+                    "unit_id": unit_id,
+                    "error": errors.get(unit_id, "evaluation_case_coverage_incomplete_after_three_rounds"),
+                    "approved_count": int(state.get("count") or 0),
+                    "approved_query_kinds": sorted(state.get("kinds") or []),
+                }
+            )
+        return failures
+
+    def _evaluation_unit_case_coverage(self, dataset: str, unit_ids: list[int]) -> dict[int, dict[str, Any]]:
+        if not unit_ids:
+            return {}
+        placeholders = ",".join("?" for _ in unit_ids)
+        rows = self.db.rows(
+            f"""
+            SELECT source_unit_id,query_kind,COUNT(*) AS count
+            FROM retrieval_eval_cases
+            WHERE dataset_name=? AND status='approved' AND source_type='silver'
+              AND source_unit_id IN ({placeholders})
+            GROUP BY source_unit_id,query_kind
+            """,
+            (dataset, *unit_ids),
+        )
+        result: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            unit_id = int(row["source_unit_id"])
+            state = result.setdefault(unit_id, {"count": 0, "kinds": set()})
+            state["count"] += int(row["count"])
+            state["kinds"].add(str(row["query_kind"]))
+        return result
+
+    @staticmethod
+    def _unit_eval_covered(state: dict[str, Any]) -> bool:
+        return int(state.get("count") or 0) >= 4 and {"direct", "synonym"}.issubset(set(state.get("kinds") or []))
 
     def _evaluation_coverage(self, dataset: str, result: dict[str, Any]) -> dict[str, Any]:
         cases = self.db.rows(
