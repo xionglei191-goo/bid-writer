@@ -160,6 +160,10 @@ class KnowledgeCandidateReview(BaseModel):
         if not isinstance(value, dict):
             return value
         normalized = dict(value)
+        # Some local models repeat the source quote on each review even though
+        # the independently audited quote belongs to the candidate/disposition.
+        # It carries no decision authority here, so dropping it is lossless.
+        normalized.pop("evidence_quote", None)
         severity = normalized.pop("severity", "medium")
         reason = str(normalized.pop("reason", "") or "").strip()
         if normalized.get("confidence") is None:

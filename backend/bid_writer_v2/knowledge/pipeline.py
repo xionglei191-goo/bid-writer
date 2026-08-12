@@ -493,7 +493,7 @@ class KnowledgePipelineService:
         if set(review_document_ids) != expected_document_ids or len(review_document_ids) != len(expected_document_ids):
             return self._fail_run(
                 run_id,
-                extraction.get("run_id"),
+                review.get("run_id"),
                 review.get("error") or "independent review returned incomplete source dispositions",
             )
         section_map = {int(section["id"]): section for section in sections}

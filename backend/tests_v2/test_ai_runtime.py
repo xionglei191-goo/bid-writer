@@ -275,6 +275,20 @@ class AiRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(review.corrected_content, "完整修订正文")
 
+    def test_ignores_redundant_review_evidence_quote(self) -> None:
+        review = KnowledgeCandidateReview.model_validate(
+            {
+                "candidate_index": 0,
+                "decision": "pass",
+                "confidence": 0.97,
+                "issues": [],
+                "corrected_content": "",
+                "evidence_quote": "该引文已在候选及来源处置中单独审计。",
+            }
+        )
+        self.assertEqual(review.decision, "pass")
+        self.assertNotIn("evidence_quote", review.model_dump())
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.db = Database(Path(self.temp.name) / "runtime.sqlite3")
