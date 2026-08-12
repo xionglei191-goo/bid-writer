@@ -25,6 +25,7 @@ class PipelineLlm:
 
     def generate(self, instructions: str, prompt: str, max_output_tokens: int = 8000) -> dict:
         self.calls += 1
+        document_ids = [int(value) for value in re.findall(r"\[DOCUMENT:(\d+)\]", prompt)]
         if "知识工程师" in instructions:
             section_id = int(re.search(r"\[SECTION:(\d+)\]", prompt).group(1))
             payload = {
@@ -62,16 +63,38 @@ class PipelineLlm:
                         "risk_level": "高",
                         "source_quote": "施工前完成技术交底、图纸会审、现场复核和作业条件确认。",
                     },
-                ]
+                ],
             }
+            if document_ids:
+                payload["source_dispositions"] = [
+                    {
+                        "document_id": document_id,
+                        "decision": "reusable" if index == 0 else "not_reusable",
+                        "confidence": 0.98,
+                        "reason": "来源包含可复用施工管理内容。" if index == 0 else "仅为项目专属补充内容，不具备跨项目复用条件。",
+                        "evidence_quote": "施工前完成技术交底、图纸会审、现场复核和作业条件确认。" if index == 0 else "",
+                    }
+                    for index, document_id in enumerate(document_ids)
+                ]
         else:
             payload = {
                 "reviews": [
                     {"candidate_index": 0, "decision": "通过", "confidence": 0.96, "issues": [], "corrected_content": ""},
                     {"candidate_index": 1, "decision": "pass", "confidence": 0.95, "issues": [], "corrected_content": ""},
                     {"candidate_index": 2, "decision": "pass", "confidence": 0.94, "issues": [{"severity": "中", "description": "适用范围需要确认"}], "corrected_content": ""},
-                ]
+                ],
             }
+            if document_ids:
+                payload["source_dispositions"] = [
+                    {
+                        "document_id": document_id,
+                        "decision": "reusable" if index == 0 else "not_reusable",
+                        "confidence": 0.98,
+                        "reason": "独立复核确认来源含通用管理措施。" if index == 0 else "独立复核确认仅含项目专属内容。",
+                        "evidence_quote": "施工前完成技术交底、图纸会审、现场复核和作业条件确认。" if index == 0 else "",
+                    }
+                    for index, document_id in enumerate(document_ids)
+                ]
         return {
             **self.settings(),
             "content": json.dumps(payload, ensure_ascii=False),
@@ -178,6 +201,15 @@ class KnowledgePipelineTest(unittest.TestCase):
         self.assertEqual(candidate["source_section_id"], first_section)
         self.assertEqual(candidate["document_id"], expected["document_id"])
         self.assertEqual(candidate["source_id"], expected["source_id"])
+        dispositions = self.db.rows(
+            "SELECT document_id,decision_stage,decision,confidence,actor_type,ai_run_id FROM knowledge_source_dispositions WHERE pipeline_run_id=? ORDER BY document_id,decision_stage",
+            (result["id"],),
+        )
+        self.assertEqual(len(dispositions), 4)
+        self.assertTrue(all(item["actor_type"] == "ai" and item["ai_run_id"] for item in dispositions))
+        second_decisions = [item for item in dispositions if int(item["document_id"]) == second_document_id]
+        self.assertEqual({item["decision"] for item in second_decisions}, {"not_reusable"})
+        self.assertTrue(all(float(item["confidence"]) >= 0.95 for item in second_decisions))
 
     def test_discontinuous_exact_quote_lines_are_valid_anchors(self) -> None:
         findings = self.pipeline._rule_findings(

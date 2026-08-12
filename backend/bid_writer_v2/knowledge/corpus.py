@@ -839,7 +839,37 @@ class CorpusCompletionService:
             source_published = int(source_counts.get("accepted") or 0)
             source_rejected = int(source_counts.get("rejected") or 0)
             source_legal = int(open_manual.get("count") or 0)
+            source_dispositions = self.db.rows(
+                """
+                SELECT decision_stage,decision,confidence,reason,ai_run_id,prompt_key,prompt_version
+                FROM knowledge_source_dispositions
+                WHERE pipeline_run_id=? AND source_id=? ORDER BY id
+                """,
+                (pipeline_run_id, item["source_id"]),
+            )
+            disposition_map = {str(row["decision_stage"]): row for row in source_dispositions}
+            extraction_disposition = disposition_map.get("extraction") or {}
+            review_disposition = disposition_map.get("independent_review") or {}
+            verified_not_reusable = (
+                str(extraction_disposition.get("decision") or "") == "not_reusable"
+                and float(extraction_disposition.get("confidence") or 0) >= 0.95
+                and str(review_disposition.get("decision") or "") == "not_reusable"
+                and float(review_disposition.get("confidence") or 0) >= 0.95
+            )
             if not source_published and not source_rejected and not source_legal:
+                if verified_not_reusable:
+                    self._terminal(
+                        item,
+                        "no_reusable_knowledge",
+                        document_id=document_id,
+                        pipeline_run_id=pipeline_run_id,
+                        checkpoint={
+                            "reason": "two_stage_ai_verified_not_reusable",
+                            "batch_documents": len(prepared),
+                            "source_dispositions": source_dispositions,
+                        },
+                    )
+                    continue
                 self._advance(
                     item,
                     "ai",

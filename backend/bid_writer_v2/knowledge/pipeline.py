@@ -5,7 +5,14 @@ import math
 import re
 from typing import Any
 
-from ..ai_runtime import AiRuntime, KNOWLEDGE_ADJUDICATION_PROMPT, KNOWLEDGE_EXTRACTION_PROMPT, KNOWLEDGE_REVIEW_PROMPT
+from ..ai_runtime import (
+    AiRuntime,
+    KNOWLEDGE_ADJUDICATION_PROMPT,
+    KNOWLEDGE_BATCH_EXTRACTION_PROMPT,
+    KNOWLEDGE_BATCH_REVIEW_PROMPT,
+    KNOWLEDGE_EXTRACTION_PROMPT,
+    KNOWLEDGE_REVIEW_PROMPT,
+)
 from ..database import Database
 from ..utils import content_hash, normalize_text, parse_json
 from .service import KnowledgeService
@@ -64,8 +71,8 @@ class KnowledgePipelineService:
                 [
                     str(document_id),
                     str(document["text_fingerprint"]),
-                    KNOWLEDGE_EXTRACTION_PROMPT.prompt_hash,
-                    KNOWLEDGE_REVIEW_PROMPT.prompt_hash,
+                    KNOWLEDGE_BATCH_EXTRACTION_PROMPT.prompt_hash,
+                    KNOWLEDGE_BATCH_REVIEW_PROMPT.prompt_hash,
                     PIPELINE_RULE_VERSION,
                     str(max_candidates),
                     ",".join(str(section["id"]) for section in sections),
@@ -384,8 +391,8 @@ class KnowledgePipelineService:
                 [
                     "short-document-batch",
                     fingerprint,
-                    KNOWLEDGE_EXTRACTION_PROMPT.prompt_hash,
-                    KNOWLEDGE_REVIEW_PROMPT.prompt_hash,
+                    KNOWLEDGE_BATCH_EXTRACTION_PROMPT.prompt_hash,
+                    KNOWLEDGE_BATCH_REVIEW_PROMPT.prompt_hash,
                     PIPELINE_RULE_VERSION,
                     str(max_candidates),
                     ",".join(str(section["id"]) for section in sections),
@@ -429,8 +436,8 @@ class KnowledgePipelineService:
             return self._fail_run(run_id, None, "batch cancelled before extraction")
         title = "全库短文档批次：" + "；".join(str(document["title"]) for document in documents)
         extraction = self.ai_runtime.execute(
-            KNOWLEDGE_EXTRACTION_PROMPT,
-            KNOWLEDGE_EXTRACTION_PROMPT.render(
+            KNOWLEDGE_BATCH_EXTRACTION_PROMPT,
+            KNOWLEDGE_BATCH_EXTRACTION_PROMPT.render(
                 max_candidates=str(max_candidates),
                 document_title=title,
                 industry="多来源；必须按 SECTION 编号逐条回挂",
@@ -448,23 +455,28 @@ class KnowledgePipelineService:
             target_id=int(documents[0]["id"]),
             max_output_tokens=12000,
         )
-        candidates = (extraction.get("payload") or {}).get("candidates") or []
-        if not candidates:
+        extraction_payload = extraction.get("payload") or {}
+        candidates = extraction_payload.get("candidates") or []
+        extraction_dispositions = extraction_payload.get("source_dispositions") or []
+        expected_document_ids = {int(document["id"]) for document in documents}
+        extraction_document_ids = [int(item["document_id"]) for item in extraction_dispositions]
+        if set(extraction_document_ids) != expected_document_ids or len(extraction_document_ids) != len(expected_document_ids):
             return self._fail_run(
                 run_id,
                 extraction.get("run_id"),
-                extraction.get("error") or "AI returned no candidates for short-document batch",
+                extraction.get("error") or "AI returned incomplete source dispositions for short-document batch",
             )
         review = self.ai_runtime.execute(
-            KNOWLEDGE_REVIEW_PROMPT,
-            KNOWLEDGE_REVIEW_PROMPT.render(
+            KNOWLEDGE_BATCH_REVIEW_PROMPT,
+            KNOWLEDGE_BATCH_REVIEW_PROMPT.render(
                 section_text=section_text,
-                candidate_json=json.dumps(candidates, ensure_ascii=False, indent=2),
+                candidate_json=json.dumps(extraction_payload, ensure_ascii=False, indent=2),
             ),
             {
                 "document_ids": [int(document["id"]) for document in documents],
                 "section_text": section_text,
                 "candidates": candidates,
+                "source_dispositions": extraction_dispositions,
             },
             task_type="knowledge_batch_candidate_review",
             target_type="standard_document_batch",
@@ -476,6 +488,14 @@ class KnowledgePipelineService:
             for item in ((review.get("payload") or {}).get("reviews") or [])
             if int(item["candidate_index"]) < len(candidates)
         }
+        review_dispositions = (review.get("payload") or {}).get("source_dispositions") or []
+        review_document_ids = [int(item["document_id"]) for item in review_dispositions]
+        if set(review_document_ids) != expected_document_ids or len(review_document_ids) != len(expected_document_ids):
+            return self._fail_run(
+                run_id,
+                extraction.get("run_id"),
+                review.get("error") or "independent review returned incomplete source dispositions",
+            )
         section_map = {int(section["id"]): section for section in sections}
         ready_count = 0
         exception_count = 0
@@ -587,6 +607,39 @@ class KnowledgePipelineService:
                     run_id,
                 ),
             )
+            conn.execute("DELETE FROM knowledge_source_dispositions WHERE pipeline_run_id=?", (run_id,))
+            extraction_map = {int(item["document_id"]): item for item in extraction_dispositions}
+            review_map = {int(item["document_id"]): item for item in review_dispositions}
+            for document in documents:
+                document_id = int(document["id"])
+                for stage, disposition, ai_run_id, prompt in (
+                    ("extraction", extraction_map.get(document_id), extraction.get("run_id"), KNOWLEDGE_BATCH_EXTRACTION_PROMPT),
+                    ("independent_review", review_map.get(document_id), review.get("run_id"), KNOWLEDGE_BATCH_REVIEW_PROMPT),
+                ):
+                    if not disposition:
+                        continue
+                    conn.execute(
+                        """
+                        INSERT INTO knowledge_source_dispositions(
+                            pipeline_run_id,document_id,source_id,decision_stage,decision,confidence,reason,
+                            evidence_quote,actor_type,ai_run_id,prompt_key,prompt_version
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            run_id,
+                            document_id,
+                            int(document["source_id"]),
+                            stage,
+                            disposition["decision"],
+                            float(disposition["confidence"]),
+                            disposition["reason"],
+                            disposition.get("evidence_quote") or "",
+                            "ai",
+                            ai_run_id,
+                            prompt.key,
+                            prompt.version,
+                        ),
+                    )
             document_ids = [int(document["id"]) for document in documents]
             placeholders = ",".join("?" for _ in document_ids)
             prior_candidates = [

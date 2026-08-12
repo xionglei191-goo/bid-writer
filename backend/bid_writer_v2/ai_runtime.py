@@ -115,6 +115,23 @@ class KnowledgeExtractionOutput(BaseModel):
     candidates: list[KnowledgeExtractionCandidate] = Field(min_length=1, max_length=20)
 
 
+class KnowledgeSourceDisposition(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    document_id: int = Field(gt=0)
+    decision: Literal["reusable", "not_reusable", "escalate"]
+    confidence: float = Field(ge=0, le=1)
+    reason: str = Field(min_length=5, max_length=500)
+    evidence_quote: str = Field(default="", max_length=1200)
+
+
+class KnowledgeBatchExtractionOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candidates: list[KnowledgeExtractionCandidate] = Field(default_factory=list, max_length=20)
+    source_dispositions: list[KnowledgeSourceDisposition] = Field(min_length=1, max_length=20)
+
+
 class KnowledgeReviewIssue(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -185,6 +202,13 @@ class KnowledgeReviewOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reviews: list[KnowledgeCandidateReview] = Field(min_length=1, max_length=20)
+
+
+class KnowledgeBatchReviewOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reviews: list[KnowledgeCandidateReview] = Field(default_factory=list, max_length=20)
+    source_dispositions: list[KnowledgeSourceDisposition] = Field(min_length=1, max_length=20)
 
 
 @dataclass(frozen=True)
@@ -305,6 +329,28 @@ KNOWLEDGE_EXTRACTION_PROMPT = PromptSpec(
     output_model=KnowledgeExtractionOutput,
 )
 
+KNOWLEDGE_BATCH_EXTRACTION_PROMPT = PromptSpec(
+    key="knowledge.extract-batch-with-source-disposition",
+    version="1.0.0",
+    instructions=(
+        "你是建设工程知识工程师。逐份判断输入文档是否含有原文明确支持、可跨项目复用的知识。"
+        "不得补充原文没有的参数、规范编号、设备数量、工期或承诺。每份文档必须给出独立处置结论。"
+    ),
+    template=(
+        "处理以下由[DOCUMENT:编号]和[SECTION:编号]标记的多份标准文档。输出JSON对象，完整包含candidates和"
+        "source_dispositions。source_dispositions必须为每个DOCUMENT编号恰好输出一条，decision只能为reusable、"
+        "not_reusable或escalate；只有确实存在可形成候选的通用技术或管理内容才判reusable，纯封面、目录、历史项目"
+        "参数、纯图形、乱码或证据不足判not_reusable，不确定判escalate。reason必须说明依据，evidence_quote有可引用"
+        "文字时应逐字摘录。对判reusable的文档至少输出1条候选，但总候选不得超过{max_candidates}条。每条候选包含"
+        "source_section_id、title、unit_type、content、summary、tags、applicability、risk_level、source_quote；"
+        "source_quote必须逐字来自对应SECTION，content至少20个中文字符。unit_type只能使用construction_method、"
+        "quality_control、safety_measure、schedule_plan、resource_plan、organization_chart、process_flow、site_layout、"
+        "table_template、management_measure；risk_level只能为low、medium或high。\n\n"
+        "批次标题：{document_title}\n行业与约束：{industry}\n来源原文：\n{section_text}"
+    ),
+    output_model=KnowledgeBatchExtractionOutput,
+)
+
 KNOWLEDGE_REVIEW_PROMPT = PromptSpec(
     key="knowledge.review-candidates",
     version="1.0.2",
@@ -319,6 +365,24 @@ KNOWLEDGE_REVIEW_PROMPT = PromptSpec(
         "来源章节：\n{section_text}\n\n候选数组：\n{candidate_json}"
     ),
     output_model=KnowledgeReviewOutput,
+)
+
+KNOWLEDGE_BATCH_REVIEW_PROMPT = PromptSpec(
+    key="knowledge.review-batch-source-disposition",
+    version="1.0.0",
+    instructions=(
+        "你是独立的建设工程知识复核人。逐条核验候选忠实性，并独立复核每份来源是否真的具有可复用内容。"
+        "不得照抄抽取结论，不得因为文字通顺而判定可复用。"
+    ),
+    template=(
+        "复核多文档批次。输出JSON对象，完整包含reviews和source_dispositions。reviews按candidate_index逐条返回；"
+        "decision只能为pass、revise、escalate或reject。source_dispositions必须为每个DOCUMENT编号恰好输出一条；"
+        "decision只能为reusable、not_reusable或escalate，confidence为0到1。只有来源能直接支持至少一项安全的跨项目"
+        "知识时判reusable；纯图、封面目录、项目专属事实或证据不足判not_reusable；无法确定判escalate。"
+        "reason说明复核依据，evidence_quote有可引用文字时逐字摘录。\n\n"
+        "来源章节：\n{section_text}\n\n抽取结果：\n{candidate_json}"
+    ),
+    output_model=KnowledgeBatchReviewOutput,
 )
 
 KNOWLEDGE_ADJUDICATION_PROMPT = PromptSpec(

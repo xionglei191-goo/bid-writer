@@ -312,6 +312,72 @@ class CorpusCompletionTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "status=failed"):
             self.corpus._process_ai(item)
 
+    def test_two_stage_not_reusable_disposition_closes_only_verified_source(self) -> None:
+        first_document_id = self._document(
+            "batch-first.md",
+            "批次第一份",
+            "施工前复核图纸和现场条件，完成后逐项检查并形成验收记录。" * 4,
+        )
+        second_document_id = self._document(
+            "batch-second.md",
+            "批次第二份",
+            "该文件仅含历史项目专属介绍，不能形成跨项目通用知识。" * 4,
+        )
+        run = self.corpus.create_run()
+        source_rows = self.db.rows(
+            "SELECT id,source_id FROM standard_documents WHERE id IN (?,?) ORDER BY id",
+            (first_document_id, second_document_id),
+        )
+        with self.db.connect() as conn:
+            pipeline_run_id = int(conn.execute(
+                """
+                INSERT INTO knowledge_ai_pipeline_runs(document_id,pipeline_key,input_hash,status,chunk_count,completed_at)
+                VALUES (?,?,?,'completed',2,CURRENT_TIMESTAMP)
+                """,
+                (first_document_id, "source-disposition-fixture", "input"),
+            ).lastrowid)
+            for document in source_rows:
+                conn.execute(
+                    "UPDATE corpus_run_items SET stage='ai',status='running',document_id=? WHERE run_id=? AND source_id=?",
+                    (document["id"], run["id"], document["source_id"]),
+                )
+            for stage in ("extraction", "independent_review"):
+                conn.execute(
+                    """
+                    INSERT INTO knowledge_source_dispositions(
+                        pipeline_run_id,document_id,source_id,decision_stage,decision,confidence,reason,
+                        actor_type,prompt_key,prompt_version
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        pipeline_run_id,
+                        second_document_id,
+                        source_rows[1]["source_id"],
+                        stage,
+                        "not_reusable",
+                        0.98,
+                        "仅含项目专属介绍，未形成可复用技术措施。",
+                        "ai",
+                        "fixture",
+                        "1",
+                    ),
+                )
+        items = self.db.rows(
+            "SELECT i.*,s.file_name FROM corpus_run_items i JOIN source_files s ON s.id=i.source_id WHERE i.run_id=? AND i.source_id IN (?,?) ORDER BY i.document_id",
+            (run["id"], source_rows[0]["source_id"], source_rows[1]["source_id"]),
+        )
+        self.pipeline.process_document_batch = lambda *_args, **_kwargs: {"id": pipeline_run_id, "status": "completed"}
+        self.corpus._final_review = lambda *_args, **_kwargs: (0, 0, 0)
+        self.corpus._process_ai_batch(items)
+        states = self.db.rows(
+            "SELECT source_id,stage,status,terminal_reason,checkpoint_json FROM corpus_run_items WHERE run_id=? AND source_id IN (?,?) ORDER BY document_id",
+            (run["id"], source_rows[0]["source_id"], source_rows[1]["source_id"]),
+        )
+        self.assertEqual((states[0]["stage"], states[0]["status"]), ("ai", "pending"))
+        self.assertIn("requires_individual_ai", states[0]["checkpoint_json"])
+        self.assertEqual((states[1]["status"], states[1]["terminal_reason"]), ("terminal", "no_reusable_knowledge"))
+        self.assertIn("two_stage_ai_verified_not_reusable", states[1]["checkpoint_json"])
+
     def test_manual_asset_resolution_requires_explicit_approve_or_exclude(self) -> None:
         source_id = self._source("batch/table.xlsx", ".xlsx", "asset")
         run = self.corpus.create_run()
