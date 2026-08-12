@@ -3,13 +3,18 @@ from __future__ import annotations
 import tempfile
 import unittest
 import zipfile
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
+
+from pypdf import PdfWriter
 
 from bid_writer_v2.ai_runtime import AiRuntime
 from bid_writer_v2.audit import AuditService
 from bid_writer_v2.database import Database
 from bid_writer_v2.evaluation import RetrievalEvaluationService
 from bid_writer_v2.knowledge.corpus import CorpusCompletionService
+from bid_writer_v2.knowledge.ocr import ocr_pdf_step
 from bid_writer_v2.knowledge.parsers import _parse_docx_xml_fallback
 from bid_writer_v2.knowledge.pipeline import KnowledgePipelineService
 from bid_writer_v2.knowledge.service import KnowledgeService
@@ -194,6 +199,28 @@ class CorpusCompletionTest(unittest.TestCase):
         self.assertEqual(ai_state, {"status": "failed", "error_code": "worker_restart"})
         self.assertEqual(pipeline_state["status"], "completed_with_exceptions")
         self.assertIn("后台进程中断", pipeline_state["error_message"])
+
+    def test_ocr_step_processes_one_new_chunk_and_resumes_from_cache(self) -> None:
+        pdf = self.settings.raw_root / "three-pages.pdf"
+        writer = PdfWriter()
+        for _ in range(3):
+            writer.add_blank_page(width=100, height=100)
+        with pdf.open("wb") as handle:
+            writer.write(handle)
+        settings = replace(self.settings, ocr_chunk_pages=2, ocr_token_env="OCR_TEST_TOKEN")
+        with patch.dict("os.environ", {"OCR_TEST_TOKEN": "fixture"}), patch(
+            "bid_writer_v2.knowledge.ocr._run_job",
+            side_effect=lambda _path, _token, offset, _settings: f"chunk-{offset}",
+        ) as provider:
+            first = ocr_pdf_step(pdf, 701, settings, max_new_chunks=1)
+            second = ocr_pdf_step(pdf, 701, settings, max_new_chunks=1)
+            third = ocr_pdf_step(pdf, 701, settings, max_new_chunks=1)
+        self.assertFalse(first["completed"])
+        self.assertEqual((first["completed_chunks"], first["total_chunks"]), (1, 2))
+        self.assertTrue(second["completed"])
+        self.assertEqual(second["markdown"], "chunk-0\n\nchunk-2")
+        self.assertTrue(third["completed"])
+        self.assertEqual(provider.call_count, 2)
 
     def test_manual_asset_resolution_requires_explicit_approve_or_exclude(self) -> None:
         source_id = self._source("batch/table.xlsx", ".xlsx", "asset")

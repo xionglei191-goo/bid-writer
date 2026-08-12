@@ -13,7 +13,7 @@ from ..database import Database
 from ..llm import LlmClient
 from ..settings import Settings
 from ..utils import content_hash, family_key, infer_industry, normalize_text, parse_json, sha256_file, write_json_atomic, write_text_atomic
-from .ocr import ocr_pdf
+from .ocr import ocr_pdf_step
 from .parsers import OcrRequired, ParsedDocument, parse_document
 
 
@@ -396,7 +396,25 @@ class KnowledgeService:
         try:
             source_path = self.resolve_source_path(job)
             job["absolute_path"] = str(source_path)
-            markdown, page_count = ocr_pdf(source_path, int(job["source_id"]), self.settings)
+            ocr = ocr_pdf_step(source_path, int(job["source_id"]), self.settings, max_new_chunks=1)
+            if not bool(ocr["completed"]):
+                completed_chunks = int(ocr["completed_chunks"])
+                total_chunks = max(1, int(ocr["total_chunks"]))
+                checkpoint = {
+                    "page_count": int(ocr["page_count"]),
+                    "completed_pages": int(ocr["completed_pages"]),
+                    "completed_chunks": completed_chunks,
+                    "total_chunks": total_chunks,
+                }
+                progress_value = min(95, 20 + int(75 * completed_chunks / total_chunks))
+                with self.db.connect() as conn:
+                    conn.execute(
+                        "UPDATE processing_jobs SET status='waiting_ocr',progress=?,current_step='ocr_checkpoint',checkpoint_json=?,error_message=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (progress_value, json.dumps(checkpoint, ensure_ascii=False), job_id),
+                    )
+                return {"id": job_id, "status": "waiting_ocr", **checkpoint}
+            markdown = str(ocr["markdown"])
+            page_count = int(ocr["page_count"])
             parsed = ParsedDocument(source_path.stem, markdown, "paddleocr-vl-1.5", page_count)
             result = self._store_document(job, parsed, create_rule_units=create_rule_units)
             with self.db.connect() as conn:

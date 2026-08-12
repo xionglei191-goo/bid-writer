@@ -597,6 +597,17 @@ class CorpusCompletionService:
             )
             return
         result = self.knowledge.run_ocr(job_id, create_rule_units=False)
+        if result.get("status") == "waiting_ocr":
+            self._advance(
+                item,
+                "ocr",
+                processing_job_id=job_id,
+                completed_pages=int(result.get("completed_pages") or 0),
+                page_count=int(result.get("page_count") or 0),
+                completed_chunks=int(result.get("completed_chunks") or 0),
+                total_chunks=int(result.get("total_chunks") or 0),
+            )
+            return
         if result.get("status") != "completed":
             raise RuntimeError(str(result.get("error") or f"OCR状态为{result.get('status')}"))
         if result.get("duplicate_of"):
