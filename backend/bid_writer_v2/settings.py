@@ -48,7 +48,7 @@ class Settings:
     auto_publish_low_risk: bool = False
     ocr_job_url: str = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
     ocr_model: str = "PaddleOCR-VL-1.5"
-    ocr_token_env: str = "PADDLE_OCR_TOKEN"
+    ocr_token_env: str = "PADDLEOCR_TOKEN"
     ocr_chunk_pages: int = 100
     ocr_poll_interval_seconds: float = 5.0
     ocr_max_polls: int = 720
@@ -95,9 +95,9 @@ class Settings:
             embedding_url=os.environ.get("BID_WRITER_EMBEDDING_URL", "").strip().rstrip("/"),
             background_jobs_enabled=os.environ.get("BID_WRITER_BACKGROUND_JOBS", "0") == "1",
             auto_publish_low_risk=os.environ.get("BID_WRITER_AUTO_PUBLISH_LOW_RISK", "0") == "1",
-            ocr_job_url=os.environ.get("BID_WRITER_OCR_URL", "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs").rstrip("/"),
-            ocr_model=os.environ.get("BID_WRITER_OCR_MODEL", "PaddleOCR-VL-1.5"),
-            ocr_token_env=os.environ.get("BID_WRITER_OCR_TOKEN_ENV", "PADDLE_OCR_TOKEN"),
+            ocr_job_url=(os.environ.get("BID_WRITER_OCR_URL") or os.environ.get("PADDLEOCR_JOB_URL") or "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs").rstrip("/"),
+            ocr_model=os.environ.get("BID_WRITER_OCR_MODEL") or os.environ.get("PADDLEOCR_MODEL") or "PaddleOCR-VL-1.5",
+            ocr_token_env=os.environ.get("BID_WRITER_OCR_TOKEN_ENV", "PADDLEOCR_TOKEN"),
             ocr_chunk_pages=max(1, int(os.environ.get("BID_WRITER_OCR_CHUNK_PAGES", "100"))),
             ocr_poll_interval_seconds=max(0.1, float(os.environ.get("BID_WRITER_OCR_POLL_SECONDS", "5"))),
             ocr_max_polls=max(1, int(os.environ.get("BID_WRITER_OCR_MAX_POLLS", "720"))),

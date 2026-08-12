@@ -58,6 +58,12 @@ npm run build
 
 HTTP耗时操作返回`202 + job_id`；前端任务中心显示进度、取消、失败和重试。旧CLI仍保留一个兼容周期。
 
+管理员可在“知识工程 → 全库收口”创建并控制全量任务。对应接口为
+`POST /api/knowledge/corpus-runs`、`GET /api/knowledge/corpus-runs/{id}`、
+`POST /api/knowledge/corpus-runs/{id}/pause|resume|cancel`、
+`GET /api/knowledge/completion`以及`GET /api/knowledge/manual-tasks`。
+技术复核由系统以`actor_type=ai`记录；只有版权、保密、法律责任、密码或替换文件事项进入人工队列。
+
 ## 测试
 
 ```powershell

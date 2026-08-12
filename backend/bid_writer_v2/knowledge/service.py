@@ -122,8 +122,12 @@ class KnowledgeService:
             "SELECT id FROM source_files WHERE sha256 = ? AND absolute_path <> ? ORDER BY id LIMIT 1",
             (digest, absolute),
         ).fetchone()
-        existing = conn.execute("SELECT id FROM source_files WHERE absolute_path = ?", (absolute,)).fetchone()
+        existing = conn.execute("SELECT * FROM source_files WHERE absolute_path = ?", (absolute,)).fetchone()
         status = self._source_status(path.suffix.lower(), bool(duplicate))
+        if existing and str(existing["sha256"] or "") == digest and not duplicate:
+            previous = str(existing["status"] or "")
+            if previous in {"processed", "asset", "metadata_only", "archive"}:
+                status = previous
         values = (
             parent_source_id,
             relative,
@@ -147,7 +151,7 @@ class KnowledgeService:
                 """,
                 values,
             )
-            source_id = int(existing[0])
+            source_id = int(existing["id"])
             created = False
         else:
             cursor = conn.execute(
@@ -186,6 +190,38 @@ class KnowledgeService:
             return "asset"
         return "metadata_only"
 
+    def resolve_source_path(self, source: dict[str, Any]) -> Path:
+        """Resolve migrated host paths against the current read-only/container mounts."""
+        absolute = Path(str(source.get("absolute_path") or ""))
+        relative = str(source.get("relative_path") or "").replace("\\", "/")
+        if str(source.get("source_kind") or "") == "raw":
+            marker = "01_原始标书库/"
+            suffix = relative.split(marker, 1)[1] if marker in relative else relative
+            candidate = self.settings.raw_root / Path(suffix)
+            if candidate.exists():
+                return candidate
+        archive_marker = "data/cache/archives/"
+        if archive_marker in relative:
+            suffix = relative.split(archive_marker, 1)[1]
+            candidate = self.settings.cache_root / "archives" / Path(suffix)
+            if candidate.exists():
+                return candidate
+            parent_id = source.get("parent_source_id")
+            if parent_id:
+                parent = self.db.row("SELECT * FROM source_files WHERE id=?", (parent_id,))
+                if parent:
+                    parent_path = self.resolve_source_path(parent)
+                    if parent_path.exists():
+                        self._expand_archive(parent_path, int(parent["id"]), str(parent["sha256"]))
+                        if candidate.exists():
+                            return candidate
+        try:
+            if absolute.is_absolute() and absolute.exists():
+                return absolute
+        except OSError:
+            pass
+        return absolute
+
     def _expand_archive(self, path: Path, source_id: int, digest: str) -> list[Path]:
         target = self.settings.cache_root / "archives" / f"{source_id}_{digest[:12]}"
         marker = target / ".complete"
@@ -195,11 +231,18 @@ class KnowledgeService:
         extension = path.suffix.lower()
         if extension == ".zip":
             with zipfile.ZipFile(path) as archive:
-                for member in archive.infolist():
+                members = archive.infolist()
+                total_size = sum(max(0, int(member.file_size)) for member in members)
+                compressed_size = sum(max(1, int(member.compress_size)) for member in members)
+                if len(members) > 100_000 or total_size > 20 * 1024**3 or total_size / compressed_size > 200:
+                    raise RuntimeError("压缩包安全门禁阻断：疑似压缩炸弹")
+                for member in members:
+                    if member.flag_bits & 0x1:
+                        raise RuntimeError("压缩包已加密，需要用户提供密码")
                     member_name = decode_archive_member_name(member.filename, member.flag_bits)
                     destination = (target / member_name).resolve()
-                    if not str(destination).startswith(str(target.resolve())):
-                        continue
+                    if not destination.is_relative_to(target.resolve()):
+                        raise RuntimeError("压缩包安全门禁阻断：路径穿越")
                     if member.is_dir():
                         destination.mkdir(parents=True, exist_ok=True)
                     else:
@@ -209,8 +252,22 @@ class KnowledgeService:
         else:
             seven_zip = shutil.which("7z") or shutil.which("7za")
             if not seven_zip:
-                return []
-            subprocess.run([seven_zip, "x", str(path), f"-o{target}", "-y"], check=True, timeout=600)
+                bsdtar = shutil.which("bsdtar")
+                if not bsdtar:
+                    raise RuntimeError("缺少7z或bsdtar，无法处理RAR/7Z")
+                subprocess.run([bsdtar, "-xf", str(path), "-C", str(target)], check=True, timeout=600)
+            else:
+                listing = subprocess.run([seven_zip, "l", "-slt", str(path)], check=True, capture_output=True, text=True, errors="replace", timeout=120).stdout
+                if re.search(r"^Encrypted\s*=\s*\+", listing, re.MULTILINE):
+                    raise RuntimeError("压缩包已加密，需要用户提供密码")
+                sizes = [int(value) for value in re.findall(r"^Size\s*=\s*(\d+)$", listing, re.MULTILINE)]
+                packed = [max(1, int(value)) for value in re.findall(r"^Packed Size\s*=\s*(\d+)$", listing, re.MULTILINE)]
+                if len(sizes) > 100_000 or sum(sizes) > 20 * 1024**3 or (packed and sum(sizes) / sum(packed) > 200):
+                    raise RuntimeError("压缩包安全门禁阻断：疑似压缩炸弹")
+                subprocess.run([seven_zip, "x", str(path), f"-o{target}", "-y"], check=True, timeout=600)
+            for extracted in target.rglob("*"):
+                if not extracted.resolve().is_relative_to(target.resolve()):
+                    raise RuntimeError("压缩包安全门禁阻断：路径穿越")
         marker.write_text("ok", encoding="ascii")
         return [item for item in target.rglob("*") if item.is_file() and item.name != ".complete"]
 
@@ -277,10 +334,10 @@ class KnowledgeService:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def run_job(self, job_id: int) -> dict[str, Any]:
+    def run_job(self, job_id: int, *, create_rule_units: bool = True) -> dict[str, Any]:
         with self.db.connect() as conn:
             row = conn.execute(
-                "SELECT j.*, s.absolute_path, s.file_name, s.extension, s.industry, s.duplicate_of FROM processing_jobs j JOIN source_files s ON s.id=j.source_id WHERE j.id=?",
+                "SELECT j.*, s.absolute_path, s.relative_path, s.source_kind, s.parent_source_id, s.sha256, s.file_name, s.extension, s.industry, s.duplicate_of FROM processing_jobs j JOIN source_files s ON s.id=j.source_id WHERE j.id=?",
                 (job_id,),
             ).fetchone()
             if not row:
@@ -297,8 +354,9 @@ class KnowledgeService:
                 (job_id,),
             )
         try:
+            job["absolute_path"] = str(self.resolve_source_path(job))
             parsed = self._parse_job(job)
-            result = self._store_document(job, parsed)
+            result = self._store_document(job, parsed, create_rule_units=create_rule_units)
             with self.db.connect() as conn:
                 conn.execute(
                     "UPDATE processing_jobs SET status='completed', progress=100, current_step='completed', error_message=NULL, finished_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?",
@@ -321,10 +379,10 @@ class KnowledgeService:
                 )
             return {"id": job_id, "status": "failed", "error": f"{type(exc).__name__}: {exc}"}
 
-    def run_ocr(self, job_id: int) -> dict[str, Any]:
+    def run_ocr(self, job_id: int, *, create_rule_units: bool = True) -> dict[str, Any]:
         with self.db.connect() as conn:
             row = conn.execute(
-                "SELECT j.*, s.absolute_path, s.file_name, s.extension, s.industry FROM processing_jobs j JOIN source_files s ON s.id=j.source_id WHERE j.id=?",
+                "SELECT j.*, s.absolute_path, s.relative_path, s.source_kind, s.parent_source_id, s.sha256, s.file_name, s.extension, s.industry FROM processing_jobs j JOIN source_files s ON s.id=j.source_id WHERE j.id=?",
                 (job_id,),
             ).fetchone()
             if not row:
@@ -335,9 +393,11 @@ class KnowledgeService:
                 (job_id,),
             )
         try:
-            markdown, page_count = ocr_pdf(Path(job["absolute_path"]), int(job["source_id"]), self.settings)
-            parsed = ParsedDocument(Path(job["absolute_path"]).stem, markdown, "paddleocr-vl-1.5", page_count)
-            result = self._store_document(job, parsed)
+            source_path = self.resolve_source_path(job)
+            job["absolute_path"] = str(source_path)
+            markdown, page_count = ocr_pdf(source_path, int(job["source_id"]), self.settings)
+            parsed = ParsedDocument(source_path.stem, markdown, "paddleocr-vl-1.5", page_count)
+            result = self._store_document(job, parsed, create_rule_units=create_rule_units)
             with self.db.connect() as conn:
                 conn.execute(
                     "UPDATE processing_jobs SET status='completed', progress=100, current_step='completed', error_message=NULL, finished_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?",
@@ -394,7 +454,7 @@ class KnowledgeService:
         path = Path(job["absolute_path"])
         return parse_document(path, int(job["source_id"]), self.settings)
 
-    def _store_document(self, job: dict[str, Any], parsed: ParsedDocument) -> dict[str, Any]:
+    def _store_document(self, job: dict[str, Any], parsed: ParsedDocument, *, create_rule_units: bool = True) -> dict[str, Any]:
         source_id = int(job["source_id"])
         document_dir = self.settings.knowledge_directories["documents"] / f"{source_id:07d}"
         markdown_path = document_dir / "document.md"
@@ -421,13 +481,13 @@ class KnowledgeService:
                 document_id = int(existing[0])
                 conn.execute("DELETE FROM document_sections WHERE document_id=?", (document_id,))
                 conn.execute(
-                    "UPDATE standard_documents SET title=?, markdown_path=?, parser=?, page_count=?, char_count=?, text_fingerprint=?, status='ready', updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                    (parsed.title, str(markdown_path), parsed.parser, parsed.page_count, len(parsed.markdown), fingerprint, document_id),
+                    "UPDATE standard_documents SET title=?, markdown_path=?, parser=?, page_count=?, char_count=?, text_fingerprint=?, source_hash=?, parser_version=?, status='ready', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (parsed.title, str(markdown_path), parsed.parser, parsed.page_count, len(parsed.markdown), fingerprint, job.get("sha256") or "", "2", document_id),
                 )
             else:
                 cursor = conn.execute(
-                    "INSERT INTO standard_documents(source_id,title,markdown_path,parser,page_count,char_count,text_fingerprint) VALUES (?,?,?,?,?,?,?)",
-                    (source_id, parsed.title, str(markdown_path), parsed.parser, parsed.page_count, len(parsed.markdown), fingerprint),
+                    "INSERT INTO standard_documents(source_id,title,markdown_path,parser,page_count,char_count,text_fingerprint,source_hash,parser_version) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (source_id, parsed.title, str(markdown_path), parsed.parser, parsed.page_count, len(parsed.markdown), fingerprint, job.get("sha256") or "", "2"),
                 )
                 document_id = int(cursor.lastrowid)
             unit_ids: list[int] = []
@@ -449,7 +509,7 @@ class KnowledgeService:
                 section_id = int(cursor.lastrowid)
                 is_structured = section["heading"].startswith(("表格", "流程图", "组织架构图", "横道图", "总平面图"))
                 minimum_length = 20 if is_structured else 80
-                if len(section["content"].strip()) < minimum_length:
+                if len(section["content"].strip()) < minimum_length or not create_rule_units:
                     continue
                 unit_id = self._create_unit(conn, source_id, section_id, job, section)
                 unit_ids.append(unit_id)

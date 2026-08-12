@@ -12,6 +12,14 @@ from ..settings import Settings
 from ..utils import normalize_text, write_text_atomic
 
 
+def _raise_for_status(response: requests.Response) -> None:
+    """Preserve the provider error body without ever logging credentials."""
+    if response.ok:
+        return
+    detail = normalize_text(response.text)[:800]
+    raise RuntimeError(f"OCR API HTTP {response.status_code}: {detail or response.reason}")
+
+
 def ocr_pdf(path: Path, source_id: int, settings: Settings) -> tuple[str, int]:
     token = os.environ.get(settings.ocr_token_env)
     if not token:
@@ -54,17 +62,17 @@ def _run_job(path: Path, token: str, page_offset: int, settings: Settings) -> st
             files={"file": handle},
             timeout=180,
         )
-    response.raise_for_status()
+    _raise_for_status(response)
     job_id = response.json()["data"]["jobId"]
     for _ in range(settings.ocr_max_polls):
         status_response = requests.get(f"{settings.ocr_job_url}/{job_id}", headers=headers, timeout=60)
-        status_response.raise_for_status()
+        _raise_for_status(status_response)
         data = status_response.json()["data"]
         state = data["state"]
         if state == "done":
             json_url = data["resultUrl"]["jsonUrl"]
             result = requests.get(json_url, timeout=180)
-            result.raise_for_status()
+            _raise_for_status(result)
             blocks: list[str] = []
             page_number = page_offset
             for line in result.text.splitlines():

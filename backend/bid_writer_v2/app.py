@@ -22,6 +22,7 @@ from .ai_runtime import (
     AiRuntime,
     KNOWLEDGE_ADJUDICATION_PROMPT,
     KNOWLEDGE_EXTRACTION_PROMPT,
+    KNOWLEDGE_FORMAL_REVIEW_PROMPT,
     KNOWLEDGE_REVIEW_PROMPT,
     KNOWLEDGE_REWRITE_PROMPT,
     SECTION_DRAFT_PROMPT,
@@ -33,6 +34,8 @@ from .evaluation import RetrievalEvaluationService
 from .evaluation_api import build_router as build_evaluation_router
 from .knowledge.api import build_router as build_knowledge_router
 from .knowledge.pipeline import KnowledgePipelineService
+from .knowledge.corpus import CorpusCompletionService
+from .knowledge.corpus_api import build_router as build_corpus_router
 from .knowledge.pipeline_api import build_router as build_knowledge_pipeline_router
 from .knowledge.service import KnowledgeService
 from .jobs import JobService
@@ -68,12 +71,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         KNOWLEDGE_EXTRACTION_PROMPT,
         KNOWLEDGE_REVIEW_PROMPT,
         KNOWLEDGE_ADJUDICATION_PROMPT,
+        KNOWLEDGE_FORMAL_REVIEW_PROMPT,
     )
     knowledge = KnowledgeService(db, settings, llm, ai_runtime)
     knowledge_pipeline = KnowledgePipelineService(db, knowledge, ai_runtime)
     production = ProductionService(db, settings, knowledge, llm, ai_runtime, storage=storage, audit=audit)
     evaluation = RetrievalEvaluationService(db, knowledge, ai_runtime, audit)
     retrieval = HybridRetrievalService(db, settings, storage)
+    corpus = CorpusCompletionService(db, knowledge, knowledge_pipeline, retrieval, ai_runtime, evaluation)
     knowledge.hybrid_search = retrieval.search
 
     jobs.register(
@@ -88,6 +93,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             report("adjudicating", 10, "开始低风险知识独立裁决", {"run_id": payload["run_id"]}),
             knowledge_pipeline.auto_publish_low_risk(int(payload["run_id"])),
         )[1],
+    )
+    jobs.register(
+        "knowledge.corpus.tick",
+        lambda payload, report, cancelled: corpus.run_tick(
+            int(payload["run_id"]),
+            progress=report,
+            cancelled=cancelled,
+            preferred_stage=str(payload.get("stage") or ""),
+        ),
     )
     jobs.register("retrieval.rebuild", lambda _payload, report, cancelled: retrieval.build_index(report, cancelled))
     jobs.register(
@@ -128,6 +142,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     knowledge.on_publication_changed = schedule_index
 
+    def dispatch_corpus(run_id: int, delay_ms: int = 0, desired: int = 1, stage: str = "") -> None:
+        target_id = f"{run_id}:{stage or 'any'}"
+        active = db.row(
+            "SELECT COUNT(*) AS count FROM app_jobs WHERE job_type='knowledge.corpus.tick' AND target_id=? AND status IN ('pending','retrying','running')",
+            (target_id,),
+        )
+        missing = max(0, int(desired) - int((active or {}).get("count", 0)))
+        for _index in range(missing):
+            jobs.enqueue("knowledge.corpus.tick", "corpus_run", target_id, {"run_id": run_id, "stage": stage}, delay_ms=delay_ms)
+
+    corpus.dispatch = dispatch_corpus
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         settings.ensure_directories()
@@ -147,6 +173,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.storage = storage
     app.state.jobs = jobs
     app.state.retrieval = retrieval
+    app.state.corpus = corpus
     app.state.initial_migrations = migrations
 
     @app.exception_handler(StarletteHTTPException)
@@ -339,6 +366,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"root_name": root.name, "items": items}
 
     app.include_router(build_knowledge_router(knowledge))
+    app.include_router(build_corpus_router(corpus))
     app.include_router(build_knowledge_pipeline_router(knowledge_pipeline, jobs))
     app.include_router(build_production_router(production, jobs))
     app.include_router(build_ai_router(ai_runtime))

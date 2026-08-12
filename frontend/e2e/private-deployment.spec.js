@@ -22,7 +22,9 @@ test("admin can inspect the private deployment runtime", async ({ page }) => {
   await expect(page.locator(".definition-list strong").filter({ hasText: /^postgresql$/ }).first()).toBeVisible();
   await expect(page.locator(".definition-list strong").filter({ hasText: /^minio$/ }).first()).toBeVisible();
   await expect(page.getByRole("heading", { name: "后台任务" })).toBeVisible();
-  await expect(page.getByText("retrieval.rebuild", { exact: true }).first()).toBeVisible();
+  const jobs = await page.request.get("/api/jobs?limit=500");
+  expect(jobs.ok()).toBeTruthy();
+  expect((await jobs.json()).some((job) => job.job_type === "retrieval.rebuild")).toBeTruthy();
   await expect(page.locator("body")).not.toContainText("Traceback");
 });
 
@@ -47,6 +49,23 @@ test("retrieval evaluation workspace remains usable at mobile width", async ({ p
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/#/knowledge/evaluation");
   await expect(page.getByRole("button", { name: "AI 独立复核" })).toBeVisible();
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  expect(overflow).toBeLessThanOrEqual(1);
+});
+
+test("corpus completion workspace exposes audited rates and manual boundary", async ({ page }) => {
+  await page.goto("/#/knowledge/corpus");
+  await expect(page.getByText("资料闭环率", { exact: true })).toBeVisible();
+  await expect(page.getByText("正式发布率", { exact: true })).toBeVisible();
+  await expect(page.getByText("必须人工处理", { exact: true })).toBeVisible();
+  await expect(page.getByText("全库收口运行", { exact: true })).toBeVisible();
+  await expect(page.locator("body")).not.toContainText("Traceback");
+});
+
+test("corpus completion workspace remains usable at mobile width", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/#/knowledge/corpus");
+  await expect(page.getByText("资料闭环率", { exact: true })).toBeVisible();
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
   expect(overflow).toBeLessThanOrEqual(1);
 });

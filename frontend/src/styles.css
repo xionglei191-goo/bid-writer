@@ -122,6 +122,10 @@ td small { color: #7a8790; margin-top: 4px; max-width: 460px; overflow: hidden; 
 .table-footer { color: #7a8790; font-size: 11px; margin-top: 9px; text-align: right; }
 .progress { width: 100px; height: 6px; background: #e9edef; border-radius: 3px; overflow: hidden; }
 .progress span { display: block; height: 100%; background: #176b62; }
+.progress.wide { width: 100%; height: 8px; margin: 10px 0 7px; }
+.corpus-progress { margin-bottom: 14px; padding: 13px; border: 1px solid #dbe2e5; border-radius: 5px; background: #f8faf9; }
+.corpus-progress > div:first-child { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.corpus-progress small { color: #70808a; }
 .error-text { color: #a42e2e; max-width: 260px; white-space: normal; }
 .empty-state { min-height: 170px; display: flex; flex-direction: column; align-items: center; justify-content: center; color: #7a8790; text-align: center; padding: 24px; }
 .empty-state strong { color: #51616c; font-size: 14px; }

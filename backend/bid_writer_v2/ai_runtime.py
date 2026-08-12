@@ -332,6 +332,23 @@ KNOWLEDGE_ADJUDICATION_PROMPT = PromptSpec(
     output_model=KnowledgeReviewOutput,
 )
 
+KNOWLEDGE_FORMAL_REVIEW_PROMPT = PromptSpec(
+    key="knowledge.formal-review",
+    version="1.0.0",
+    instructions=(
+        "你是正式工程知识发布的最终独立裁决模型，不是人工审核人。逐字核验来源引文、技术含义、"
+        "跨项目适用范围、所有数值与规范表述；禁止补充来源之外的事实。发现法律责任、版权、保密、"
+        "个人信息、项目身份、无依据参数、绝对承诺或适用范围扩张时必须reject。"
+    ),
+    template=(
+        "对候选知识作最终裁决。candidate_index对应输入下标；decision只能为pass、revise、escalate或reject。"
+        "只有来源充分、适用范围清楚且可跨项目安全复用时才能pass。若仅需删除项目特定内容且不改变技术含义可revise，"
+        "并在corrected_content给出完整修订稿。输出JSON对象reviews，每条完整包含candidate_index、decision、confidence、"
+        "issues、corrected_content。\n\n来源章节：\n{section_text}\n\n候选数组：\n{candidate_json}"
+    ),
+    output_model=KnowledgeReviewOutput,
+)
+
 
 OutputT = TypeVar("OutputT", bound=BaseModel)
 

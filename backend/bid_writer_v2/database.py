@@ -48,6 +48,8 @@ _ID_TABLES = {
     "job_events", "object_records", "document_chunks", "candidate_relations", "knowledge_auto_publish_batches",
     "retrieval_indexes", "retrieval_runs_v2", "retrieval_feedback", "generation_runs", "claims", "evidence_links",
     "quality_issues", "delivery_manifests",
+    "corpus_runs", "corpus_run_items", "knowledge_review_decisions", "governance_tasks",
+    "corpus_section_clusters",
 }
 
 

@@ -251,12 +251,12 @@ class RetrievalEvaluationService:
             )
         return {"action": action, "processed": len(results), "case_ids": unique_ids}
 
-    def repair_confusing_negatives(self, dataset_name: str) -> dict[str, Any]:
+    def repair_confusing_negatives(self, dataset_name: str, search_fn=None) -> dict[str, Any]:
         negatives = self.list_cases(dataset_name, status="approved", source_type="silver")
         negatives = [item for item in negatives if item["query_kind"] == "confusing_negative"]
         rejected_ids: list[int] = []
         for case in negatives:
-            retrieved_ids = {int(item["unit_id"]) for item in self.knowledge.search(case["query"], limit=10)}
+            retrieved_ids = {int(item["unit_id"]) for item in (search_fn or self.knowledge.search)(case["query"], "", "", 10)}
             if retrieved_ids.intersection(int(value) for value in case["excluded_unit_ids"]):
                 rejected_ids.append(int(case["id"]))
         if rejected_ids:
@@ -295,7 +295,7 @@ class RetrievalEvaluationService:
                 donors = [item for item in positives if int(item.get("source_unit_id") or 0) != unit_id]
                 for donor in donors:
                     query = f"相关专业对照：{donor['query']}"
-                    retrieved_ids = {int(item["unit_id"]) for item in self.knowledge.search(query, limit=10)}
+                    retrieved_ids = {int(item["unit_id"]) for item in (search_fn or self.knowledge.search)(query, "", "", 10)}
                     if unit_id in retrieved_ids:
                         continue
                     cursor = conn.execute(
@@ -342,7 +342,7 @@ class RetrievalEvaluationService:
             )
         return {"case_id": case_id, "status": status, "source_type": source_type, "reviewed_by": reviewer.strip()}
 
-    def run(self, dataset_name: str = "default", source_type: str = "silver", top_k: int = 10) -> dict[str, Any]:
+    def run(self, dataset_name: str = "default", source_type: str = "silver", top_k: int = 10, search_fn=None) -> dict[str, Any]:
         top_k = max(1, min(int(top_k), 50))
         cases = self.list_cases(dataset_name=dataset_name, status="approved", source_type=source_type)
         if not cases:
@@ -358,7 +358,7 @@ class RetrievalEvaluationService:
         baseline_negative_passes = 0
         negative_count = 0
         for case in cases:
-            matches = self.knowledge.search(case["query"], case["industry"], case["unit_type"], top_k)
+            matches = (search_fn or self.knowledge.search)(case["query"], case["industry"], case["unit_type"], top_k)
             hybrid_callback = getattr(self.knowledge, "hybrid_search", None)
             try:
                 self.knowledge.hybrid_search = None

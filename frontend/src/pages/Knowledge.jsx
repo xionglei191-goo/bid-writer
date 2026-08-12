@@ -4,7 +4,7 @@ import { api, post, waitForJob } from "../api";
 import { BusyButton, Empty, Metric, Notice, PageHeader, Status, Tabs } from "../components";
 
 const tabItems = [
-  { key: "sources", label: "原始资料" }, { key: "jobs", label: "处理队列" }, { key: "documents", label: "标准文档" }, { key: "ai-pipeline", label: "AI加工" },
+  { key: "corpus", label: "全库收口" }, { key: "sources", label: "原始资料" }, { key: "jobs", label: "处理队列" }, { key: "documents", label: "标准文档" }, { key: "ai-pipeline", label: "AI加工" },
   { key: "units", label: "知识单元" }, { key: "reviews", label: "审核发布" }, { key: "publications", label: "正式知识" }, { key: "search", label: "检索测试" }, { key: "evaluation", label: "评测集" },
 ];
 
@@ -19,6 +19,7 @@ export default function Knowledge({ initialTab, onChanged }) {
     <PageHeader eyebrow="知识工程中心" title="本地知识资产" description="只有审核并发布的内容可以进入技术标生成链路。" />
     <section className="metric-grid five"><Metric label="已扫描" value={metrics.sources} /><Metric label="重复文件" value={metrics.duplicates} /><Metric label="标准文档" value={metrics.documents} /><Metric label="待审核" value={metrics.review_pending} tone="warning" /><Metric label="已发布" value={metrics.published} tone="success" /></section>
     <Tabs items={tabItems} active={tab} onChange={selectTab} />
+    {tab === "corpus" && <CorpusCompletion onChanged={() => { loadMetrics(); onChanged?.(); }} />}
     {tab === "sources" && <Sources onChanged={() => { loadMetrics(); onChanged?.(); }} />}
     {tab === "jobs" && <Jobs onChanged={() => { loadMetrics(); onChanged?.(); }} />}
     {tab === "documents" && <Documents />}
@@ -28,6 +29,31 @@ export default function Knowledge({ initialTab, onChanged }) {
     {tab === "publications" && <Publications onChanged={loadMetrics} />}
     {tab === "search" && <KnowledgeSearch />}
     {tab === "evaluation" && <RetrievalEvaluationWorkspace />}
+  </>;
+}
+
+function CorpusCompletion({ onChanged }) {
+  const [run, setRun] = useState(null); const [completion, setCompletion] = useState(null); const [tasks, setTasks] = useState([]); const [busy, setBusy] = useState(""); const [message, setMessage] = useState("");
+  async function load(runId) {
+    const nextCompletion = await api(`/api/knowledge/completion${runId ? `?run_id=${runId}` : ""}`);
+    setCompletion(nextCompletion);
+    const id = runId || nextCompletion.run_id;
+    if (id) setRun(await api(`/api/knowledge/corpus-runs/${id}`));
+    setTasks(await api("/api/knowledge/manual-tasks?status=open&limit=500"));
+  }
+  async function start() { setBusy("start"); try { const next = await post("/api/knowledge/corpus-runs", {}); setRun(next); setMessage("全库收口任务已启动，原始库保持只读，加工结果按检查点持续写入。"); await load(next.id); onChanged?.(); } catch (error) { setMessage(error.message); } finally { setBusy(""); } }
+  async function control(action) { if (!run) return; setBusy(action); try { const next = await post(`/api/knowledge/corpus-runs/${run.id}/${action}`, {}); setRun(next); setMessage(action === "pause" ? "任务已暂停。" : action === "resume" ? "任务已恢复。" : "任务已取消。"); await load(run.id); } catch (error) { setMessage(error.message); } finally { setBusy(""); } }
+  async function resolve(task, action) { const resolution = window.prompt(action === "approve" ? "请输入授权、解密或法律确认依据；批准后相关内容才会进入后续流水线：" : "请输入排除依据；相关内容将保持不进入正式检索："); if (!resolution) return; setBusy(`task-${task.id}`); try { await post(`/api/knowledge/manual-tasks/${task.id}/resolve`, { action, resolution }); await load(run?.id); } catch (error) { setMessage(error.message); } finally { setBusy(""); } }
+  useEffect(() => { load().catch((error) => setMessage(error.message)); }, []);
+  useEffect(() => { if (!run || run.status !== "running") return undefined; const timer = window.setInterval(() => load(run.id).catch(() => {}), 5000); return () => window.clearInterval(timer); }, [run?.id, run?.status]);
+  const counters = run?.counters || {}; const reasons = Object.entries(counters.by_reason || {}).sort((left, right) => right[1] - left[1]);
+  return <>
+    <section className="metric-grid five"><Metric label="资料闭环率" value={`${Math.round((completion?.corpus_terminal_rate || 0) * 10000) / 100}%`} tone={completion?.corpus_terminal_rate === 1 ? "success" : "warning"} /><Metric label="正式发布率" value={`${Math.round((completion?.formal_eligible_publication_rate || 0) * 10000) / 100}%`} tone={completion?.formal_eligible_publication_rate === 1 ? "success" : "warning"} /><Metric label="剩余资料" value={counters.remaining ?? completion?.corpus_total ?? 0} /><Metric label="正式知识" value={completion?.published_total ?? 0} tone="success" /><Metric label="人工事项" value={completion?.manual_legal_open ?? 0} tone={completion?.manual_legal_open ? "warning" : "success"} /></section>
+    <section className="panel"><div className="toolbar"><div><strong>全库收口运行</strong><span className="toolbar-note">标准化2路、OCR 1路、AI加工1路；服务失败率和磁盘空间自动熔断。</span></div><div className="actions"><button className="secondary icon-only" title="刷新" onClick={() => load(run?.id)}><RefreshCw size={17} /></button>{!run && <BusyButton busy={busy === "start"} onClick={start}><Play size={16} />启动全库收口</BusyButton>}{run?.status === "running" && <BusyButton busy={busy === "pause"} className="secondary" onClick={() => control("pause")}>暂停</BusyButton>}{run?.status === "paused" && <BusyButton busy={busy === "resume"} onClick={() => control("resume")}><Play size={16} />恢复</BusyButton>}</div></div>
+      {message && <Notice type={message.includes("失败") || message.includes("无权") ? "danger" : "info"}>{message}</Notice>}
+      {run ? <><div className="corpus-progress"><div><strong>运行 #{run.id} · {run.stage}</strong><Status value={run.status} /></div><div className="progress wide"><span style={{ width: `${run.progress || 0}%` }} /></div><small>{run.progress || 0}% · 剩余 {counters.remaining ?? 0} 项{run.pause_reason ? ` · 熔断/暂停原因：${run.pause_reason}` : ""}</small></div><div className="table-wrap"><table><thead><tr><th>终态原因</th><th>数量</th></tr></thead><tbody>{reasons.map(([reason, count]) => <tr key={reason}><td><Status value={reason} /></td><td>{count}</td></tr>)}</tbody></table>{!reasons.length && <Empty title="尚未形成终态统计" />}</div></> : <Empty title="尚未创建全库收口任务" detail="启动前应已完成数据库、向量库、对象存储和知识目录备份。" />}
+    </section>
+    <section className="panel"><div className="toolbar"><div><strong>必须人工处理</strong><span className="toolbar-note">仅保留版权授权、保密解密、法律责任和密码/替换文件事项。</span></div><span>{tasks.length} 项</span></div><div className="table-wrap"><table><thead><tr><th>类型</th><th>事项</th><th>来源</th><th>操作</th></tr></thead><tbody>{tasks.map((task) => <tr key={task.id}><td><Status value={task.task_type} /></td><td><strong>{task.title}</strong><small>{task.message}</small></td><td>{task.file_name || "批次事项"}<small>{task.relative_path || ""}</small></td><td><div className="row-actions"><BusyButton busy={busy === `task-${task.id}`} onClick={() => resolve(task, "approve")}>批准</BusyButton><BusyButton busy={busy === `task-${task.id}`} className="secondary" onClick={() => resolve(task, "exclude")}>排除</BusyButton></div></td></tr>)}</tbody></table>{!tasks.length && <Empty title="没有待人工处理事项" />}</div></section>
   </>;
 }
 

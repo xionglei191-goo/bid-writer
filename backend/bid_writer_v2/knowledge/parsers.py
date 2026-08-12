@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 import zipfile
+from xml.etree import ElementTree
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -44,29 +45,37 @@ def parse_document(path: Path, source_id: int, settings: Settings) -> ParsedDocu
 
 
 def _parse_docx(path: Path, source_id: int, settings: Settings) -> ParsedDocument:
-    document = Document(path)
     blocks: list[str] = [f"# {path.stem}"]
-    for paragraph in document.paragraphs:
-        text = normalize_text(paragraph.text)
-        if not text:
-            continue
-        style = (paragraph.style.name if paragraph.style else "").lower()
-        match = re.search(r"heading\s*(\d+)", style)
-        if match:
-            level = max(1, min(int(match.group(1)), 6))
-            blocks.append(f"{'#' * level} {text}")
-        else:
-            blocks.append(text)
-    for table_index, table in enumerate(document.tables, 1):
-        rows = [[normalize_text(cell.text).replace("|", "\\|") for cell in row.cells] for row in table.rows]
-        if not rows:
-            continue
-        width = max(len(row) for row in rows)
-        rows = [row + [""] * (width - len(row)) for row in rows]
-        blocks.append(f"## 表格 {table_index}")
-        blocks.append("| " + " | ".join(rows[0]) + " |")
-        blocks.append("| " + " | ".join(["---"] * width) + " |")
-        blocks.extend("| " + " | ".join(row) + " |" for row in rows[1:])
+    try:
+        document = Document(path)
+        for paragraph in document.paragraphs:
+            text = normalize_text(paragraph.text)
+            if not text:
+                continue
+            style = (paragraph.style.name if paragraph.style else "").lower()
+            match = re.search(r"heading\s*(\d+)", style)
+            if match:
+                level = max(1, min(int(match.group(1)), 6))
+                blocks.append(f"{'#' * level} {text}")
+            else:
+                blocks.append(text)
+        for table_index, table in enumerate(document.tables, 1):
+            rows = [[normalize_text(cell.text).replace("|", "\\|") for cell in row.cells] for row in table.rows]
+            if not rows:
+                continue
+            width = max(len(row) for row in rows)
+            rows = [row + [""] * (width - len(row)) for row in rows]
+            blocks.append(f"## 表格 {table_index}")
+            blocks.append("| " + " | ".join(rows[0]) + " |")
+            blocks.append("| " + " | ".join(["---"] * width) + " |")
+            blocks.extend("| " + " | ".join(row) + " |" for row in rows[1:])
+    except KeyError as exc:
+        # Some legacy Word files contain a broken relationship whose target is
+        # literally "NULL".  The main document XML is still usable and is read
+        # directly so that one bad embedded object does not discard the text.
+        if "NULL" not in str(exc):
+            raise
+        blocks.extend(_parse_docx_xml_fallback(path))
 
     asset_dir = settings.knowledge_directories["assets"] / "导入图片" / str(source_id)
     with zipfile.ZipFile(path) as archive:
@@ -78,6 +87,41 @@ def _parse_docx(path: Path, source_id: int, settings: Settings) -> ParsedDocumen
             destination.write_bytes(archive.read(name))
             blocks.append(f"![原文图片{index}]({destination.as_posix()})")
     return ParsedDocument(path.stem, normalize_text("\n\n".join(blocks)), "python-docx", 0)
+
+
+def _parse_docx_xml_fallback(path: Path) -> list[str]:
+    namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    with zipfile.ZipFile(path) as archive:
+        root = ElementTree.fromstring(archive.read("word/document.xml"))
+    blocks: list[str] = []
+    body = root.find(f"{namespace}body")
+    if body is None:
+        return blocks
+    table_index = 0
+    for child in body:
+        if child.tag == f"{namespace}p":
+            text = normalize_text("".join(node.text or "" for node in child.iter(f"{namespace}t")))
+            if text:
+                blocks.append(text)
+        elif child.tag == f"{namespace}tbl":
+            rows: list[list[str]] = []
+            for row in child.findall(f"{namespace}tr"):
+                values = []
+                for cell in row.findall(f"{namespace}tc"):
+                    values.append(normalize_text("".join(node.text or "" for node in cell.iter(f"{namespace}t"))).replace("|", "\\|"))
+                if values:
+                    rows.append(values)
+            if rows:
+                table_index += 1
+                width = max(len(row) for row in rows)
+                rows = [row + [""] * (width - len(row)) for row in rows]
+                blocks.extend([
+                    f"## 表格 {table_index}",
+                    "| " + " | ".join(rows[0]) + " |",
+                    "| " + " | ".join(["---"] * width) + " |",
+                    *("| " + " | ".join(row) + " |" for row in rows[1:]),
+                ])
+    return blocks
 
 
 def _parse_pdf(path: Path) -> ParsedDocument:

@@ -32,6 +32,7 @@ class JobService:
         target_id: str | int,
         payload: dict[str, Any] | None = None,
         created_by: int | None = None,
+        delay_ms: int = 0,
     ) -> dict[str, Any]:
         if job_type not in self.handlers:
             raise ValueError(f"未注册的任务类型: {job_type}")
@@ -53,7 +54,10 @@ class JobService:
         if self.settings.background_jobs_enabled and self.settings.redis_url:
             from .worker import run_app_job
 
-            run_app_job.send(job_id)
+            if delay_ms > 0:
+                run_app_job.send_with_options(args=(job_id,), delay=max(0, int(delay_ms)))
+            else:
+                run_app_job.send(job_id)
         return self.get(job_id)
 
     def progress(self, job_id: int, stage: str, progress: int, message: str = "", details: dict[str, Any] | None = None) -> None:

@@ -86,6 +86,7 @@ class HybridRetrievalService:
         self.storage = storage
         self.embedding = EmbeddingClient(settings)
         self._index_cache: dict[str, Any] = {}
+        self._index_override: tuple[dict[str, Any], list[dict[str, Any]]] | None = None
 
     def _published_rows(self, industry: str = "", unit_type: str = "", classification: str = "") -> list[dict[str, Any]]:
         clauses = ["p.status='published'"]
@@ -110,7 +111,7 @@ class HybridRetrievalService:
             params,
         )
 
-    def build_index(self, progress=None, cancelled=None) -> dict[str, Any]:
+    def build_index(self, progress=None, cancelled=None, *, activate: bool = True) -> dict[str, Any]:
         progress = progress or (lambda *_args, **_kwargs: None)
         cancelled = cancelled or (lambda: False)
         rows = self._published_rows()
@@ -126,7 +127,7 @@ class HybridRetrievalService:
             for row in rows
         ]
         source_hash = content_hash("|".join(str(row["content_hash"]) for row in rows) or "empty")
-        version = f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{source_hash[:10]}"
+        version = f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}-{source_hash[:10]}"
         collection = f"published_knowledge_{version.replace('-', '_')}"
         object_key = f"indexes/{version}/bm25.json"
         stored = self.storage.put_bytes(object_key, json.dumps(corpus, ensure_ascii=False).encode("utf-8"), "application/json")
@@ -162,13 +163,14 @@ class HybridRetrievalService:
                 dense_indexed = len(vectors)
         metrics = {"bm25_documents": len(rows), "dense_documents": dense_indexed}
         with self.db.connect() as conn:
-            conn.execute("UPDATE retrieval_indexes SET status='superseded' WHERE status='active'")
+            if activate:
+                conn.execute("UPDATE retrieval_indexes SET status='superseded' WHERE status='active'")
             cursor = conn.execute(
                 """
                 INSERT INTO retrieval_indexes(
                     version,embedding_model,reranker_model,bm25_object_key,qdrant_collection,
                     publication_count,content_hash,status,metrics_json,activated_at
-                ) VALUES (?,?,?,?,?,?,?,'active',?,CURRENT_TIMESTAMP)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     version,
@@ -178,15 +180,30 @@ class HybridRetrievalService:
                     collection,
                     len(rows),
                     source_hash,
+                    "active" if activate else "building",
                     json.dumps(metrics, ensure_ascii=False),
+                    datetime.now(timezone.utc).isoformat(timespec="seconds") if activate else None,
                 ),
             )
             index_id = int(cursor.lastrowid)
-        self._index_cache = {"version": version, "corpus": corpus}
-        progress("completed", 100, "检索索引已激活", metrics)
-        return {"id": index_id, "version": version, "object": stored, **metrics}
+        if activate:
+            self._index_cache = {"version": version, "corpus": corpus}
+        progress("completed", 100, "检索索引已激活" if activate else "候选检索索引已构建", metrics)
+        return {"id": index_id, "version": version, "status": "active" if activate else "building", "object": stored, **metrics}
+
+    def activate_index(self, index_id: int) -> dict[str, Any]:
+        index = self.db.row("SELECT * FROM retrieval_indexes WHERE id=?", (index_id,))
+        if not index:
+            raise KeyError("检索索引不存在")
+        with self.db.connect() as conn:
+            conn.execute("UPDATE retrieval_indexes SET status='superseded' WHERE status='active' AND id<>?", (index_id,))
+            conn.execute("UPDATE retrieval_indexes SET status='active',activated_at=CURRENT_TIMESTAMP WHERE id=?", (index_id,))
+        self._index_cache = {}
+        return self.db.row("SELECT * FROM retrieval_indexes WHERE id=?", (index_id,)) or {}
 
     def _active_index(self) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        if self._index_override is not None:
+            return self._index_override
         index = self.db.row("SELECT * FROM retrieval_indexes WHERE status='active' ORDER BY id DESC LIMIT 1")
         if not index:
             return None, []
@@ -317,6 +334,27 @@ class HybridRetrievalService:
         for item in results:
             item["retrieval_run_id"] = run_id
         return results
+
+    def search_index(
+        self,
+        index_id: int,
+        query: str,
+        industry: str = "",
+        unit_type: str = "",
+        limit: int = 12,
+        classification: str = "internal",
+    ) -> list[dict[str, Any]]:
+        index = self.db.row("SELECT * FROM retrieval_indexes WHERE id=?", (index_id,))
+        if not index:
+            raise KeyError("检索索引不存在")
+        with self.storage.open(index["bm25_object_key"]) as handle:
+            corpus = json.loads(handle.read().decode("utf-8"))
+        previous_override = self._index_override
+        try:
+            self._index_override = (index, corpus)
+            return self.search(query, industry, unit_type, limit, classification=classification)
+        finally:
+            self._index_override = previous_override
 
     def feedback(self, run_id: int, action: str, unit_id: int | None, notes: str, user_id: int | None) -> dict[str, Any]:
         if action not in {"used", "rejected", "missing", "irrelevant"}:

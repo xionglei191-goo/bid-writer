@@ -20,6 +20,9 @@ def content_hash(value: str) -> str:
 
 
 def normalize_text(value: str) -> str:
+    # PostgreSQL rejects NUL bytes and Office/PDF extractors occasionally emit
+    # other C0 controls.  Keep the three legal whitespace controls only.
+    value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", value)
     value = value.replace("\r\n", "\n").replace("\r", "\n")
     value = re.sub(r"[ \t]+", " ", value)
     value = re.sub(r"\n{3,}", "\n\n", value)

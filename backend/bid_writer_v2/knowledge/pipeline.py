@@ -32,15 +32,31 @@ class KnowledgePipelineService:
         max_candidates: int = 12,
         progress=None,
         cancelled=None,
+        auto_publish: bool | None = None,
+        section_ids: list[int] | None = None,
     ) -> dict[str, Any]:
         progress = progress or (lambda *_args, **_kwargs: None)
         cancelled = cancelled or (lambda: False)
         max_candidates = max(1, min(int(max_candidates), 20))
+        should_auto_publish = self.knowledge.settings.auto_publish_low_risk if auto_publish is None else auto_publish
         document, sections = self._document_context(document_id)
+        if section_ids is not None:
+            selected = {int(value) for value in section_ids}
+            sections = [section for section in sections if int(section["id"]) in selected]
+            if not sections:
+                raise ValueError("所选章节均已由重复章节代表覆盖")
         chunks = self.prepare_chunks(document_id, sections)
         progress("chunking", 5, "文档切片完成", {"chunks": len(chunks), "coverage_rate": 1.0})
         if len(chunks) > 1:
-            return self._process_chunked(document, sections, chunks, max_candidates, progress, cancelled)
+            return self._process_chunked(
+                document,
+                sections,
+                chunks,
+                max_candidates,
+                progress,
+                cancelled,
+                should_auto_publish,
+            )
         section_text = self._section_text(sections)
         model_settings = self.ai_runtime.llm.settings()
         pipeline_key = content_hash(
@@ -52,6 +68,7 @@ class KnowledgePipelineService:
                     KNOWLEDGE_REVIEW_PROMPT.prompt_hash,
                     PIPELINE_RULE_VERSION,
                     str(max_candidates),
+                    ",".join(str(section["id"]) for section in sections),
                     json.dumps(
                         {
                             "model": model_settings.get("model", ""),
@@ -69,7 +86,7 @@ class KnowledgePipelineService:
                 (pipeline_key,),
             ).fetchone()
             if existing and existing["status"] == "completed":
-                if self.knowledge.settings.auto_publish_low_risk:
+                if should_auto_publish:
                     self.auto_publish_low_risk(int(existing["id"]))
                 return {**self.get_run(int(existing["id"])), "reused": True}
             if existing:
@@ -277,7 +294,7 @@ class KnowledgePipelineService:
                 "UPDATE knowledge_ai_pipeline_runs SET completed_chunks=1,coverage_rate=1 WHERE id=?",
                 (run_id,),
             )
-        if self.knowledge.settings.auto_publish_low_risk:
+        if should_auto_publish:
             self.auto_publish_low_risk(run_id)
         progress("completed", 100, "知识加工完成", {"candidates": len(candidates), "ready": ready_count})
         return {**self.get_run(run_id), "reused": False}
@@ -376,6 +393,7 @@ class KnowledgePipelineService:
         max_candidates: int,
         progress,
         cancelled,
+        should_auto_publish: bool,
     ) -> dict[str, Any]:
         model_settings = self.ai_runtime.llm.settings()
         document_id = int(document["id"])
@@ -389,6 +407,7 @@ class KnowledgePipelineService:
                     PIPELINE_RULE_VERSION,
                     str(max_candidates),
                     "chunked",
+                    ",".join(str(section["id"]) for section in sections),
                     str(model_settings.get("model", "")),
                 ]
             )
@@ -554,7 +573,7 @@ class KnowledgePipelineService:
                     "任务被取消" if cancelled() else (f"{failed_chunks}个切片失败" if failed_chunks else ""), run_id,
                 ),
             )
-        if self.knowledge.settings.auto_publish_low_risk and not cancelled():
+        if should_auto_publish and not cancelled():
             self.auto_publish_low_risk(run_id)
         progress("completed", 100, "分批知识加工完成", {"chunks": len(chunks), "failed_chunks": failed_chunks, "coverage_rate": coverage_rate})
         return {**self.get_run(run_id), "reused": False}
@@ -933,7 +952,8 @@ class KnowledgePipelineService:
         with self.db.connect() as conn:
             rows = conn.execute(
                 f"""
-                SELECT c.*,d.title AS document_title,s.file_name,s.industry,ds.heading AS source_heading,ar.model
+                SELECT c.*,d.title AS document_title,s.file_name,s.industry,ds.heading AS source_heading,ar.model,
+                    pr.review_ai_run_id
                 FROM knowledge_ai_candidates c
                 JOIN standard_documents d ON d.id=c.document_id
                 JOIN source_files s ON s.id=c.source_id
