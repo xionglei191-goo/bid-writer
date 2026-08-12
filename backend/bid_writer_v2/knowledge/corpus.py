@@ -427,7 +427,7 @@ class CorpusCompletionService:
             return
         result = self.pipeline.process_document(
             document_id,
-            max_candidates=12,
+            max_candidates=20,
             auto_publish=False,
             section_ids=representative_sections,
             progress=progress,

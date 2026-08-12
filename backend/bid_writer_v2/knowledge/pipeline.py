@@ -11,9 +11,9 @@ from ..utils import content_hash, normalize_text, parse_json
 from .service import KnowledgeService
 
 
-PIPELINE_RULE_VERSION = "2.0.0"
-CHUNK_MAX_CHARS = 24000
-CHUNK_OVERLAP_CHARS = 600
+PIPELINE_RULE_VERSION = "2.1.0"
+CHUNK_MAX_CHARS = 48000
+CHUNK_OVERLAP_CHARS = 800
 
 
 class RetryableAiAdjudicationError(RuntimeError):
