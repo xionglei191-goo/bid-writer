@@ -464,7 +464,7 @@ class CorpusCompletionService:
             if updated.rowcount:
                 claimed.append(candidate)
                 used_chars += candidate_chars
-            if len(claimed) >= 8:
+            if len(claimed) >= 12:
                 break
         return claimed
 
