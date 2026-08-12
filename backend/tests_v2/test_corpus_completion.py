@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import zipfile
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -15,7 +16,7 @@ from bid_writer_v2.database import Database
 from bid_writer_v2.evaluation import RetrievalEvaluationService
 from bid_writer_v2.knowledge.corpus import CorpusCompletionService
 from bid_writer_v2.knowledge.ocr import ocr_pdf_step
-from bid_writer_v2.knowledge.parsers import _parse_docx_xml_fallback
+from bid_writer_v2.knowledge.parsers import _parse_docx, _parse_docx_xml_fallback, _parse_legacy_doc_text
 from bid_writer_v2.knowledge.pipeline import KnowledgePipelineService
 from bid_writer_v2.knowledge.service import KnowledgeService
 from bid_writer_v2.retrieval import HybridRetrievalService
@@ -478,6 +479,30 @@ class CorpusCompletionTest(unittest.TestCase):
         with zipfile.ZipFile(archive, "w") as handle:
             handle.writestr("word/document.xml", document_xml)
         self.assertEqual(_parse_docx_xml_fallback(archive), ["可恢复的正文"])
+
+    def test_docx_grid_offset_error_uses_xml_fallback(self) -> None:
+        archive = self.settings.raw_root / "broken-grid.docx"
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        document_xml = """<?xml version="1.0" encoding="UTF-8"?>
+        <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+          <w:body><w:p><w:r><w:t>recoverable table text</w:t></w:r></w:p></w:body>
+        </w:document>"""
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.writestr("word/document.xml", document_xml)
+        with patch("bid_writer_v2.knowledge.parsers.Document", side_effect=ValueError("no `tc` element at grid_offset=22")):
+            parsed = _parse_docx(archive, 901, self.settings)
+        self.assertIn("recoverable table text", parsed.markdown)
+
+    def test_legacy_doc_antiword_fallback_normalizes_text(self) -> None:
+        source = self.settings.raw_root / "legacy.doc"
+        source.write_bytes(b"fixture")
+        completed = subprocess.CompletedProcess([], 0, b"reusable construction management content with checks and acceptance", b"")
+        with patch("bid_writer_v2.knowledge.parsers.shutil.which", return_value="/usr/bin/antiword"), patch(
+            "bid_writer_v2.knowledge.parsers.subprocess.run", return_value=completed
+        ):
+            parsed = _parse_legacy_doc_text(source)
+        self.assertEqual(parsed.parser, "antiword")
+        self.assertIn("checks and acceptance", parsed.markdown)
 
     def test_manual_tasks_are_grouped_by_source_batch(self) -> None:
         first = self._source("01_原始标书库/编号项目/001/图片/a.png", ".png", "asset")

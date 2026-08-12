@@ -10,7 +10,7 @@ ARG DEBIAN_MIRROR=https://deb.debian.org
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app/backend
 RUN sed -i "s|https\?://deb.debian.org/debian-security|${DEBIAN_MIRROR}/debian-security|g; s|https\?://deb.debian.org/debian|${DEBIAN_MIRROR}/debian|g" /etc/apt/sources.list.d/debian.sources \
     && (apt-get update && apt-cache show libreoffice-writer >/dev/null 2>&1 || (sed -i "s|${DEBIAN_MIRROR}/debian-security|https://deb.debian.org/debian-security|g; s|${DEBIAN_MIRROR}/debian|https://deb.debian.org/debian|g" /etc/apt/sources.list.d/debian.sources && apt-get update)) \
-    && apt-get install -y --no-install-recommends libreoffice-writer poppler-utils fonts-noto-cjk curl p7zip-full libarchive-tools \
+    && apt-get install -y --no-install-recommends libreoffice-writer poppler-utils antiword fonts-noto-cjk curl p7zip-full libarchive-tools \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY backend/requirements.txt /app/backend/requirements.txt

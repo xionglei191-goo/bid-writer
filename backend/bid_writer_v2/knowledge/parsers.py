@@ -36,8 +36,11 @@ def parse_document(path: Path, source_id: int, settings: Settings) -> ParsedDocu
     if extension == ".pdf":
         return _parse_pdf(path)
     if extension == ".doc":
-        converted = _convert_doc(path, settings.cache_root / "doc_conversion" / str(source_id))
-        return _parse_docx(converted, source_id, settings)
+        try:
+            converted = _convert_doc(path, settings.cache_root / "doc_conversion" / str(source_id))
+            return _parse_docx(converted, source_id, settings)
+        except (RuntimeError, subprocess.SubprocessError):
+            return _parse_legacy_doc_text(path)
     if extension in {".md", ".txt"}:
         text = path.read_text(encoding="utf-8", errors="ignore")
         return ParsedDocument(path.stem, normalize_text(text), "plain_text", 0)
@@ -69,11 +72,11 @@ def _parse_docx(path: Path, source_id: int, settings: Settings) -> ParsedDocumen
             blocks.append("| " + " | ".join(rows[0]) + " |")
             blocks.append("| " + " | ".join(["---"] * width) + " |")
             blocks.extend("| " + " | ".join(row) + " |" for row in rows[1:])
-    except KeyError as exc:
+    except (KeyError, ValueError) as exc:
         # Some legacy Word files contain a broken relationship whose target is
         # literally "NULL".  The main document XML is still usable and is read
         # directly so that one bad embedded object does not discard the text.
-        if "NULL" not in str(exc):
+        if "NULL" not in str(exc) and "grid_offset" not in str(exc):
             raise
         blocks.extend(_parse_docx_xml_fallback(path))
 
@@ -87,6 +90,22 @@ def _parse_docx(path: Path, source_id: int, settings: Settings) -> ParsedDocumen
             destination.write_bytes(archive.read(name))
             blocks.append(f"![原文图片{index}]({destination.as_posix()})")
     return ParsedDocument(path.stem, normalize_text("\n\n".join(blocks)), "python-docx", 0)
+
+
+def _parse_legacy_doc_text(path: Path) -> ParsedDocument:
+    antiword = shutil.which("antiword")
+    if not antiword:
+        raise RuntimeError("无法转换DOC且antiword文本回退不可用")
+    result = subprocess.run(
+        [antiword, "-m", "UTF-8.txt", str(path)],
+        check=True,
+        capture_output=True,
+        timeout=600,
+    )
+    text = normalize_text(result.stdout.decode("utf-8", errors="replace"))
+    if len(re.sub(r"\s+", "", text)) < 20:
+        raise RuntimeError("DOC文本回退未提取到足够正文")
+    return ParsedDocument(path.stem, f"# {path.stem}\n\n{text}", "antiword", 0)
 
 
 def _parse_docx_xml_fallback(path: Path) -> list[str]:
