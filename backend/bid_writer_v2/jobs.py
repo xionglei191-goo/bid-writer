@@ -85,21 +85,37 @@ class JobService:
                 (job_id, stage, progress, message[:1000], json.dumps(details or {}, ensure_ascii=False)),
             )
 
-    def run(self, job_id: int) -> dict[str, Any]:
+    def run(self, job_id: int, message_id: str = "") -> dict[str, Any]:
         job = self.get(job_id)
         if job["status"] not in {"pending", "retrying"}:
             return job
+        if self.db.backend == "postgresql":
+            with self.db.connect() as conn:
+                claimed = conn.execute(
+                    """
+                    UPDATE app_jobs SET status='running',stage='starting',attempt_count=attempt_count+1,
+                        started_at=COALESCE(started_at,CURRENT_TIMESTAMP),checkpoint_json=?,updated_at=CURRENT_TIMESTAMP
+                    WHERE id=? AND status IN ('pending','retrying')
+                    """,
+                    (json.dumps({"worker_message_id": message_id}, ensure_ascii=False), job_id),
+                )
+                if not claimed.rowcount:
+                    return self.get(job_id)
+        else:
+            with self.db.connect() as conn:
+                current = conn.execute("SELECT status FROM app_jobs WHERE id=?", (job_id,)).fetchone()
+                if not current or current["status"] not in {"pending", "retrying"}:
+                    return self.get(job_id)
+                conn.execute(
+                    """
+                    UPDATE app_jobs SET status='running',stage='starting',attempt_count=attempt_count+1,
+                        started_at=COALESCE(started_at,CURRENT_TIMESTAMP),checkpoint_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?
+                    """,
+                    (json.dumps({"worker_message_id": message_id}, ensure_ascii=False), job_id),
+                )
         handler = self.handlers.get(str(job["job_type"]))
         if not handler:
             return self._fail(job_id, "handler_missing", "任务处理器未注册")
-        with self.db.connect() as conn:
-            conn.execute(
-                """
-                UPDATE app_jobs SET status='running',stage='starting',attempt_count=attempt_count+1,
-                    started_at=COALESCE(started_at,CURRENT_TIMESTAMP),updated_at=CURRENT_TIMESTAMP WHERE id=?
-                """,
-                (job_id,),
-            )
         self.progress(job_id, "starting", 1, "任务开始执行")
         payload = json.loads(job.get("payload_json") or "{}")
 
