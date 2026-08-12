@@ -346,13 +346,63 @@ class CorpusCompletionService:
         cancelled = cancelled or (lambda: False)
         run = self._raw_run(run_id)
         if run["status"] == "paused" and str(run.get("pause_reason") or "").startswith("外部服务错误") and preferred_stage == "__recovery__":
+            pause_started_at = str(run.get("updated_at") or iso_now())
+            recovery_stage = str(parse_json(run.get("checkpoint_json"), {}).get("service_pause_stage") or "")
+            if not recovery_stage:
+                failed_stage = self.db.row(
+                    """
+                    SELECT stage,COUNT(*) AS count FROM corpus_run_items
+                    WHERE run_id=? AND status='retrying' AND error_message<>''
+                    GROUP BY stage ORDER BY count DESC LIMIT 1
+                    """,
+                    (run_id,),
+                ) or {}
+                recovery_stage = str(failed_stage.get("stage") or "")
+            self._recover_stale_items(run_id)
+            if recovery_stage:
+                with self.db.connect() as conn:
+                    conn.execute(
+                        """
+                        UPDATE corpus_run_items SET status='retrying',error_code='service_recovery',
+                            error_message='熔断前占位已回到检查点，等待外部服务恢复',
+                            next_retry_at=NULL,updated_at=CURRENT_TIMESTAMP
+                        WHERE run_id=? AND stage=? AND status='running' AND updated_at<=?
+                        """,
+                        (run_id, recovery_stage, pause_started_at),
+                    )
+            if recovery_stage == "ai":
+                probe = self.ai_runtime.llm.generate(
+                    "你是服务可用性探针。只返回 OK。",
+                    "返回 OK。",
+                    16,
+                )
+                if probe.get("error") or not str(probe.get("content") or "").strip():
+                    checkpoint = parse_json(run.get("checkpoint_json"), {})
+                    checkpoint["service_recovery_probe"] = {
+                        "stage": recovery_stage,
+                        "status": "failed",
+                        "checked_at": iso_now(),
+                        "error": str(probe.get("error") or "empty_model_response")[:300],
+                    }
+                    with self.db.connect() as conn:
+                        conn.execute(
+                            "UPDATE corpus_runs SET checkpoint_json=?,pause_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                            (
+                                json.dumps(checkpoint, ensure_ascii=False),
+                                "外部服务错误达到熔断阈值: ai（恢复探针未通过）",
+                                run_id,
+                            ),
+                        )
+                    if self.dispatch:
+                        self.dispatch(run_id, 15 * 60 * 1000, 1, "__recovery__")
+                    return self.get_run(run_id)
             with self.db.connect() as conn:
                 conn.execute(
                     "UPDATE corpus_runs SET status='running',pause_reason='',consecutive_errors=0,recent_results_json='[]',updated_at=CURRENT_TIMESTAMP WHERE id=?",
                     (run_id,),
                 )
             run = self._raw_run(run_id)
-            preferred_stage = ""
+            preferred_stage = recovery_stage
         if run["status"] not in {"pending", "running"}:
             return self.get_run(run_id)
         if cancelled():
@@ -395,7 +445,12 @@ class CorpusCompletionService:
                 state = self.db.row("SELECT status FROM corpus_run_items WHERE id=?", (active_item["id"],)) or {}
                 if state.get("status") == "running":
                     self._handle_failure(active_item, exc, service_error=service_error)
-            self._record_result(run_id, not service_error, f"{type(exc).__name__}: {exc}")
+            self._record_result(
+                run_id,
+                not service_error,
+                f"{type(exc).__name__}: {exc}",
+                service_stage=str(item["stage"]) if service_error else "",
+            )
         summary = self._refresh(run_id)
         progress(str(summary["stage"]), int(summary["progress"]), "全库批次检查点已保存", summary.get("counters"))
         current = self._raw_run(run_id)
@@ -412,36 +467,56 @@ class CorpusCompletionService:
     def _claim_next_item(self, run_id: int, preferred_stage: str = "") -> dict[str, Any] | None:
         if preferred_stage == "__recovery__":
             preferred_stage = ""
+        policy = parse_json(self._raw_run(run_id).get("policy_json"), {})
+        capacities = {
+            "normalize": int(policy.get("normalize_concurrency", 2)),
+            "ocr": int(policy.get("ocr_concurrency", 1)),
+            "governance": int(policy.get("normalize_concurrency", 2)),
+            "ai": int(policy.get("ai_concurrency", 1)),
+        }
+        stages = [preferred_stage] if preferred_stage else ["normalize", "ocr", "governance", "ai"]
         for _attempt in range(5):
-            stage_clause = "AND i.stage=?" if preferred_stage else ""
-            params: list[Any] = [run_id, iso_now()]
-            if preferred_stage:
-                params.append(preferred_stage)
-            item = self.db.row(
-                f"""
-                SELECT i.*,s.absolute_path,s.relative_path,s.file_name,s.extension,s.source_kind,s.parent_source_id,
-                    s.status AS source_status,s.error_message AS source_error,s.industry,d.char_count AS document_char_count
-                FROM corpus_run_items i JOIN source_files s ON s.id=i.source_id
-                LEFT JOIN standard_documents d ON d.id=i.document_id
-                WHERE i.run_id=? AND i.status IN ('pending','retrying')
-                  AND (i.next_retry_at IS NULL OR i.next_retry_at<=?)
-                  {stage_clause}
-                ORDER BY CASE i.stage WHEN 'normalize' THEN 1 WHEN 'ocr' THEN 2 WHEN 'governance' THEN 3 WHEN 'ai' THEN 4 ELSE 5 END,
-                    CASE WHEN i.stage IN ('normalize','ocr') THEN s.size_bytes ELSE 0 END,
-                    CASE WHEN i.stage='ai' THEN COALESCE(d.char_count,2147483647) ELSE 0 END,i.id LIMIT 1
-                """,
-                params,
-            )
-            if not item:
-                return None
             with self.db.connect() as conn:
-                claimed = conn.execute(
-                    "UPDATE corpus_run_items SET status='running',attempt_count=attempt_count+1,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('pending','retrying')",
-                    (item["id"],),
-                )
-                if claimed.rowcount:
-                    conn.execute("UPDATE corpus_runs SET stage=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (item["stage"], run_id))
-                    return item
+                if self.db.backend == "postgresql":
+                    conn.execute("SELECT pg_advisory_xact_lock(CAST(? AS BIGINT))", (run_id * 100_000 + 9_137,))
+                run_state = conn.execute("SELECT status FROM corpus_runs WHERE id=?", (run_id,)).fetchone()
+                if not run_state or run_state["status"] not in {"pending", "running"}:
+                    return None
+                running = {
+                    str(row["stage"]): int(row["count"])
+                    for row in conn.execute(
+                        "SELECT stage,COUNT(*) AS count FROM corpus_run_items WHERE run_id=? AND status='running' GROUP BY stage",
+                        (run_id,),
+                    ).fetchall()
+                }
+                for stage in stages:
+                    if running.get(stage, 0) >= max(1, capacities.get(stage, 1)):
+                        continue
+                    item_row = conn.execute(
+                        """
+                        SELECT i.*,s.absolute_path,s.relative_path,s.file_name,s.extension,s.source_kind,s.parent_source_id,
+                            s.status AS source_status,s.error_message AS source_error,s.industry,
+                            d.char_count AS document_char_count
+                        FROM corpus_run_items i JOIN source_files s ON s.id=i.source_id
+                        LEFT JOIN standard_documents d ON d.id=i.document_id
+                        WHERE i.run_id=? AND i.stage=? AND i.status IN ('pending','retrying')
+                          AND (i.next_retry_at IS NULL OR i.next_retry_at<=?)
+                        ORDER BY CASE WHEN i.stage IN ('normalize','ocr') THEN s.size_bytes ELSE 0 END,
+                            CASE WHEN i.stage='ai' THEN COALESCE(d.char_count,2147483647) ELSE 0 END,i.id
+                        LIMIT 1
+                        """,
+                        (run_id, stage, iso_now()),
+                    ).fetchone()
+                    if not item_row:
+                        continue
+                    item = dict(item_row)
+                    claimed = conn.execute(
+                        "UPDATE corpus_run_items SET status='running',attempt_count=attempt_count+1,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('pending','retrying')",
+                        (item["id"],),
+                    )
+                    if claimed.rowcount:
+                        conn.execute("UPDATE corpus_runs SET stage=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (stage, run_id))
+                        return item
         return None
 
     def _claim_ai_batch(self, item: dict[str, Any]) -> list[dict[str, Any]]:
@@ -522,7 +597,7 @@ class CorpusCompletionService:
                 "governance": int(policy.get("normalize_concurrency", 2)),
                 "ai": int(policy.get("ai_concurrency", 1)),
             }.get(stage, 1)
-            desired = max(1, min(capacity, int(row["count"]))) + int(stage == current_running_stage)
+            desired = max(1, min(capacity, int(row["count"])))
             self.dispatch(run_id, delay_ms, desired, stage)
 
     def _normalize_item(self, item: dict[str, Any]) -> None:
@@ -1614,7 +1689,7 @@ class CorpusCompletionService:
                         created_at>? AND EXISTS (
                             SELECT 1 FROM ai_runs newer
                             WHERE newer.id>ai_runs.id
-                              AND newer.status IN ('running','succeeded')
+                              AND newer.status IN ('running','succeeded','failed')
                               AND newer.task_type=ai_runs.task_type
                               AND COALESCE(newer.target_type,'')=COALESCE(ai_runs.target_type,'')
                               AND COALESCE(newer.target_id,-1)=COALESCE(ai_runs.target_id,-1)
@@ -1703,9 +1778,10 @@ class CorpusCompletionService:
             )
             return int(updated.rowcount or 0)
 
-    def _record_result(self, run_id: int, succeeded: bool, error: str) -> None:
+    def _record_result(self, run_id: int, succeeded: bool, error: str, *, service_stage: str = "") -> None:
         run = self._raw_run(run_id)
         policy = parse_json(run.get("policy_json"), {})
+        checkpoint = parse_json(run.get("checkpoint_json"), {})
         recent = parse_json(run.get("recent_results_json"), [])
         recent.append({"ok": bool(succeeded), "at": iso_now(), "error": error[:300]})
         recent = recent[-int(policy.get("recent_window", 20)):]
@@ -1713,10 +1789,24 @@ class CorpusCompletionService:
         failures = sum(not item["ok"] for item in recent)
         rate = failures / len(recent) if recent else 0
         should_pause = consecutive >= int(policy.get("service_consecutive_error_limit", 5)) or (len(recent) >= 20 and rate > float(policy.get("recent_failure_rate", 0.2)))
+        if should_pause and service_stage:
+            checkpoint["service_pause_stage"] = service_stage
+            checkpoint["service_recovery_probe"] = {
+                "stage": service_stage,
+                "status": "scheduled",
+                "checked_at": iso_now(),
+            }
         with self.db.connect() as conn:
             conn.execute(
-                "UPDATE corpus_runs SET consecutive_errors=?,recent_results_json=?,status=?,pause_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (consecutive, json.dumps(recent, ensure_ascii=False), "paused" if should_pause else run["status"], "外部服务错误达到熔断阈值" if should_pause else run.get("pause_reason", ""), run_id),
+                "UPDATE corpus_runs SET consecutive_errors=?,recent_results_json=?,checkpoint_json=?,status=?,pause_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (
+                    consecutive,
+                    json.dumps(recent, ensure_ascii=False),
+                    json.dumps(checkpoint, ensure_ascii=False),
+                    "paused" if should_pause else run["status"],
+                    f"外部服务错误达到熔断阈值: {service_stage or 'unknown'}" if should_pause else run.get("pause_reason", ""),
+                    run_id,
+                ),
             )
         if should_pause and self.dispatch:
             self.dispatch(run_id, 15 * 60 * 1000, 1, "__recovery__")

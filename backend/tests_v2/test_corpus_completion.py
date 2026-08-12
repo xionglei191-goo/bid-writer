@@ -586,11 +586,86 @@ class CorpusCompletionTest(unittest.TestCase):
                 "UPDATE corpus_runs SET consecutive_errors=4,recent_results_json=? WHERE id=?",
                 ('[{"ok": false}]', run["id"]),
             )
-        self.corpus._record_result(run["id"], False, "HTTP 503")
-        state = self.db.row("SELECT status,pause_reason FROM corpus_runs WHERE id=?", (run["id"],))
+        self.corpus._record_result(run["id"], False, "HTTP 503", service_stage="ai")
+        state = self.db.row("SELECT status,pause_reason,checkpoint_json FROM corpus_runs WHERE id=?", (run["id"],))
         self.assertEqual(state["status"], "paused")
         self.assertTrue(state["pause_reason"].startswith("外部服务错误"))
+        self.assertIn('"service_pause_stage": "ai"', state["checkpoint_json"])
         self.assertEqual(dispatched, [(run["id"], 15 * 60 * 1000, 1, "__recovery__")])
+
+    def test_failed_ai_recovery_probe_keeps_run_paused(self) -> None:
+        self._source("recovery-probe.txt", ".txt")
+        run = self.corpus.create_run()
+        dispatched: list[tuple[int, int, int, str]] = []
+        self.corpus.dispatch = lambda run_id, delay, desired, stage: dispatched.append((run_id, delay, desired, stage))
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE corpus_runs SET status='paused',pause_reason='外部服务错误达到熔断阈值: ai',checkpoint_json=?,policy_json=? WHERE id=?",
+                (
+                    '{"service_pause_stage":"ai"}',
+                    '{"disk_min_bytes":0,"disk_min_ratio":0}',
+                    run["id"],
+                ),
+            )
+        self.runtime.llm.generate = lambda *_args, **_kwargs: {"content": "", "error": "HTTP 503"}  # type: ignore[method-assign]
+
+        result = self.corpus.run_tick(run["id"], preferred_stage="__recovery__")
+
+        self.assertEqual(result["status"], "paused")
+        self.assertIn("恢复探针未通过", result["pause_reason"])
+        self.assertEqual(dispatched, [(run["id"], 15 * 60 * 1000, 1, "__recovery__")])
+
+    def test_ai_claim_respects_single_stage_concurrency(self) -> None:
+        first = self._source("ai-running.txt", ".txt")
+        second = self._source("ai-pending.txt", ".txt")
+        run = self.corpus.create_run()
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE corpus_run_items SET stage='ai',status='running' WHERE run_id=? AND source_id=?",
+                (run["id"], first),
+            )
+            conn.execute(
+                "UPDATE corpus_run_items SET stage='ai',status='pending' WHERE run_id=? AND source_id=?",
+                (run["id"], second),
+            )
+
+        self.assertIsNone(self.corpus._claim_next_item(run["id"], "ai"))
+        state = self.db.row(
+            "SELECT status,attempt_count FROM corpus_run_items WHERE run_id=? AND source_id=?",
+            (run["id"], second),
+        )
+        self.assertEqual(state, {"status": "pending", "attempt_count": 0})
+
+    def test_successful_ai_recovery_probe_releases_pre_fuse_claims(self) -> None:
+        source_id = self._source("recovered-ai.txt", ".txt")
+        run = self.corpus.create_run()
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE corpus_run_items SET stage='ai',status='running',updated_at=datetime('now','-20 minutes')
+                WHERE run_id=? AND source_id=?
+                """,
+                (run["id"], source_id),
+            )
+            conn.execute(
+                "UPDATE corpus_runs SET status='paused',pause_reason='外部服务错误达到熔断阈值: ai',checkpoint_json=?,policy_json=? WHERE id=?",
+                (
+                    '{"service_pause_stage":"ai"}',
+                    '{"disk_min_bytes":0,"disk_min_ratio":0}',
+                    run["id"],
+                ),
+            )
+        self.runtime.llm.generate = lambda *_args, **_kwargs: {"content": "OK", "error": ""}  # type: ignore[method-assign]
+
+        with patch.object(self.corpus, "_claim_next_item", return_value=None):
+            result = self.corpus.run_tick(run["id"], preferred_stage="__recovery__")
+
+        item = self.db.row(
+            "SELECT status,error_code,next_retry_at FROM corpus_run_items WHERE run_id=? AND source_id=?",
+            (run["id"], source_id),
+        )
+        self.assertEqual(result["status"], "running")
+        self.assertEqual(item, {"status": "retrying", "error_code": "service_recovery", "next_retry_at": None})
 
 
     def test_damaged_run_ledger_can_be_rebuilt_from_persisted_results(self) -> None:
