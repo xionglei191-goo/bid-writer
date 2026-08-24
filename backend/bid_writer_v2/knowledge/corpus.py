@@ -372,10 +372,11 @@ class CorpusCompletionService:
                         (run_id, recovery_stage, pause_started_at),
                     )
             if recovery_stage == "ai":
+                # 推理型模型会消耗推理 token，16 的预算会导致正文为空、探针永远失败。
                 probe = self.ai_runtime.llm.generate(
                     "你是服务可用性探针。只返回 OK。",
                     "返回 OK。",
-                    16,
+                    2048,
                 )
                 if probe.get("error") or not str(probe.get("content") or "").strip():
                     checkpoint["service_recovery_probe"] = {
