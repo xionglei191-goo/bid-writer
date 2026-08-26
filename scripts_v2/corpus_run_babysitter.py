@@ -139,10 +139,19 @@ def main() -> int:
         snap = snapshot()
         if "error" in snap:
             log(f"查询失败: {snap['error']}")
+            if "401" in str(snap["error"]):
+                log("会话过期，重新登录…")
+                if login():
+                    log("重新登录成功")
+                else:
+                    log("重新登录失败，下轮重试")
         else:
             log(json.dumps(snap, ensure_ascii=False))
             if snap["status"] == "paused" and "外部服务错误" in snap["pause_reason"]:
                 result = api(f"/api/knowledge/corpus-runs/{RUN_ID}/resume", method="POST", csrf=csrf_token)
+                if "error" in result and "401" in str(result.get("error", "")):
+                    login()
+                    result = api(f"/api/knowledge/corpus-runs/{RUN_ID}/resume", method="POST", csrf=csrf_token)
                 if "error" in result:
                     log(f"resume 尝试失败(将重试): {result}")
                 else:

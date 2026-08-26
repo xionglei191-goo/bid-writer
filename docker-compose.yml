@@ -65,6 +65,13 @@ services:
       HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
     volumes:
       - model_cache:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/health')"]
       interval: 30s
@@ -122,7 +129,7 @@ services:
     entrypoint: []
     env_file: .env
     environment: *app-environment
-    command: ["dramatiq", "bid_writer_v2.worker", "--processes", "1", "--threads", "6"]
+    command: ["dramatiq", "bid_writer_v2.worker", "--processes", "1", "--threads", "40"]
     volumes:
       - ${BID_WRITER_RAW_HOST:-./sample-data/raw}:/workspace/raw:ro
       - ${BID_WRITER_KNOWLEDGE_HOST:-./runtime/knowledge}:/workspace/knowledge
