@@ -28,11 +28,16 @@ from ..ai_runtime import AiRuntime, SECTION_DRAFT_PROMPT
 from ..database import Database
 from ..audit import AuditService
 from ..evidence import EvidenceService
+from ..project_evidence import factual_profile
 from ..knowledge.service import KnowledgeService
 from ..llm import LlmClient
 from ..settings import Settings
 from ..storage import ObjectStorage
 from ..utils import content_hash, normalize_text, parse_json, write_text_atomic
+from .generation_state import context_fingerprint, part_fingerprint, public_generation, read_generation
+from .requirements_workflow import RequirementsWorkflow
+from .workbench import build_workbench, response_metrics, human_confirmation_indices, generation_incomplete
+from .response_text import copies_requirement
 
 
 DEFAULT_OUTLINE = [
@@ -70,6 +75,7 @@ class ProductionService:
         self.evidence = evidence or EvidenceService(db)
         self.storage = storage or ObjectStorage(db, settings)
         self.audit = audit or AuditService(db)
+        self.requirements_workflow = RequirementsWorkflow(self)
 
     def create_project(self, payload: dict[str, Any]) -> dict[str, Any]:
         name = str(payload.get("name") or "").strip()
@@ -127,9 +133,12 @@ class ProductionService:
             if section["draft"]:
                 section["draft"]["citations"] = parse_json(section["draft"].pop("citations_json", "[]"), [])
                 section["draft"]["confirmations"] = parse_json(section["draft"].pop("confirmations_json", "[]"), [])
+                section["draft"]["confirmation_required_indices"] = human_confirmation_indices(section["draft"])
                 # Approval fingerprints describe the saved body, including when
                 # a legacy or interrupted write left its cached hash stale.
                 section["draft"]["content_hash"] = content_hash(section["draft"]["content"])
+                section["draft"]["generation"] = public_generation(section["draft"])
+                section["draft"].pop("generation_json", None)
                 section["draft"]["confirmation_resolutions"] = [
                     dict(value)
                     for value in conn.execute(
@@ -138,7 +147,10 @@ class ProductionService:
                         (section["draft"]["id"], section["draft"]["content_hash"]),
                     )
                 ]
-                section["draft"]["claims"] = self.evidence.list_claims(int(section["draft"]["id"]))
+                section["draft"]["confirmation_resolutions"] = [resolution for resolution in section["draft"]["confirmation_resolutions"]
+                    if 0 <= resolution["confirmation_index"] < len(section["draft"]["confirmations"])
+                    and resolution["confirmation_text"] == section["draft"]["confirmations"][resolution["confirmation_index"]]]
+                section["draft"]["claims"] = self.evidence.list_claims(int(section["draft"]["id"]), conn=conn)
         item["sections"] = sections
         item["quality_issues"] = [
             dict(value)
@@ -147,6 +159,14 @@ class ProductionService:
                 (project_id,),
             )
         ]
+        item["evidence_source"] = self.evidence.project_source_status(project_id, conn=conn)
+        self.requirements_workflow.enrich(item, conn)
+        response_pairs = set(response_metrics(self, item, conn=conn)["response_pairs"])
+        technical_ids = set(item["requirements_workflow"]["formal_technical_ids"])
+        for section in sections:
+            if section.get("draft"):
+                section["draft"]["missing_response_requirement_ids"] = [rid for rid in section["requirement_ids"]
+                    if rid in technical_ids and (section["draft"]["id"], rid) not in response_pairs]
         return item
 
     def _lock_project_for_update(self, conn, project_id: int) -> None:
@@ -203,7 +223,8 @@ class ProductionService:
                 ),
             )
             conn.execute("UPDATE delivery_manifests SET invalidated_at=CURRENT_TIMESTAMP,status='invalidated' WHERE project_id=? AND invalidated_at IS NULL", (project_id,))
-            conn.execute("UPDATE generation_runs SET status='invalidated' WHERE project_id=? AND status='completed'", (project_id,))
+            if self._project_hash(current) != self._project_hash(updated):
+                conn.execute("UPDATE generation_runs SET status='invalidated' WHERE project_id=? AND status='completed'", (project_id,))
         return self.get_project(project_id)
 
     def preview_project(self, project_id: int) -> dict[str, Any]:
@@ -214,6 +235,40 @@ class ProductionService:
             "markdown": self._project_markdown(project),
             "confirmation": self._delivery_confirmation(project),
         }
+
+    def workbench(self, project_id: int) -> dict[str, Any]:
+        return build_workbench(self, self.get_project(project_id))
+
+    def refresh_project_evidence(self, project_id: int, progress=None, cancelled=None) -> dict[str, Any]:
+        progress = progress or (lambda *_args, **_kwargs: None)
+        cancelled = cancelled or (lambda: False)
+        project = self.get_project(project_id)
+        drafts = [section["draft"] for section in project["sections"] if section.get("draft")]
+        results = []
+        for index, draft in enumerate(drafts):
+            if cancelled():
+                return {"project_id": project_id, "cancelled": True, "analyzed_count": len(results), "drafts": results}
+            progress("checking", int(index / max(1, len(drafts)) * 95), f"重新核验第{index + 1}/{len(drafts)}章证据", {"draft_id": draft["id"]})
+            with self.db.connect() as conn:
+                self._lock_project_for_update(conn, project_id)
+                refreshed = self.evidence.refresh_project_evidence(project_id, draft_ids=[draft["id"]], conn=conn)
+                analysis = refreshed["drafts"][0]
+                row = conn.execute("SELECT content,confirmations_json FROM project_drafts WHERE id=?", (draft["id"],)).fetchone()
+                if content_hash(row["content"]) != analysis["current_content_hash"] or analysis.get("stale"):
+                    raise ValueError("核验期间正文或来源发生变化，请重新检查")
+                confirmations = [str(text) for text in parse_json(row["confirmations_json"], [])
+                                 if not str(text).startswith("高风险表述缺少充分证据：")]
+                confirmations.extend(f"高风险表述缺少充分证据：{text[:160]}" for text in analysis["unsupported_high"])
+                conn.execute("UPDATE project_drafts SET confirmations_json=?,status='draft' WHERE id=?",
+                             (json.dumps(list(dict.fromkeys(confirmations)), ensure_ascii=False), draft["id"]))
+                conn.execute("UPDATE draft_review_decisions SET decision='invalidated' WHERE draft_id=? AND decision='approved'", (draft["id"],))
+                conn.execute("UPDATE requirement_responses SET review_status='invalidated' WHERE draft_id=?", (draft["id"],))
+                conn.execute("UPDATE project_sections SET status='drafted' WHERE id=(SELECT section_id FROM project_drafts WHERE id=?)", (draft["id"],))
+                conn.execute("UPDATE delivery_manifests SET status='invalidated',invalidated_at=CURRENT_TIMESTAMP WHERE project_id=? AND invalidated_at IS NULL", (project_id,))
+                results.append(analysis)
+        progress("completed", 100, "已重新核验证据，正文保持原文，章节需重新签审", {"analyzed_count": len(results)})
+        return {"project_id": project_id, "analyzed_count": len(results), "drafts": results,
+                "source_status": self.evidence.project_source_status(project_id)}
 
     def confirm_final_review(self, project_id: int, project_hash: str, professional_reviewer: str,
                              compliance_confirmed: bool, manual_finalized: bool) -> dict[str, Any]:
@@ -248,9 +303,16 @@ class ProductionService:
         }
 
     def parse_requirements(self, project_id: int) -> dict[str, Any]:
+        from .requirements_workflow import RequirementsWorkflow
+
         project = self.get_project(project_id)
         if any(section.get("draft") for section in project.get("sections", [])):
             raise ValueError("项目已有章节草稿或签审，不能重新解析要求；请新建项目后重新解析，避免覆盖已有成果")
+        if project["requirements"]:
+            # Existing source clauses are stable records. Reclassification must
+            # not recreate their IDs or delete existing review provenance.
+            snapshot = RequirementsWorkflow(self).refresh_suggestions(project_id)
+            return {"project_id": project_id, "requirements": snapshot["items"], "retained_originals": True}
         source_text = normalize_text(project.get("source_text") or "")
         candidates = self._requirement_paragraphs(source_text, str(project.get("name") or ""))
         requirements: list[dict[str, Any]] = []
@@ -258,8 +320,6 @@ class ProductionService:
         keywords = ["项目", "工程", "应", "须", "不得", "禁止", "严禁", "评分", "要求", "工期", "质量", "安全", "施工", "技术", "方案", "响应"]
         for candidate in candidates:
             line = candidate["content"]
-            if re.fullmatch(r"(?:[（(]\d+[)）])?.{0,30}评分标准[（(]总分\s*\d+(?:\.\d+)?\s*分[)）]", line):
-                continue
             key = (line, candidate["source_page"])
             if key in seen:
                 continue
@@ -294,13 +354,19 @@ class ProductionService:
         if not requirements and source_text and not re.search(r"\[第\s*\d+\s*页\]", source_text):
             requirements.append({"content": source_text, "priority": "normal", "kind": "technical", "source_page": None})
         with self.db.connect() as conn:
-            conn.execute("DELETE FROM project_requirements WHERE project_id=?", (project_id,))
+            self._lock_project_for_update(conn, project_id)
+            current = self._get_project_from_connection(conn, project_id)
+            if current["requirements"] or any(section.get("draft") for section in current["sections"]):
+                raise ValueError("项目条款或草稿已变化，请刷新后重新操作，原始条款将保留")
+            if normalize_text(current.get("source_text") or "") != source_text:
+                raise ValueError("招标原文已变化，请刷新后重新解析")
             for index, requirement in enumerate(requirements, 1):
                 conn.execute(
                     "INSERT INTO project_requirements(project_id,requirement_key,kind,content,priority,source_page) VALUES (?,?,?,?,?,?)",
                     (project_id, f"REQ-{index:04d}", requirement["kind"], requirement["content"], requirement["priority"], requirement["source_page"]),
                 )
-        return {"project_id": project_id, "requirements": self.get_project(project_id)["requirements"]}
+        snapshot = RequirementsWorkflow(self).refresh_suggestions(project_id)
+        return {"project_id": project_id, "requirements": snapshot["items"]}
 
     @staticmethod
     def _requirement_paragraphs(source_text: str, project_name: str = "") -> list[dict[str, Any]]:
@@ -461,22 +527,14 @@ class ProductionService:
         return result
 
     def build_outline(self, project_id: int) -> dict[str, Any]:
-        project = self.get_project(project_id)
-        if any(section.get("draft") for section in project.get("sections", [])):
-            raise ValueError("项目已有章节草稿或签审，不能重建目录；请新建项目，避免删除已有成果")
-        requirements = project["requirements"]
-        with self.db.connect() as conn:
-            conn.execute("DELETE FROM project_sections WHERE project_id=?", (project_id,))
-            for order_no, title in enumerate(DEFAULT_OUTLINE, 1):
-                ids = [item["id"] for item in requirements if self._requirement_matches(title, item["content"])]
-                conn.execute(
-                    "INSERT INTO project_sections(project_id,order_no,title,requirement_ids_json) VALUES (?,?,?,?)",
-                    (project_id, order_no, title, json.dumps(ids)),
-                )
-        return {"project_id": project_id, "sections": self.get_project(project_id)["sections"]}
+        from .requirements_workflow import RequirementsWorkflow
+
+        return RequirementsWorkflow(self).build_outline(project_id, DEFAULT_OUTLINE, self._requirement_matches)
 
     def coverage_matrix(self, project_id: int) -> dict[str, Any]:
-        project = self.get_project(project_id)
+        from .requirements_workflow import RequirementsWorkflow
+
+        project = RequirementsWorkflow(self).enrich(self.get_project(project_id))
         rows = []
         for requirement in project["requirements"]:
             matched = [
@@ -484,23 +542,31 @@ class ProductionService:
                 for section in project["sections"]
                 if requirement["id"] in section["requirement_ids"]
             ]
-            rows.append({"requirement": requirement, "sections": matched, "covered": bool(matched)})
+            rows.append({"requirement": requirement, "sections": matched, "covered": bool(matched),
+                         "planning_technical": requirement["planning_category"] in {"technical", "unclassified"},
+                         "formal_technical": requirement["formal_technical"]})
+        workflow = project["requirements_workflow"]
         return {
             "project_id": project_id,
             "items": rows,
             "covered": sum(1 for row in rows if row["covered"]),
             "total": len(rows),
-            "unmapped_high": [row["requirement"]["id"] for row in rows if not row["covered"] and row["requirement"]["priority"] == "high"],
+            "planning_total": workflow["planning_technical_total"],
+            "planning_covered": workflow["mapped_technical"],
+            "formal_technical_total": workflow["formal_technical_total"],
+            "classification_pending": workflow["classification_pending"],
+            "checklist_pending": workflow["checklist_pending"],
+            "unmapped_high": workflow["unmapped_high"],
         }
 
     @staticmethod
     def _requirement_matches(title: str, content: str) -> bool:
         mappings = {
-            "质量": ["质量", "验收", "竣工资料"],
+            "质量": ["质量", "验收", "竣工资料", "竣工文件", "移交资料", "技术档案"],
             "安全": ["安全", "文明", "环保"],
             "进度": ["进度", "工期"],
             "资源": ["资源", "人员", "机械", "材料"],
-            "施工方案": ["施工", "工艺", "技术", "水性漆", "涂装", "涂料"],
+            "施工方案": ["施工", "工艺", "技术", "水性漆", "水性涂料", "涂装", "涂料"],
             "重点难点": ["重点", "难点", "风险"],
             "平面": ["平面", "临建", "场地"],
         }
@@ -509,11 +575,15 @@ class ProductionService:
                 return True
         return False
 
-    def generate_section(self, project_id: int, section_id: int, progress=None, cancelled=None) -> dict[str, Any]:
+    def generate_section(self, project_id: int, section_id: int, progress=None, cancelled=None,
+                         *, repair_only: bool = False, target_hash: str | None = None) -> dict[str, Any]:
         progress = progress or (lambda *_args, **_kwargs: None)
         cancelled = cancelled or (lambda: False)
         generation_run_id = None
         batch_results: list[dict[str, Any]] = []
+
+        class CancelledBeforeSave(Exception):
+            pass
 
         def cancellation_result() -> dict[str, Any]:
             if generation_run_id is not None:
@@ -531,19 +601,38 @@ class ProductionService:
             raise KeyError("章节不存在")
         requirement_map = {item["id"]: item for item in project["requirements"]}
         requirements = [requirement_map[value] for value in section["requirement_ids"] if value in requirement_map]
+        starting_review_fingerprints = [(item["id"], item.get("requirement_fingerprint")) for item in requirements]
+        starting_draft = section.get("draft")
+        starting_version = (starting_draft["id"], starting_draft["content_hash"]) if starting_draft else None
+        frozen = {}
+        starting_metadata_hash = None
+        if repair_only:
+            if not starting_draft or not target_hash or target_hash != starting_draft["content_hash"]:
+                raise ValueError("当前章节版本已变化，请重新载入后修复")
+            with self.db.connect() as conn:
+                raw_draft = dict(conn.execute("SELECT * FROM project_drafts WHERE id=?", (starting_draft["id"],)).fetchone())
+            if not public_generation(raw_draft)["can_repair"]:
+                raise ValueError("当前章节没有可恢复的分段记录或正文已经修改，请重新生成此章")
+            starting_metadata_hash = content_hash(raw_draft.get("generation_json") or "{}")
+            frozen = read_generation(raw_draft)
         query = " ".join([section["title"], *[item["content"] for item in requirements[:5]]])
-        sources = self.knowledge.search(query, project.get("industry") or "", limit=8)
-        if not sources and query != section["title"]:
+        sources = frozen.get("sources") if repair_only else self.knowledge.search(query, project.get("industry") or "", limit=8)
+        if not repair_only and not sources and query != section["title"]:
             sources = self.knowledge.search(section["title"], project.get("industry") or "", limit=8)
         if not sources:
             raise ValueError("已发布知识库没有匹配内容，章节生成已阻断")
+        scope_fingerprint = context_fingerprint(project, section, requirements, sources)
+        if repair_only and frozen.get("context_fingerprint") != scope_fingerprint:
+            raise ValueError("项目资料、条款或章节映射已变化，请重新生成此章")
+        with self.db.connect() as conn:
+            self._check_generation_sources(conn, sources)
         if cancelled():
             return cancellation_result()
         source_text = "\n\n".join(
             f"[知识{index}] {item['title']} / 发布v{item['publication_version']}\n{item['content'][:4000]}"
             for index, item in enumerate(sources, 1)
         )
-        profile = project["profile"]
+        profile = factual_profile(project["profile"])
         retrieval_run_id = int(sources[0]["retrieval_run_id"]) if sources and sources[0].get("retrieval_run_id") else None
         generation_input_hash = content_hash(
             json.dumps(
@@ -578,6 +667,9 @@ class ProductionService:
         )
         source_text = source_text[:28000]
         batches = self._section_requirement_batches(requirements)
+        if repair_only and [part["requirement_ids"] for part in frozen["parts"]] != [[item["id"] for item in batch] for batch in batches]:
+            raise ValueError("条款分段规则已变化，请重新生成此章")
+        saved_parts: list[dict[str, Any]] = []
         content_parts = [f"# {section['title']}"]
         confirmations: list[str] = []
         evidence: list[dict[str, Any]] = []
@@ -586,23 +678,36 @@ class ProductionService:
                 return cancellation_result()
             content_budget = min(3000, max(1000, len(batch_requirements) * 240)) if batch_requirements else 2400
             batch = {"index": batch_index, "count": len(batches), "content_budget": content_budget}
+            prior_part = frozen["parts"][batch_index - 1] if repair_only else None
+            if prior_part and prior_part["status"] == "ai" and not prior_part.get("missing_requirement_ids"):
+                preserved = {**prior_part, "reused": True}
+                saved_parts.append(preserved)
+                content_parts.append(preserved["content"])
+                evidence.extend(preserved["evidence"])
+                confirmations.extend(preserved["confirmations"])
+                batch_results.append({key: value for key, value in preserved.items() if key not in {"content", "evidence", "confirmations", "part_hash"}})
+                progress("generating", 10 + int(batch_index / len(batches) * 75), f"保留第{batch_index}/{len(batches)}部分原文", {"section_id": section_id, **batch, "reused": True})
+                continue
             progress("generating", 10 + int((batch_index - 1) / len(batches) * 75),
                      f"生成章节第{batch_index}/{len(batches)}部分", {"section_id": section_id, **batch})
             if cancelled():
                 return cancellation_result()
+            prompt_requirements = [{key: item.get(key) for key in ("id", "requirement_key", "content", "kind", "priority", "source_page")} for item in batch_requirements]
             prompt = SECTION_DRAFT_PROMPT.render(
                 project_name=project["name"], industry=project["industry"],
                 profile=json.dumps(profile, ensure_ascii=False), section_title=section["title"],
-                requirements=json.dumps(batch_requirements, ensure_ascii=False), source_text=source_text,
+                requirements=json.dumps(prompt_requirements, ensure_ascii=False), source_text=source_text,
                 batch_index=str(batch_index), batch_count=str(len(batches)), content_budget=str(content_budget),
             )
+            if prior_part:
+                prompt += "\n本次只重写此部分。上次缺少可核验响应的要求ID：" + ",".join(map(str, prior_part.get("missing_requirement_ids") or prior_part["requirement_ids"])) + "。逐项提供正文原句作为evidence，不得把招标要求原文直接当作已完成的施工响应。"
             try:
                 result = self.ai_runtime.execute(
                     SECTION_DRAFT_PROMPT, prompt,
                     {
                         "project": {"id": project_id, "name": project["name"], "industry": project["industry"], "profile": profile},
                         "section": {"id": section_id, "title": section["title"]},
-                        "batch": batch, "requirements": batch_requirements,
+                        "batch": batch, "requirements": prompt_requirements, "context_fingerprint": scope_fingerprint,
                         "sources": [
                             {"publication_id": item["publication_id"], "content_hash": item["content_hash"], "content": item["content"][:4000]}
                             for item in sources
@@ -610,6 +715,7 @@ class ProductionService:
                     },
                     task_type="section_draft", target_type="project_section", target_id=section_id,
                     max_output_tokens=8000,
+                    use_cache=not repair_only,
                     cancelled=cancelled,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -619,8 +725,9 @@ class ProductionService:
             payload = result.get("payload") or {}
             body = normalize_text(str(payload.get("content") or ""))
             succeeded = bool(body)
+            part_confirmations: list[str] = []
             if succeeded:
-                confirmations.extend(
+                part_confirmations.extend(
                     normalize_text(str(item)) for item in (payload.get("confirmations") or []) if normalize_text(str(item))
                 )
                 batch_evidence = payload.get("evidence") or []
@@ -629,9 +736,9 @@ class ProductionService:
                 # cannot duplicate an entire chapter for every failed request.
                 body = self._fallback_section(project, section, batch_requirements, sources if len(batches) == 1 else [])
                 if len(batches) == 1:
-                    confirmations.append("大模型不可用，当前章节为基于已审核知识的结构化草稿，需人工复核")
+                    part_confirmations.append("大模型不可用，当前章节为基于已审核知识的结构化草稿，需人工复核")
                 else:
-                    confirmations.append(f"第{batch_index}/{len(batches)}部分AI编写失败，当前部分仅保留招标要求，须补充技术响应并人工复核")
+                    part_confirmations.append(f"第{batch_index}/{len(batches)}部分AI编写失败，当前部分仅保留招标要求，须补充技术响应并人工复核")
                 batch_evidence = [
                     {"requirement_id": item["id"], "text": f"{item['requirement_key']}：{item['content']}"}
                     for item in batch_requirements
@@ -648,6 +755,7 @@ class ProductionService:
             content_parts.append(batch_body)
             batch_ids = {int(item["id"]) for item in batch_requirements}
             covered_ids: set[int] = set()
+            accepted_evidence: list[dict[str, Any]] = []
             for item in batch_evidence:
                 requirement_id = int(item.get("requirement_id") or 0)
                 # Legacy ordinal output can only map within its own part; a real
@@ -657,12 +765,12 @@ class ProductionService:
                 text = normalize_text(str(item.get("text") or "")).replace("[项目名称]", project["name"])
                 # Evidence must quote this part's final body. A quotation that
                 # only occurs in another part must not establish coverage here.
-                if requirement_id in batch_ids and text and text in batch_body:
-                    evidence.append({"requirement_id": requirement_id, "text": text, "coverage_score": 1.0})
+                if requirement_id in batch_ids and text and text in batch_body and (not succeeded or not copies_requirement(text, requirement_map[requirement_id])):
+                    accepted_evidence.append({"requirement_id": requirement_id, "text": text, "coverage_score": 1.0 if succeeded else 0.0})
                     covered_ids.add(requirement_id)
             missing_ids = sorted(batch_ids - covered_ids) if succeeded else []
             if missing_ids:
-                confirmations.append(f"第{batch_index}/{len(batches)}部分有{len(missing_ids)}项要求缺少可核验的正文响应（要求ID：{','.join(map(str, missing_ids))}），须补充后复核")
+                part_confirmations.append(f"第{batch_index}/{len(batches)}部分有{len(missing_ids)}项要求缺少可核验的正文响应（要求ID：{','.join(map(str, missing_ids))}），须补充后复核")
             batch_results.append({
                 **batch, "requirement_ids": [item["id"] for item in batch_requirements],
                 "status": ("ai_incomplete" if missing_ids else "ai") if succeeded else "fallback", "ai_run_id": result.get("run_id"),
@@ -670,6 +778,12 @@ class ProductionService:
                 "model": result.get("model"), "cached": bool(result.get("cached")),
                 "error": ("部分要求缺少可核验的正文响应" if missing_ids else "") if succeeded else str(result.get("error") or "模型未返回有效正文"),
             })
+            part = {**batch_results[-1], "content": batch_body, "evidence": accepted_evidence,
+                    "confirmations": part_confirmations, "reused": False}
+            part["part_hash"] = part_fingerprint(part)
+            saved_parts.append(part)
+            evidence.extend(accepted_evidence)
+            confirmations.extend(part_confirmations)
             progress("generating", 10 + int(batch_index / len(batches) * 75),
                      f"第{batch_index}/{len(batches)}部分已处理" + ("，需要补充技术响应并复核" if not succeeded or missing_ids else ""),
                      {"section_id": section_id, **batch, "status": batch_results[-1]["status"]})
@@ -691,25 +805,57 @@ class ProductionService:
             for item in sources
         ]
         draft_hash = content_hash(content)
+        generation_metadata = {"schema_version": 1, "context_fingerprint": scope_fingerprint,
+                               "draft_hash": draft_hash, "status": generation_status, "sources": sources,
+                               "parts": saved_parts, "repaired_from_draft_id": starting_draft["id"] if repair_only else None}
         progress("saving", 95, "合并各部分并核验证据", {"section_id": section_id, "batch_count": len(batches), "fallback_batches": fallback_batches, "incomplete_batches": incomplete_batches})
         if cancelled():
             return cancellation_result()
-        with self.db.connect() as conn:
-            version_no = int(conn.execute("SELECT COALESCE(MAX(version_no),0)+1 FROM project_drafts WHERE section_id=?", (section_id,)).fetchone()[0])
-            cursor = conn.execute(
-                "INSERT INTO project_drafts(project_id,section_id,content,citations_json,confirmations_json,version_no,status,content_hash) VALUES (?,?,?,?,?,?,'draft',?)",
-                (project_id, section_id, content, json.dumps(citations, ensure_ascii=False), json.dumps(confirmations, ensure_ascii=False), version_no, draft_hash),
-            )
-            draft_id = int(cursor.lastrowid)
-            conn.execute("UPDATE project_sections SET status='drafted' WHERE id=?", (section_id,))
-            for item in evidence:
-                requirement_id = int(item.get("requirement_id") or 0)
-                text = normalize_text(str(item.get("text") or ""))
-                coverage_score = float(item["coverage_score"])
-                conn.execute(
-                    "INSERT INTO requirement_responses(requirement_id,draft_id,evidence_text,coverage_score,content_fingerprint) VALUES (?,?,?,?,?)",
-                    (requirement_id, draft_id, text, coverage_score, draft_hash),
+        try:
+            with self.db.connect() as conn:
+                self._lock_project_for_update(conn, project_id)
+                if cancelled():
+                    raise CancelledBeforeSave()
+                current = self._get_project_from_connection(conn, project_id)
+                current_section = next((item for item in current["sections"] if item["id"] == section_id), None)
+                current_draft = current_section.get("draft") if current_section else None
+                current_version = (current_draft["id"], current_draft["content_hash"]) if current_draft else None
+                current_requirement_map = {item["id"]: item for item in current["requirements"]}
+                current_requirements = [current_requirement_map[rid] for rid in current_section["requirement_ids"] if rid in current_requirement_map] if current_section else []
+                current_review_fingerprints = [(item["id"], item.get("requirement_fingerprint")) for item in current_requirements]
+                current_metadata_hash = None
+                if repair_only and current_draft:
+                    current_metadata_hash = content_hash(conn.execute("SELECT generation_json FROM project_drafts WHERE id=?", (current_draft["id"],)).fetchone()[0] or "{}")
+                if (not current_section or current_version != starting_version or current_review_fingerprints != starting_review_fingerprints
+                    or (repair_only and current_metadata_hash != starting_metadata_hash)
+                    or context_fingerprint(current, current_section, current_requirements, sources) != scope_fingerprint):
+                    conn.execute("UPDATE generation_runs SET status='invalidated',completed_at=CURRENT_TIMESTAMP WHERE id=?", (generation_run_id,))
+                    raise ValueError("生成期间项目资料、条款映射或章节正文发生变化，本次结果未覆盖现有章节，请重新载入")
+                self._check_generation_sources(conn, sources, lock=True)
+                version_no = int(conn.execute("SELECT COALESCE(MAX(version_no),0)+1 FROM project_drafts WHERE section_id=?", (section_id,)).fetchone()[0])
+                cursor = conn.execute(
+                    "INSERT INTO project_drafts(project_id,section_id,content,citations_json,confirmations_json,version_no,status,content_hash,generation_json) VALUES (?,?,?,?,?,?,'draft',?,?)",
+                    (project_id, section_id, content, json.dumps(citations, ensure_ascii=False), json.dumps(confirmations, ensure_ascii=False), version_no, draft_hash, json.dumps(generation_metadata, ensure_ascii=False)),
                 )
+                draft_id = int(cursor.lastrowid)
+                conn.execute("UPDATE project_sections SET status='drafted' WHERE id=?", (section_id,))
+                conn.execute("UPDATE delivery_manifests SET invalidated_at=CURRENT_TIMESTAMP,status='invalidated' WHERE project_id=? AND invalidated_at IS NULL", (project_id,))
+                for item in evidence:
+                    requirement_id = int(item.get("requirement_id") or 0)
+                    text = normalize_text(str(item.get("text") or ""))
+                    coverage_score = float(item["coverage_score"])
+                    conn.execute(
+                        "INSERT INTO requirement_responses(requirement_id,draft_id,evidence_text,coverage_score,content_fingerprint) VALUES (?,?,?,?,?)",
+                        (requirement_id, draft_id, text, coverage_score, draft_hash),
+                    )
+                if cancelled():
+                    raise CancelledBeforeSave()
+        except CancelledBeforeSave:
+            return cancellation_result()
+        except Exception:
+            with self.db.connect() as conn:
+                conn.execute("UPDATE generation_runs SET status='failed',completed_at=CURRENT_TIMESTAMP WHERE id=?", (generation_run_id,))
+            raise
         evidence_sources = [
             *sources,
             *[
@@ -723,12 +869,19 @@ class ProductionService:
             ],
         ]
         evidence_report = self.evidence.analyze_draft(generation_run_id, draft_id, content, evidence_sources)
-        if evidence_report["unsupported_high"]:
-            confirmations.extend(
-                f"高风险表述缺少充分证据：{text[:160]}"
-                for text in evidence_report["unsupported_high"]
-            )
-            with self.db.connect() as conn:
+        with self.db.connect() as conn:
+            self._lock_project_for_update(conn, project_id)
+            saved = dict(conn.execute("SELECT * FROM project_drafts WHERE id=?", (draft_id,)).fetchone())
+            confirmations = list(parse_json(saved["confirmations_json"], []))
+            # A human can bind a missing response or resolve a claim after the
+            # analysis transaction. Merge current claims into current notices;
+            # never restore the generation task's older confirmation list.
+            if content_hash(saved["content"]) == draft_hash and not evidence_report.get("stale"):
+                current_claims = self.evidence.list_claims(draft_id, conn=conn)
+                confirmations = [text for text in confirmations if not str(text).startswith("高风险表述缺少充分证据：")]
+                confirmations.extend(f"高风险表述缺少充分证据：{claim['text'][:160]}" for claim in current_claims
+                                     if claim["risk_level"] == "high" and claim["support_status"] != "supported")
+                confirmations = list(dict.fromkeys(confirmations))
                 conn.execute(
                     "UPDATE project_drafts SET confirmations_json=? WHERE id=?",
                     (json.dumps(confirmations, ensure_ascii=False), draft_id),
@@ -753,8 +906,17 @@ class ProductionService:
             "error": "；".join(f"第{item['index']}部分：{item['error']}" for item in batch_results if item["error"]),
             "generation_run_id": generation_run_id,
             "evidence": evidence_report,
+            "generation": public_generation({"content": content, "generation": generation_metadata}),
+            "reused_parts": sum(bool(item.get("reused")) for item in saved_parts),
             "claims": self.evidence.list_claims(draft_id),
         }
+
+    def _check_generation_sources(self, conn, sources: list[dict], *, lock: bool = False) -> None:
+        suffix = " FOR SHARE OF p,v" if lock and self.db.backend == "postgresql" else ""
+        for source in sorted(sources, key=lambda item: int(item["publication_id"])):
+            publication = conn.execute("SELECT p.*,v.content FROM knowledge_publications p JOIN knowledge_versions v ON v.id=p.version_id WHERE p.id=?" + suffix, (source["publication_id"],)).fetchone()
+            if not publication or publication["status"] != "published" or publication["content_hash"] != source["content_hash"] or int(publication["publication_version"]) != int(source["publication_version"]) or publication["content"] != source["content"]:
+                raise ValueError("章节所引用的知识版本已失效，请重新生成此章以选取有效来源")
 
     @staticmethod
     def _section_requirement_batches(requirements: list[dict[str, Any]], max_items: int = 12, max_chars: int = 6000) -> list[list[dict[str, Any]]]:
@@ -837,23 +999,27 @@ class ProductionService:
             row = conn.execute("SELECT * FROM project_drafts WHERE id=?", (draft_id,)).fetchone()
             if not row:
                 raise KeyError("章节草稿不存在")
+            if conn.execute("SELECT 1 FROM project_drafts WHERE section_id=? AND version_no>? LIMIT 1", (row["section_id"], row["version_no"])).fetchone():
+                raise ValueError("只能修改当前最新章节版本，请重新载入")
             current_hash = content_hash(row["content"])
             if current_hash == updated_hash:
                 return {"draft_id": draft_id, "status": row["status"], "changed": False, "quality_confirmations_invalidated": False}
+            generation_metadata = read_generation(dict(row))
+            generation_metadata["manual_content_hash"] = updated_hash
             conn.execute(
-                "UPDATE project_drafts SET content=?,content_hash=?,status='draft',evidence_status='pending',updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (normalized, updated_hash, draft_id),
+                "UPDATE project_drafts SET content=?,content_hash=?,generation_json=?,status='draft',evidence_status='pending',updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (normalized, updated_hash, json.dumps(generation_metadata, ensure_ascii=False), draft_id),
             )
             conn.execute("UPDATE project_sections SET status='drafted' WHERE id=?", (row["section_id"],))
             conn.execute("UPDATE requirement_responses SET review_status='invalidated' WHERE draft_id=?", (draft_id,))
             conn.execute("UPDATE claims SET support_status='invalidated',updated_at=CURRENT_TIMESTAMP WHERE draft_id=?", (draft_id,))
             conn.execute("UPDATE generation_runs SET status='invalidated' WHERE draft_id=?", (draft_id,))
             conn.execute("UPDATE delivery_manifests SET status='invalidated',invalidated_at=CURRENT_TIMESTAMP WHERE project_id=? AND invalidated_at IS NULL", (row["project_id"],))
-            responses = conn.execute("SELECT id,evidence_text FROM requirement_responses WHERE draft_id=?", (draft_id,)).fetchall()
+            responses = conn.execute("SELECT id,evidence_text,coverage_score FROM requirement_responses WHERE draft_id=?", (draft_id,)).fetchall()
             for response in responses:
                 evidence_text = normalize_text(response["evidence_text"] or "")
                 conn.execute("UPDATE requirement_responses SET content_fingerprint=?,coverage_score=? WHERE id=?",
-                             (updated_hash, 1.0 if evidence_text and evidence_text in normalized else 0.0, response["id"]))
+                             (updated_hash, float(response["coverage_score"]) if response["coverage_score"] >= .8 and evidence_text and evidence_text in normalized else 0.0, response["id"]))
         # A saved edit must be evaluated against the frozen sources again;
         # invalidated claims must never disappear from the high-risk gate.
         citations = parse_json(row["citations_json"], [])
@@ -900,13 +1066,27 @@ class ProductionService:
             row = conn.execute(f"SELECT * FROM project_drafts WHERE id=?{lock_clause}", (draft_id,)).fetchone()
             if not row:
                 raise KeyError("章节草稿不存在")
+            if conn.execute("SELECT 1 FROM project_drafts WHERE section_id=? AND version_no>? LIMIT 1", (row["section_id"], row["version_no"])).fetchone():
+                raise ValueError("只能签审当前最新章节版本，请重新载入")
             current_hash = content_hash(row["content"])
             if target_hash is not None and target_hash != current_hash:
                 raise ValueError("章节内容已变化，请重新查看后签审")
             confirmations = parse_json(row["confirmations_json"], [])
+            source_status = self.evidence.project_source_status(int(owner["project_id"]), conn=conn)
+            if draft_id in source_status["stale_draft_ids"] or row["evidence_status"] in {"pending", "invalidated", "failed"}:
+                raise ValueError("当前章节证据尚未绑定最新项目资料，请先重新核验证据")
+            if source_status["profile_conflicts"]:
+                raise ValueError("项目资料与招标原文存在冲突，请先核对项目资料")
+            if generation_incomplete({"generation": public_generation(dict(row)), "confirmations": confirmations}):
+                raise ValueError("当前正文含未完成的生成部分，请先局部修复或编辑正文并补录响应，不能用处理结论代替正文")
+            project = self._get_project_from_connection(conn, int(owner["project_id"]))
+            section = next(section for section in project["sections"] if section["id"] == row["section_id"])
+            missing_responses = section["draft"]["missing_response_requirement_ids"]
+            if missing_responses:
+                raise ValueError(f"本章还有{len(missing_responses)}条未绑定实际正文响应，请补写或定位现有正文后再签审")
             unsupported_high = int(
                 conn.execute(
-                    "SELECT COUNT(*) FROM claims WHERE draft_id=? AND risk_level='high' AND support_status IN ('unsupported','invalidated')",
+                    "SELECT COUNT(*) FROM claims WHERE draft_id=? AND risk_level='high' AND support_status NOT IN ('supported','confirmed')",
                     (draft_id,),
                 ).fetchone()[0]
             )
@@ -914,6 +1094,7 @@ class ProductionService:
                 raise ValueError(f"仍有{unsupported_high}条高风险Claim缺少证据，不能签审")
             target_hash = current_hash
             supplied: dict[int, str] = {}
+            required_indices = human_confirmation_indices({"confirmations": confirmations})
             for item in resolutions or []:
                 index = int(item.get("index", -1))
                 resolution = normalize_text(str(item.get("resolution") or ""))
@@ -924,11 +1105,13 @@ class ProductionService:
                 if index in supplied:
                     raise ValueError(f"第{index + 1}项待确认事项重复提交")
                 supplied[index] = resolution
-            missing = [index + 1 for index in range(len(confirmations)) if index not in supplied]
+            missing = [index + 1 for index in required_indices if index not in supplied]
             if missing:
                 raise ValueError(f"待确认事项必须逐项处理：缺少第{','.join(map(str, missing))}项")
             conn.execute("UPDATE project_drafts SET content_hash=? WHERE id=?", (target_hash, draft_id))
             for index, confirmation in enumerate(confirmations):
+                if index not in required_indices:
+                    continue
                 conn.execute(
                     """
                     INSERT INTO confirmation_resolutions(
@@ -965,7 +1148,7 @@ class ProductionService:
             "status": "reviewed",
             "reviewer": reviewer.strip(),
             "target_hash": target_hash,
-            "resolved_confirmations": len(confirmations),
+            "resolved_confirmations": len(required_indices),
         }
 
     def quality_gate(self, project_id: int, *, conn=None, sync_issues: bool = True) -> dict[str, Any]:
@@ -982,14 +1165,8 @@ class ProductionService:
         with (nullcontext(conn) if conn is not None else self.db.connect()) as connection:
             for draft in drafts:
                 target_hash = draft["content_hash"]
-                resolved = {
-                    int(row[0])
-                    for row in connection.execute(
-                        "SELECT confirmation_index FROM confirmation_resolutions WHERE draft_id=? AND target_hash=?",
-                        (draft["id"], target_hash),
-                    )
-                }
-                confirmation_count += sum(1 for index, _ in enumerate(draft.get("confirmations") or []) if index not in resolved)
+                resolved = {int(row["confirmation_index"]) for row in draft["confirmation_resolutions"]}
+                confirmation_count += sum(1 for index in human_confirmation_indices(draft) if index not in resolved)
                 reviewed = connection.execute(
                     "SELECT 1 FROM draft_review_decisions WHERE draft_id=? AND target_hash=? AND decision='approved' LIMIT 1",
                     (draft["id"], target_hash),
@@ -1012,6 +1189,14 @@ class ProductionService:
                         invalid_citations += 1
         if invalid_citations:
             review_blockers.append({"key": "invalid_citations", "title": "引用已失效", "detail": f"共{invalid_citations}项"})
+        project_evidence = project["evidence_source"]
+        if project_evidence["stale_draft_ids"]:
+            review_blockers.append({"key": "project_evidence_stale", "title": "项目来源证据需要重新核验", "detail": f"共{len(project_evidence['stale_draft_ids'])}章尚未绑定当前原文或项目资料"})
+        if project_evidence["profile_conflicts"]:
+            review_blockers.append({"key": "project_profile_conflicts", "title": "项目资料与原文存在冲突", "detail": f"共{len(project_evidence['profile_conflicts'])}处，请核对面积、工期等资料"})
+        incomplete_generation = sum(generation_incomplete(draft) for draft in drafts)
+        if incomplete_generation:
+            review_blockers.append({"key": "incomplete_generation", "title": "正文仍有未完成的生成部分", "detail": f"共{incomplete_generation}章，请先局部修复或补充实际正文响应"})
         stale_evidence = sum(
             1 for draft in drafts
             if draft.get("evidence_status") in {"pending", "invalidated", "failed"}
@@ -1026,32 +1211,13 @@ class ProductionService:
         if not artifact_audit["ready"]:
             detail = "、".join(f"{key}={value}" for key, value in artifact_audit["counts"].items() if value)
             review_blockers.append({"key": "artifact_audit", "title": "最终产物审计未通过", "detail": detail or "发现禁止内容"})
-        coverage_total = len(project["requirements"])
-        with (nullcontext(conn) if conn is not None else self.db.connect()) as connection:
-            covered = int(connection.execute(
-                """
-                SELECT COUNT(DISTINCT rr.requirement_id) FROM requirement_responses rr
-                JOIN project_requirements r ON r.id=rr.requirement_id
-                JOIN project_drafts d ON d.id=rr.draft_id
-                WHERE r.project_id=?
-                    AND rr.coverage_score>=0.8
-                    AND rr.review_status='confirmed'
-                    AND rr.content_fingerprint=d.content_hash
-                    AND TRIM(COALESCE(rr.evidence_text,''))<>''
-                    AND NOT EXISTS (
-                        SELECT 1 FROM project_drafts newer
-                        WHERE newer.section_id=d.section_id AND newer.version_no>d.version_no
-                    )
-                    AND EXISTS (
-                        SELECT 1 FROM draft_review_decisions rd
-                        WHERE rd.draft_id=d.id AND rd.target_hash=d.content_hash AND rd.decision='approved'
-                    )
-                """,
-                (project_id,),
-            ).fetchone()[0])
+        workflow_metrics = response_metrics(self, project, conn=conn)
+        coverage_total = workflow_metrics["technical_total"]
+        covered = workflow_metrics["signed"]
+        review_blockers.extend(project["requirements_workflow"]["blockers"])
         coverage = round(covered / coverage_total * 100, 2) if coverage_total else 100.0
         if coverage < 95:
-            review_blockers.append({"key": "coverage", "title": "条款证据覆盖不足", "detail": f"当前{coverage}%"})
+            review_blockers.append({"key": "coverage", "title": "技术条款签审覆盖不足", "detail": f"当前{coverage}%，{covered}/{coverage_total}条已签审；未确认的非技术分类仍计入分母"})
         consistency_issues = self._consistency_issues(project)
         warnings = [item for item in consistency_issues if item["key"] == "duplicate_sections"]
         review_blockers.extend(item for item in consistency_issues if item["key"] != "duplicate_sections")
@@ -1091,6 +1257,11 @@ class ProductionService:
                 "requirements": coverage_total,
                 "covered_requirements": covered,
                 "coverage": coverage,
+                "mapped_requirements": workflow_metrics["mapped"],
+                "responded_requirements": workflow_metrics["responded"],
+                "total_requirements": workflow_metrics["total"],
+                "technical_requirements": workflow_metrics["technical_total"],
+                "classification_pending": project["requirements_workflow"]["classification_pending"],
                 "confirmations": confirmation_count,
                 "unreviewed_drafts": unreviewed_drafts,
                 "invalid_citations": invalid_citations,
@@ -1431,7 +1602,7 @@ class ProductionService:
                     "region": project.get("region"),
                     "source_text": project.get("source_text"),
                     "profile": {key: value for key, value in (project.get("profile") or {}).items() if key not in confirmation_fields},
-                    "requirements": [(item["id"], item["content"], item["kind"]) for item in project["requirements"]],
+                    "requirements": [(item["id"], item["content"], item["kind"], item.get("requirement_fingerprint"), item.get("classification")) for item in project["requirements"]],
                     "sections": [(section["id"], section["title"], section.get("order_no"), section.get("requirement_ids")) for section in project["sections"]],
                     "drafts": [(section["draft"]["id"], section["draft"]["content_hash"], section["draft"].get("citations")) for section in project["sections"] if section.get("draft")],
                 },

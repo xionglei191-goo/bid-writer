@@ -3,10 +3,12 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from docx import Document
 from fastapi.testclient import TestClient
@@ -16,6 +18,7 @@ from bid_writer_v2.database import Database
 from bid_writer_v2.knowledge.service import KnowledgeService
 from bid_writer_v2.production.service import ProductionService
 from bid_writer_v2.settings import Settings
+from bid_writer_v2.utils import content_hash
 
 
 def build_settings(root: Path) -> Settings:
@@ -53,6 +56,33 @@ def create_source_docx(path: Path) -> None:
     table.cell(1, 1).text = "连续施工"
     table.cell(1, 2).text = "旁站检查"
     document.save(path)
+
+
+def fixture_section_reply(*, base_response: str, confirmations: list[str] | None = None, table: bool = False):
+    """Valid controlled model output, with each evidence quote in its body.
+
+    These workflow tests exercise review/export; model transport has separate
+    tests. Never use a failed-generation fallback as an approved fixture.
+    """
+    def reply(spec, prompt, input_payload, **kwargs):
+        lines = []
+        evidence = []
+        for requirement in input_payload["requirements"]:
+            duration = re.search(r"\d+\s*日历天", requirement["content"])
+            response = (f"施工进度计划按{duration.group().replace(' ', '')}工期要求组织。"
+                        if duration else base_response)
+            line = f"{requirement['requirement_key']}响应：{response}"
+            lines.append(line)
+            evidence.append({"requirement_id": requirement["id"], "text": line})
+        if not lines:
+            lines.append(base_response)
+        if table:
+            lines.append("| 施工工序 | 控制点 | 检查方式 |\n| --- | --- | --- |\n| 浇筑 | 连续施工 | 旁站检查 |")
+        payload = {"content": "\n\n".join(lines), "evidence": evidence,
+                   "confirmations": list(confirmations or []), "visual_suggestions": []}
+        validated = spec.output_model.model_validate(payload).model_dump()
+        return {"payload": validated, "model": "controlled-workflow-fixture", "cached": False}
+    return reply
 
 
 class V2WorkflowTest(unittest.TestCase):
@@ -123,7 +153,13 @@ class V2WorkflowTest(unittest.TestCase):
             self.production.parse_requirements(project["id"])
             outline = self.production.build_outline(project["id"])
             target = outline["sections"][3]
-            generated = self.production.generate_section(project["id"], target["id"])
+            with patch.object(self.production.ai_runtime, "execute", side_effect=fixture_section_reply(
+                base_response="施工前完成技术交底、图纸会审、现场复核和作业条件确认。",
+                confirmations=["请核实实际施工现场资料是否齐全"], table=True,
+            )):
+                generated = self.production.generate_section(project["id"], target["id"])
+            self.assertEqual(generated["generation_status"], "ai")
+            self.assertEqual(generated["incomplete_batches"], 0)
             self.assertTrue(generated["citations"])
             self.assertNotIn("[项目名称]", generated["content"])
             self.assertIn("| ---", generated["content"])
@@ -150,6 +186,12 @@ class V2WorkflowTest(unittest.TestCase):
                     copied_draft_ids.append(int(cursor.lastrowid))
                     conn.execute("UPDATE project_sections SET status='drafted' WHERE id=?", (section["id"],))
             for draft_id in copied_draft_ids:
+                with self.db.connect() as conn:
+                    copy_row = conn.execute("SELECT section_id,content FROM project_drafts WHERE id=?", (draft_id,)).fetchone()
+                copy_run = self.production.evidence.create_generation_run(
+                    project["id"], copy_row["section_id"], content_hash(copy_row["content"]), "copied-fixture", "1", "1", None, [],
+                )
+                self.production.evidence.analyze_draft(copy_run, draft_id, copy_row["content"], [])
                 self.production.confirm_draft(draft_id, "测试技术负责人")
 
             quality = self.production.quality_gate(project["id"])
@@ -161,7 +203,20 @@ class V2WorkflowTest(unittest.TestCase):
                 self.production.export_project(project["id"], "docx")
             review_export = self.production.export_project(project["id"], "docx", "review")
             self.assertEqual(review_export["mode"], "review")
-            review_package = self.production.export_project(project["id"], "package", "review")
+            def fixture_pdf(docx_path: Path) -> Path:
+                # The container validates real LibreOffice/UNO conversion;
+                # this unit test checks package composition and native DOCX.
+                pdf_path = docx_path.with_suffix(".pdf")
+                pdf_path.write_bytes(b"%PDF-1.4\ncontrolled package fixture")
+                return pdf_path
+
+            if os.getenv("BID_WRITER_TEST_LIBREOFFICE") == "1":
+                review_package = self.production.export_project(project["id"], "package", "review")
+            else:
+                with patch.object(self.production, "_convert_pdf", side_effect=fixture_pdf), patch.object(
+                    self.production, "_preflight_pdf", return_value={"pages": 1}
+                ):
+                    review_package = self.production.export_project(project["id"], "package", "review")
             with zipfile.ZipFile(review_package["file_path"]) as archive:
                 names = set(archive.namelist())
             self.assertEqual(len(names), 4)
@@ -169,17 +224,15 @@ class V2WorkflowTest(unittest.TestCase):
             self.assertTrue(any(name.endswith(".pdf") for name in names))
             self.assertIn("送审说明.md", names)
             self.assertIn("文件清单.txt", names)
-            self.production.update_project(
-                project["id"],
-                {
-                    "profile": {
-                        "bidder_name": "河南建设工程有限公司",
-                        "professional_reviewer": "注册建造师复核人",
-                        "compliance_confirmed": True,
-                        "manual_finalized": True,
-                    }
-                },
-            )
+            self.production.update_project(project["id"], {"profile": {"bidder_name": "河南建设工程有限公司"}})
+            self.production.refresh_project_evidence(project["id"])
+            for section in self.production.get_project(project["id"])["sections"]:
+                draft = section["draft"]
+                resolutions = [{"index": index, "resolution": "已根据当前项目资料重新核对实际施工条件"}
+                               for index, _text in enumerate(draft["confirmations"])]
+                self.production.confirm_draft(draft["id"], "测试技术负责人", resolutions)
+            preview = self.production.preview_project(project["id"])
+            self.production.confirm_final_review(project["id"], preview["project_hash"], "注册建造师复核人", True, True)
             quality = self.production.quality_gate(project["id"])
             self.assertTrue(quality["formal_ready"], quality)
             self.assertTrue(quality["ready"], quality)
@@ -206,7 +259,12 @@ class V2WorkflowTest(unittest.TestCase):
             )
             self.production.parse_requirements(project["id"])
             outline = self.production.build_outline(project["id"])
-            generated = self.production.generate_section(project["id"], outline["sections"][3]["id"])
+            with patch.object(self.production.ai_runtime, "execute", side_effect=fixture_section_reply(
+                base_response="施工前完成技术交底、图纸会审、现场复核和作业条件确认。",
+                confirmations=["请核实实际施工现场资料是否齐全"],
+            )):
+                generated = self.production.generate_section(project["id"], outline["sections"][3]["id"])
+            self.assertEqual(generated["generation_status"], "ai")
 
             with self.assertRaisesRegex(ValueError, "必须逐项处理"):
                 self.production.confirm_draft(generated["draft_id"], "审核人")

@@ -8,6 +8,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from .service import ProductionService
+from .requirements_api import build_router as build_requirements_router
 from ..auth import AuthService
 from ..jobs import JobService
 from ..utils import public_payload
@@ -45,9 +46,16 @@ class GeneratePayload(BaseModel):
     background: bool = True
 
 
+class RepairPayload(GeneratePayload):
+    target_hash: str = Field(min_length=1)
+
+
 class ClaimResolutionPayload(BaseModel):
-    action: str
-    resolution: str
+    action: Literal["confirm", "reopen"]
+    resolution: str = Field(min_length=1)
+    reviewer: str = Field(min_length=1)
+    target_hash: str = Field(min_length=1)
+    project_source_hash: str = Field(min_length=1)
 
 
 class QualityResolutionPayload(BaseModel):
@@ -75,6 +83,44 @@ class FinalReviewPayload(BaseModel):
 
 def build_router(service: ProductionService, jobs: JobService | None = None) -> APIRouter:
     router = APIRouter(prefix="/api/projects", tags=["production"])
+
+    @router.get("/{project_id}/workbench")
+    def workbench(project_id: int) -> dict[str, Any]:
+        try:
+            return service.workbench(project_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @router.post("/{project_id}/sections/{section_id}/repair")
+    def repair_section(project_id: int, section_id: int, payload: RepairPayload, request: Request, background_tasks: BackgroundTasks) -> dict[str, Any]:
+        try:
+            if payload.background and jobs:
+                user = getattr(request.state, "user", None) or {}
+                job = jobs.enqueue("production.repair_section", "project_section", section_id,
+                                   {"project_id": project_id, "section_id": section_id, "target_hash": payload.target_hash}, user.get("id"))
+                if not jobs.settings.background_jobs_enabled:
+                    background_tasks.add_task(jobs.run, int(job["id"]))
+                return job
+            return service.generate_section(project_id, section_id, repair_only=True, target_hash=payload.target_hash)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router.post("/{project_id}/evidence/recheck")
+    def recheck_evidence(project_id: int, payload: GeneratePayload, request: Request, background_tasks: BackgroundTasks) -> dict[str, Any]:
+        try:
+            if payload.background and jobs:
+                user = getattr(request.state, "user", None) or {}
+                job = jobs.enqueue("production.recheck_evidence", "project", project_id, {"project_id": project_id}, user.get("id"))
+                if not jobs.settings.background_jobs_enabled:
+                    background_tasks.add_task(jobs.run, int(job["id"]))
+                return job
+            return service.refresh_project_evidence(project_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router.get("")
     def list_projects() -> list[dict[str, Any]]:
@@ -170,6 +216,8 @@ def build_router(service: ProductionService, jobs: JobService | None = None) -> 
             return service.update_draft(draft_id, payload.content)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router.post("/drafts/{draft_id}/confirm")
     def confirm_draft(draft_id: int, payload: ConfirmPayload) -> dict[str, Any]:
@@ -210,7 +258,8 @@ def build_router(service: ProductionService, jobs: JobService | None = None) -> 
     @router.post("/claims/{claim_id}/resolve")
     def resolve_claim(claim_id: int, payload: ClaimResolutionPayload) -> dict[str, Any]:
         try:
-            return service.evidence.resolve_claim(claim_id, payload.action, payload.resolution)
+            return service.evidence.resolve_claim(claim_id, payload.action, payload.resolution,
+                reviewer=payload.reviewer, target_hash=payload.target_hash, project_source_hash=payload.project_source_hash)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -278,4 +327,8 @@ def build_router(service: ProductionService, jobs: JobService | None = None) -> 
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    workflow_router = build_requirements_router(service.requirements_workflow)
+    # Both routers already declare /api/projects; include the child routes
+    # directly to avoid repeating that prefix.
+    router.routes.extend(workflow_router.routes)
     return router

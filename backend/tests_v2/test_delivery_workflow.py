@@ -66,8 +66,9 @@ class DeliveryWorkflowTest(unittest.TestCase):
         self.temp.cleanup()
 
     def finalize(self) -> dict:
-        self.production.confirm_draft(self.draft_id, "陈工")
         self.production.update_project(self.project_id, {"profile": {"bidder_name": "华建建设工程有限公司"}})
+        self.production.refresh_project_evidence(self.project_id)
+        self.production.confirm_draft(self.draft_id, "陈工")
         preview = self.client.get(f"/api/projects/{self.project_id}/preview").json()
         response = self.client.post(f"/api/projects/{self.project_id}/final-review", json={
             "project_hash": preview["project_hash"], "professional_reviewer": "陈工",
@@ -99,6 +100,15 @@ class DeliveryWorkflowTest(unittest.TestCase):
         self.assertTrue(history[0]["current"])
         self.assertTrue(history[0]["available"])
         self.assertEqual(self.client.get(f"/api/projects/999/deliveries/{artifact['delivery_id']}/download").status_code, 404)
+
+    def test_editing_a_replaced_version_returns_a_reloadable_conflict(self) -> None:
+        with self.db.connect() as conn:
+            conn.execute("INSERT INTO project_drafts(project_id,section_id,content,content_hash,version_no) VALUES (?,?,?,?,2)",
+                         (self.project_id, self.section_id, self.content, content_hash(self.content)))
+        response = self.client.patch(f"/api/projects/drafts/{self.draft_id}", json={"content": self.content + "人工修改"})
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertIn("重新载入", response.text)
+        self.assertEqual(self.db.row("SELECT content FROM project_drafts WHERE id=?", (self.draft_id,))["content"], self.content)
 
     def test_final_review_requires_current_preview_and_user_confirmations(self) -> None:
         before = self.client.get(f"/api/projects/{self.project_id}/preview").json()

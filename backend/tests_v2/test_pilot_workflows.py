@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from docx import Document
 
@@ -13,7 +14,7 @@ from bid_writer_v2.database import Database
 from bid_writer_v2.knowledge.service import KnowledgeService
 from bid_writer_v2.production.service import DEFAULT_OUTLINE, ProductionService
 from bid_writer_v2.utils import content_hash
-from test_v2_workflow import build_settings
+from test_v2_workflow import build_settings, fixture_section_reply
 
 
 FIXTURE_ROOT = Path(__file__).with_name("fixtures") / "pilots"
@@ -69,10 +70,22 @@ class PilotWorkflowTest(unittest.TestCase):
                 project = production.create_project(fixture)
                 parsed = production.parse_requirements(project["id"])
                 outline = production.build_outline(project["id"])
+                classifications = production.requirements_workflow.snapshot(project["id"])
+                pending = [item for item in classifications["items"] if item["planning_category"] == "unclassified"]
+                if pending:
+                    production.requirements_workflow.review(project["id"], "演练技术负责人", [
+                        {"requirement_id": item["id"], "expected_fingerprint": item["requirement_fingerprint"],
+                         "category": "technical", "reason": f"本演练条款直接要求施工措施：{item['content']}"}
+                        for item in pending
+                    ], expected_project_hash=classifications["project_hash"])
                 matrix = production.coverage_matrix(project["id"])
                 self.assertFalse(matrix["unmapped_high"], matrix)
-                generated = production.generate_all(project["id"])
+                with patch.object(production.ai_runtime, "execute", side_effect=fixture_section_reply(
+                    base_response=knowledge_item["content"].split("。", 1)[0] + "。",
+                )):
+                    generated = production.generate_all(project["id"])
                 self.assertEqual(generated["failed"], 0, generated)
+                self.assertTrue(all(item["generation_status"] == "ai" and item["incomplete_batches"] == 0 for item in generated["results"]))
                 detail = production.get_project(project["id"])
                 for section in detail["sections"]:
                     draft = section["draft"]

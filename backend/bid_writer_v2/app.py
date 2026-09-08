@@ -129,6 +129,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ),
     )
     jobs.register(
+        "production.repair_section",
+        lambda payload, report, cancelled: production.generate_section(
+            int(payload["project_id"]), int(payload["section_id"]), progress=report, cancelled=cancelled,
+            repair_only=True, target_hash=str(payload["target_hash"]),
+        ),
+    )
+    jobs.register(
+        "production.recheck_evidence",
+        lambda payload, report, cancelled: production.refresh_project_evidence(
+            int(payload["project_id"]), progress=report, cancelled=cancelled,
+        ),
+    )
+    jobs.register(
         "production.export",
         lambda payload, report, _cancelled: production.export_project(
             int(payload["project_id"]),
@@ -258,7 +271,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             permission = "read" if request.method in {"GET", "HEAD", "OPTIONS"} else "write"
             if "/publish" in request.url.path or "/publications" in request.url.path:
                 permission = "publish"
-            elif "/confirm" in request.url.path or "/review" in request.url.path or request.url.path.endswith("/final-review"):
+            elif "/confirm" in request.url.path or "/review" in request.url.path or request.url.path.endswith("/final-review") or (
+                request.url.path.startswith("/api/projects/claims/") and request.url.path.endswith("/resolve")
+            ):
                 permission = "review"
             elif "/export" in request.url.path or (
                 request.url.path.startswith("/api/projects/")

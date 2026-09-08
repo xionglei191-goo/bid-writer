@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { BookOpenText, CheckCheck, Download, History, ShieldCheck } from "lucide-react";
 import { api, apiUrl, post, waitForJob } from "../api";
 import { BusyButton, Empty, Metric, Notice } from "../components";
+import { CoverageMetrics } from "./ProjectRemediation";
 
 const formats = [["docx", "Word"], ["pdf", "PDF"], ["package", "交付包"]];
 const profileIssues = new Set(["bidder_identity", "professional_reviewer", "seal_requirements", "delivery_deadline"]);
@@ -10,7 +11,8 @@ function IssueList({ items = [], onNavigate }) {
   return items.map((item) => <article key={`${item.key}-${item.detail}`}>
     <strong>{item.title}</strong><span>{item.detail}</span>
     {profileIssues.has(item.key) && <button className="secondary" onClick={() => onNavigate("overview")}>补充项目资料</button>}
-    {["missing_sections", "unreviewed_drafts", "confirmations", "unsupported_high_claims", "coverage", "invalid_citations", "artifact_audit"].includes(item.key) && <button className="secondary" onClick={() => onNavigate("editor")}>核对章节与证据</button>}
+    {["missing_sections", "unreviewed_drafts", "confirmations", "unsupported_high_claims", "coverage", "invalid_citations", "artifact_audit", "generation", "stale_evidence"].includes(item.key) && <button className="secondary" onClick={() => onNavigate("remediation")}>打开对应处理待办</button>}
+    {item.key?.startsWith("requirement_") && <button className="secondary" onClick={() => onNavigate("requirements")}>核对条款分类与资料</button>}
   </article>);
 }
 
@@ -21,6 +23,7 @@ function FileLink({ item, label }) {
 
 export default function ProjectDelivery({ project, reload, onNavigate }) {
   const [report, setReport] = useState(null);
+  const [coverage, setCoverage] = useState(null);
   const [deliveries, setDeliveries] = useState([]);
   const [latest, setLatest] = useState(null);
   const [preview, setPreview] = useState(null);
@@ -34,13 +37,13 @@ export default function ProjectDelivery({ project, reload, onNavigate }) {
 
   function clearConfirmation() { setPreview(null); setReviewer(""); setCompliance(false); setFinalized(false); }
   async function refresh() {
-    const [quality, history] = await Promise.all([api(`${root}/quality`), api(`${root}/deliveries`)]);
-    setReport(quality); setDeliveries(history);
+    const [quality, history, workbench] = await Promise.all([api(`${root}/quality`), api(`${root}/deliveries`), api(`${root}/workbench`)]);
+    setReport(quality); setDeliveries(history); setCoverage(workbench.metrics);
   }
   async function run(name, action) {
     setBusy(name); setFailed(false); setMessage("");
     try { await action(); }
-    catch (error) { setFailed(true); setMessage(error.message); }
+    catch (error) { if (/版本已变化|原文.*变化|来源.*变化|重新预览/.test(error.message)) clearConfirmation(); setFailed(true); setMessage(error.message); }
     finally { setBusy(""); }
   }
   async function check() {
@@ -83,12 +86,14 @@ export default function ProjectDelivery({ project, reload, onNavigate }) {
       {message && <Notice type={failed ? "danger" : "info"}>{message}</Notice>}
       {latest && <div className="delivery-latest"><strong>本次导出：{latest.mode === "review" ? "送审版" : "正式版"}</strong><FileLink item={latest} /></div>}
       {report ? <>
+        <CoverageMetrics metrics={coverage} />
         <div className="metric-grid four">
           <Metric label="章节草稿" value={`${report.metrics.drafts}/${report.metrics.sections}`} />
-          <Metric label="已签审条款覆盖" value={`${report.metrics.coverage}%`} />
-          <Metric label="证据支持" value={`${report.metrics.claims.support_rate}%`} tone={report.metrics.claims.high_unsupported ? "danger" : "success"} />
+          <Metric label="已签审覆盖率" value={`${report.metrics.coverage}%`} />
+          <Metric label="规则证据支持率" value={`${report.metrics.claims.support_rate}%`} hint="不等于专业认可" tone={report.metrics.claims.high_unsupported ? "danger" : "success"} />
           <Metric label="未签审章节" value={report.metrics.unreviewed_drafts} tone={report.metrics.unreviewed_drafts ? "warning" : "success"} />
         </div>
+        <div className="actions delivery-workbench-link"><button type="button" className="secondary" onClick={() => onNavigate("remediation")}>按原因处理待办</button><button type="button" className="secondary" onClick={() => onNavigate("requirements")}>核对条款分类与资料</button></div>
         <div className="delivery-modes">
           {["review", "formal"].map((mode) => {
             const reviewMode = mode === "review";

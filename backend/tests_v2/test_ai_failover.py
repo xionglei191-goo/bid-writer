@@ -272,7 +272,8 @@ class FailoverMigrationTest(unittest.TestCase):
             with db.connect() as conn:
                 conn.execute("INSERT INTO ai_runs(task_type,prompt_key,prompt_version,prompt_hash,input_hash,cache_key,model,base_url,wire_api,status,input_json) VALUES ('legacy','p','1','h','i','c','old-model','old-route','responses','succeeded','{}')")
             db.migrations_root = source
-            self.assertEqual(db.migrate(), ["017_ai_failover_audit.sql"])
+            self.assertEqual(db.migrate(), ["017_ai_failover_audit.sql", "018_requirement_classification.sql",
+                                            "019_project_evidence_binding.sql", "020_generation_parts.sql"])
             row = db.row("SELECT * FROM ai_runs")
             self.assertEqual(row["model"], "old-model")
             self.assertIsNone(row["effective_model"])

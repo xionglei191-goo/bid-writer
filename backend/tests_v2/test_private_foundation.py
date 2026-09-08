@@ -190,7 +190,11 @@ class PrivateFoundationTest(unittest.TestCase):
         report = evidence.analyze_draft(run_id, draft_id, "本项目保证30天内完成全部施工。", [{"content": "项目应合理安排施工进度。"}])
         self.assertEqual(report["evidence_status"], "blocked")
         claim = evidence.list_claims(draft_id)[0]
-        resolved = evidence.resolve_claim(claim["id"], "confirm", "已与招标文件工期条款逐字核对")
+        resolved = evidence.resolve_claim(
+            claim["id"], "confirm", "已与招标文件工期条款逐字核对", reviewer="测试实际核验人",
+            target_hash=content_hash("本项目保证30天内完成全部施工。"),
+            project_source_hash=evidence.project_source_status(project_id)["current_project_source_hash"],
+        )
         self.assertEqual(resolved["evidence_status"], "supported")
 
     def test_postgres_baseline_is_portable_and_excludes_sqlite_fts(self) -> None:

@@ -36,6 +36,8 @@ async function workspace(page, options = {}) {
       return json(state.project);
     }
     if (path === "/api/projects/41/quality") return json(quality());
+    if (path === "/api/projects/41/workbench") return json({ project_id: 41, metrics: { mapped: 1, responded: 1, signed: state.finalized ? 1 : 0, total: 1, technical_total: 1 }, tasks: [] });
+    if (path === "/api/projects/41/requirements/workflow") return json({ project_id: 41, project_hash: "project-version-one", source_hash: "source-one", items: state.project.requirements.map((item) => ({ ...item, requirement_fingerprint: "requirement-one", planning_category: "technical", classification: { suggested_category: "technical", suggestion_reason: "包含工期参数", status: "pending" }, section_ids: [11] })), metrics: {}, blockers: [] });
     if (path === "/api/projects/41/deliveries") return json(state.deliveries);
     if (path === "/api/projects/41/preview") return json(preview());
     if (path === "/api/projects/41/final-review") {
@@ -173,7 +175,7 @@ test("preparation without drafts waits for the asynchronous result", async ({ pa
   await workspace(page, { noDraft: true });
   await page.getByRole("button", { name: "招标解析", exact: true }).click();
   await page.getByRole("button", { name: "重新解析", exact: true }).click();
-  await expect(page.getByText("异步解析完成：工期180天", { exact: true })).toBeVisible();
+  await expect(page.locator(".requirement-detail > p").first()).toHaveText("异步解析完成：工期180天");
   await page.getByRole("button", { name: "目录策略", exact: true }).click();
   await page.getByRole("button", { name: "生成目录", exact: true }).click();
   await expect(page.getByText("异步目录完成", { exact: true })).toBeVisible();

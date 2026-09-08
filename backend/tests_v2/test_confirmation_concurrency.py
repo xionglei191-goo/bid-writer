@@ -34,6 +34,7 @@ class ConfirmationConcurrencyTest(unittest.TestCase):
                 "INSERT INTO project_drafts(project_id,section_id,content,content_hash,evidence_status) VALUES (?,?,?,?,'not_applicable')",
                 (self.project_id, self.section_id, self.older, content_hash(self.older)),
             ).lastrowid)
+        self.production.evidence.refresh_project_evidence(self.project_id)
 
     def finalize(self) -> str:
         self.production.confirm_draft(self.draft_id, "陈工", target_hash=content_hash(self.older))

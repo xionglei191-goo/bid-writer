@@ -126,7 +126,12 @@ class TenderParsingTest(unittest.TestCase):
         self.assertIn("运土车辆封闭率", scores[3]["content"])
         self.assertIn("禁止使用国二及以下排放标准", scores[5]["content"])
         self.assertNotIn("投标报价", scores[-1]["content"])
-        self.assertFalse(any(item["content"] == "评分因素 参考评分标准" or "（总分 100分）" in item["content"] for item in requirements))
+        self.assertFalse(any(item["content"] == "评分因素 参考评分标准" for item in requirements))
+        headings = [item for item in requirements if "（总分 100分）" in item["content"]]
+        self.assertEqual(len(headings), 1)
+        self.assertEqual(headings[0]["classification"]["suggested_category"], "reference")
+        self.assertTrue(headings[0]["formal_technical"])
+        self.assertEqual(headings[0]["classification"]["status"], "pending")
 
     def test_numeric_terms_outside_score_tables_are_not_scores(self) -> None:
         requirements = self.parse("[第7页]\n5\n1.3.2 计划工期\n850 日历天。\n1.3.3 质量要求\n符合相关技术标准合格要求。")
@@ -233,7 +238,7 @@ class TenderParsingTest(unittest.TestCase):
         self.assertEqual(len(requirements), 2)
         self.assertTrue(all(item["source_page"] is None for item in requirements))
 
-    def test_reparse_and_outline_rebuild_refuse_to_delete_existing_signed_drafts(self) -> None:
+    def test_reparse_is_blocked_and_outline_supplement_preserves_existing_signed_drafts(self) -> None:
         original_requirements = self.parse("投标人必须编制施工方案。")
         outline = self.service.build_outline(self.project_id)
         section_id = outline["sections"][0]["id"]
@@ -243,13 +248,17 @@ class TenderParsingTest(unittest.TestCase):
                 "INSERT INTO project_drafts(project_id,section_id,content,content_hash,version_no) VALUES (?,?,?,?,1)",
                 (self.project_id, section_id, text, content_hash(text)),
             ).lastrowid)
+        run_id = self.service.evidence.create_generation_run(self.project_id, section_id, content_hash(text), "fixture", "1", "1", None, [])
+        self.service.evidence.analyze_draft(run_id, draft_id, text, [])
         self.service.confirm_draft(draft_id, "隔离测试责任人")
         before = self.service.get_project(self.project_id)
-        for suffix in ("requirements/parse", "outline"):
-            response = self.client.post(f"/api/projects/{self.project_id}/{suffix}")
-            self.assertEqual(response.status_code, 409, response.text)
+        response = self.client.post(f"/api/projects/{self.project_id}/requirements/parse")
+        self.assertEqual(response.status_code, 409, response.text)
+        supplemented = self.client.post(f"/api/projects/{self.project_id}/outline")
+        self.assertEqual(supplemented.status_code, 200, supplemented.text)
         after = self.service.get_project(self.project_id)
-        self.assertEqual(after["requirements"], original_requirements)
+        for key in ("id", "content", "source_page", "kind"):
+            self.assertEqual([item[key] for item in after["requirements"]], [item[key] for item in original_requirements])
         self.assertEqual(json.dumps(after["sections"], sort_keys=True), json.dumps(before["sections"], sort_keys=True))
         self.assertEqual(after["sections"][0]["draft"]["status"], "reviewed")
 
