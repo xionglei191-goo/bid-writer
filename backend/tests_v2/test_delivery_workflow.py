@@ -277,6 +277,20 @@ class DeliveryWorkflowTest(unittest.TestCase):
         self.assertEqual(self.production.evidence.metrics(self.project_id)["high_unsupported"], 0)
         self.assertTrue(self.production.quality_gate(self.project_id)["review_ready"])
 
+    def test_consistency_ignores_duration_spacing_and_goal_headings(self) -> None:
+        project = {"sections": [
+            {"draft": {"content": "工期：850 日历天。\n质量目标：**符合国家、省、市相关规范**。\n## 质量目标保证和控制措施\n日常检查。"}},
+            {"draft": {"content": "总工期为850日历天。\n**质量目标**：符合国家、省、市相关规范。\n## 安全目标保证措施\n安全目标：杜绝死亡。"}},
+        ]}
+        self.assertFalse(any(item["key"].startswith("conflict_") for item in self.production._consistency_issues(project)))
+
+    def test_consistency_still_flags_different_declared_targets(self) -> None:
+        project = {"sections": [
+            {"draft": {"content": "工期80天。质量目标：合格。安全目标：杜绝死亡。"}},
+            {"draft": {"content": "工期100天。质量目标为优良。安全目标为减少事故。"}},
+        ]}
+        self.assertEqual({item["key"] for item in self.production._consistency_issues(project)}, {"conflict_工期", "conflict_质量目标", "conflict_安全目标"})
+
     def test_review_package_record_and_download_refer_to_zip(self) -> None:
         # PDF conversion itself is exercised by the existing pilot; this test
         # isolates the package/record/download contract from the external tool.

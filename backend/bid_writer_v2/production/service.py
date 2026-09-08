@@ -1106,14 +1106,16 @@ class ProductionService:
     def _consistency_issues(project: dict[str, Any]) -> list[dict[str, str]]:
         issues: list[dict[str, str]] = []
         drafts = [section["draft"] for section in project["sections"] if section.get("draft")]
-        combined = "\n".join(draft["content"] for draft in drafts)
+        combined = re.sub(r"[*_`]", "", "\n".join(draft["content"] for draft in drafts))
         label_patterns = {
             "工期": r"工期.{0,12}?(\d+\s*(?:天|日历天))",
-            "质量目标": r"质量目标.{0,12}?([^，。；\n]{2,20})",
-            "安全目标": r"安全目标.{0,12}?([^，。；\n]{2,20})",
+            "质量目标": r"质量目标[ \t]*(?:[:：]|为|是)[ \t]*([^，。；\n]{2,40})",
+            "安全目标": r"安全目标[ \t]*(?:[:：]|为|是)[ \t]*([^，。；\n]{2,40})",
         }
         for label, pattern in label_patterns.items():
             values = {normalize_text(value) for value in re.findall(pattern, combined, flags=re.IGNORECASE)}
+            if label == "工期":
+                values = {re.sub(r"\s+", "", value) for value in values}
             if len(values) > 1:
                 issues.append({"key": f"conflict_{label}", "title": f"{label}存在冲突", "detail": "、".join(sorted(values))[:300]})
         normalized = [set(re.findall(r"[\u4e00-\u9fff]{2,4}", draft["content"])) for draft in drafts]
