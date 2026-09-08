@@ -50,8 +50,17 @@ from .docx_visual_qa import run_docx_visual_qa
 from .draft_versions import list_draft_versions, restore_draft_version
 from .draft_polish import apply_replacement, list_replacement_records, preview_replacement, scan_project_polish
 from .enterprise_profiles import get_enterprise_profile, update_enterprise_profile
-from .exporter import export_client_docx, export_client_package, export_docx, export_markdown, export_package
-from .formal_export_gate import require_formal_export_ready
+from .exporter import (
+    export_client_docx,
+    export_client_package,
+    export_docx,
+    export_markdown,
+    export_package,
+    export_review_docx,
+    export_review_package,
+    export_review_pdf,
+)
+from .formal_export_gate import require_formal_export_ready, require_review_export_ready
 from .final_checklist import build_final_checklist, update_final_check_item
 from .final_document import build_final_document, update_final_document
 from .feedback import create_feedback_item, list_feedback_items, update_feedback_item
@@ -1601,9 +1610,17 @@ def api_review(tender_id: int) -> list[dict[str, Any]]:
 
 @app.post("/api/tenders/{tender_id}/export")
 def api_export(tender_id: int, payload: ExportRequest) -> dict[str, Any]:
+    if payload.format in {"review_docx", "review_pdf", "review_package"}:
+        require_review_export_ready(tender_id)
     if payload.format in {"formal_docx", "docx", "client_package", "client_zip"}:
         require_formal_export_ready(tender_id)
-    if payload.format in {"client_package", "client_zip"}:
+    if payload.format == "review_docx":
+        result = export_review_docx(tender_id)
+    elif payload.format == "review_pdf":
+        result = export_review_pdf(tender_id)
+    elif payload.format == "review_package":
+        result = export_review_package(tender_id)
+    elif payload.format in {"client_package", "client_zip"}:
         result = export_client_package(tender_id)
     elif payload.format in {"internal_package", "package", "zip"}:
         result = export_package(tender_id)

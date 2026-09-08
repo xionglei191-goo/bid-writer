@@ -40,3 +40,23 @@ def require_formal_export_ready(tender_id: int) -> dict[str, Any]:
     if not status["ready"]:
         raise ValueError("正式导出未解锁：" + "；".join(status["blockers"]))
     return status
+
+
+def review_export_status(tender_id: int) -> dict[str, Any]:
+    acceptance = build_acceptance_status(tender_id)
+    blockers = [str(item.get("detail") or item.get("title") or "送审门禁未通过") for item in acceptance.get("review_blockers") or []]
+    return {
+        "tender_id": tender_id,
+        "ready": bool(acceptance.get("review_ready")) and not blockers,
+        "blockers": blockers,
+        "acceptance": acceptance,
+    }
+
+
+def require_review_export_ready(tender_id: int) -> dict[str, Any]:
+    status = review_export_status(tender_id)
+    if os.environ.get("BID_WRITER_TEST_BYPASS_FORMAL_GATE") == "1":
+        return {**status, "ready": True, "test_bypass": True}
+    if not status["ready"]:
+        raise ValueError("送审导出未解锁：" + "；".join(status["blockers"]))
+    return status

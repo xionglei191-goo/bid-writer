@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 import zipfile
+from xml.etree import ElementTree
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,8 +36,11 @@ def parse_document(path: Path, source_id: int, settings: Settings) -> ParsedDocu
     if extension == ".pdf":
         return _parse_pdf(path)
     if extension == ".doc":
-        converted = _convert_doc(path, settings.cache_root / "doc_conversion" / str(source_id))
-        return _parse_docx(converted, source_id, settings)
+        try:
+            converted = _convert_doc(path, settings.cache_root / "doc_conversion" / str(source_id))
+            return _parse_docx(converted, source_id, settings)
+        except (RuntimeError, subprocess.SubprocessError):
+            return _parse_legacy_doc_text(path)
     if extension in {".md", ".txt"}:
         text = path.read_text(encoding="utf-8", errors="ignore")
         return ParsedDocument(path.stem, normalize_text(text), "plain_text", 0)
@@ -44,29 +48,37 @@ def parse_document(path: Path, source_id: int, settings: Settings) -> ParsedDocu
 
 
 def _parse_docx(path: Path, source_id: int, settings: Settings) -> ParsedDocument:
-    document = Document(path)
     blocks: list[str] = [f"# {path.stem}"]
-    for paragraph in document.paragraphs:
-        text = normalize_text(paragraph.text)
-        if not text:
-            continue
-        style = (paragraph.style.name if paragraph.style else "").lower()
-        match = re.search(r"heading\s*(\d+)", style)
-        if match:
-            level = max(1, min(int(match.group(1)), 6))
-            blocks.append(f"{'#' * level} {text}")
-        else:
-            blocks.append(text)
-    for table_index, table in enumerate(document.tables, 1):
-        rows = [[normalize_text(cell.text).replace("|", "\\|") for cell in row.cells] for row in table.rows]
-        if not rows:
-            continue
-        width = max(len(row) for row in rows)
-        rows = [row + [""] * (width - len(row)) for row in rows]
-        blocks.append(f"## 表格 {table_index}")
-        blocks.append("| " + " | ".join(rows[0]) + " |")
-        blocks.append("| " + " | ".join(["---"] * width) + " |")
-        blocks.extend("| " + " | ".join(row) + " |" for row in rows[1:])
+    try:
+        document = Document(path)
+        for paragraph in document.paragraphs:
+            text = normalize_text(paragraph.text)
+            if not text:
+                continue
+            style = (paragraph.style.name if paragraph.style else "").lower()
+            match = re.search(r"heading\s*(\d+)", style)
+            if match:
+                level = max(1, min(int(match.group(1)), 6))
+                blocks.append(f"{'#' * level} {text}")
+            else:
+                blocks.append(text)
+        for table_index, table in enumerate(document.tables, 1):
+            rows = [[normalize_text(cell.text).replace("|", "\\|") for cell in row.cells] for row in table.rows]
+            if not rows:
+                continue
+            width = max(len(row) for row in rows)
+            rows = [row + [""] * (width - len(row)) for row in rows]
+            blocks.append(f"## 表格 {table_index}")
+            blocks.append("| " + " | ".join(rows[0]) + " |")
+            blocks.append("| " + " | ".join(["---"] * width) + " |")
+            blocks.extend("| " + " | ".join(row) + " |" for row in rows[1:])
+    except (KeyError, ValueError) as exc:
+        # Some legacy Word files contain a broken relationship whose target is
+        # literally "NULL".  The main document XML is still usable and is read
+        # directly so that one bad embedded object does not discard the text.
+        if "NULL" not in str(exc) and "grid_offset" not in str(exc):
+            raise
+        blocks.extend(_parse_docx_xml_fallback(path))
 
     asset_dir = settings.knowledge_directories["assets"] / "导入图片" / str(source_id)
     with zipfile.ZipFile(path) as archive:
@@ -78,6 +90,57 @@ def _parse_docx(path: Path, source_id: int, settings: Settings) -> ParsedDocumen
             destination.write_bytes(archive.read(name))
             blocks.append(f"![原文图片{index}]({destination.as_posix()})")
     return ParsedDocument(path.stem, normalize_text("\n\n".join(blocks)), "python-docx", 0)
+
+
+def _parse_legacy_doc_text(path: Path) -> ParsedDocument:
+    antiword = shutil.which("antiword")
+    if not antiword:
+        raise RuntimeError("无法转换DOC且antiword文本回退不可用")
+    result = subprocess.run(
+        [antiword, "-m", "UTF-8.txt", str(path)],
+        check=True,
+        capture_output=True,
+        timeout=600,
+    )
+    text = normalize_text(result.stdout.decode("utf-8", errors="replace"))
+    if len(re.sub(r"\s+", "", text)) < 20:
+        raise RuntimeError("DOC文本回退未提取到足够正文")
+    return ParsedDocument(path.stem, f"# {path.stem}\n\n{text}", "antiword", 0)
+
+
+def _parse_docx_xml_fallback(path: Path) -> list[str]:
+    namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    with zipfile.ZipFile(path) as archive:
+        root = ElementTree.fromstring(archive.read("word/document.xml"))
+    blocks: list[str] = []
+    body = root.find(f"{namespace}body")
+    if body is None:
+        return blocks
+    table_index = 0
+    for child in body:
+        if child.tag == f"{namespace}p":
+            text = normalize_text("".join(node.text or "" for node in child.iter(f"{namespace}t")))
+            if text:
+                blocks.append(text)
+        elif child.tag == f"{namespace}tbl":
+            rows: list[list[str]] = []
+            for row in child.findall(f"{namespace}tr"):
+                values = []
+                for cell in row.findall(f"{namespace}tc"):
+                    values.append(normalize_text("".join(node.text or "" for node in cell.iter(f"{namespace}t"))).replace("|", "\\|"))
+                if values:
+                    rows.append(values)
+            if rows:
+                table_index += 1
+                width = max(len(row) for row in rows)
+                rows = [row + [""] * (width - len(row)) for row in rows]
+                blocks.extend([
+                    f"## 表格 {table_index}",
+                    "| " + " | ".join(rows[0]) + " |",
+                    "| " + " | ".join(["---"] * width) + " |",
+                    *("| " + " | ".join(row) + " |" for row in rows[1:]),
+                ])
+    return blocks
 
 
 def _parse_pdf(path: Path) -> ParsedDocument:
@@ -96,11 +159,22 @@ def _convert_doc(path: Path, target_dir: Path) -> Path:
     target_dir.mkdir(parents=True, exist_ok=True)
     libreoffice = shutil.which("soffice") or shutil.which("libreoffice")
     if libreoffice:
+        profile_dir = target_dir / "libreoffice_profile"
+        profile_dir.mkdir(parents=True, exist_ok=True)
         subprocess.run(
-            [libreoffice, "--headless", "--convert-to", "docx", "--outdir", str(target_dir), str(path)],
+            [
+                libreoffice,
+                f"-env:UserInstallation={profile_dir.resolve().as_uri()}",
+                "--headless",
+                "--convert-to",
+                "docx",
+                "--outdir",
+                str(target_dir),
+                str(path),
+            ],
             check=True,
             capture_output=True,
-            timeout=180,
+            timeout=600,
         )
         output = target_dir / f"{path.stem}.docx"
         if output.exists():

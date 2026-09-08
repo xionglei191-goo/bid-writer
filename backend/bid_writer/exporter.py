@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import sqlite3
+import subprocess
 import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .bid_strategy import get_bid_strategy, render_bid_strategy_markdown
+from .artifact_audit import audit_docx_path, audit_zip_path
 from .case_assets import list_case_assets, render_case_assets_markdown
 from .closure_confirmation import build_closure_confirmation
 from .communications import list_communications, render_communications_markdown
@@ -391,9 +394,94 @@ def export_client_docx(tender_id: int, conn: sqlite3.Connection | None = None) -
     audit = save_docx_audit(tender_id, audit, build_preflight_signature(tender_id, final_hash, conn))
     if not audit["ready"]:
         raise ValueError("客户DOCX结构审计未通过：" + "；".join(audit["blockers"]))
+    artifact_audit = audit_docx_path(path)
+    if not artifact_audit["ready"]:
+        raise ValueError("客户DOCX最终产物审计未通过")
     if own_conn:
         conn.close()
-    return {"path": str(path), "format": "client_docx", "layout_audit": audit}
+    return {"path": str(path), "format": "client_docx", "layout_audit": audit, "artifact_audit": artifact_audit}
+
+
+def export_review_docx(tender_id: int, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
+    own_conn = conn is None
+    conn = conn or connect()
+    tender = row_to_dict(conn.execute("SELECT * FROM tenders WHERE id = ?", (tender_id,)).fetchone())
+    if not tender:
+        raise ValueError(f"Tender not found: {tender_id}")
+    generated = export_client_docx(tender_id, conn=conn)
+    source = Path(generated["path"])
+    path = EXPORT_DIR / f"{_safe_name(tender['name'])}_{tender_id}_送审版.docx"
+    shutil.copy2(source, path)
+    artifact_audit = audit_docx_path(path)
+    if not artifact_audit["ready"]:
+        raise ValueError("送审DOCX最终产物审计未通过")
+    result = {"path": str(path), "format": "review_docx", "layout_audit": generated.get("layout_audit") or {}, "artifact_audit": artifact_audit}
+    if own_conn:
+        conn.close()
+    return result
+
+
+def _convert_review_pdf(docx_path: Path) -> Path:
+    executable = shutil.which("libreoffice") or shutil.which("soffice")
+    windows_soffice = Path("C:/Program Files/LibreOffice/program/soffice.exe")
+    if not executable and windows_soffice.exists():
+        executable = str(windows_soffice)
+    if not executable:
+        raise ValueError("未安装LibreOffice，无法生成送审PDF")
+    result = subprocess.run(
+        [executable, "--headless", "--convert-to", "pdf", "--outdir", str(docx_path.parent), str(docx_path)],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    pdf_path = docx_path.with_suffix(".pdf")
+    if result.returncode or not pdf_path.is_file() or not pdf_path.stat().st_size:
+        raise ValueError("LibreOffice生成送审PDF失败")
+    return pdf_path
+
+
+def export_review_pdf(tender_id: int, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
+    own_conn = conn is None
+    conn = conn or connect()
+    docx_file = export_review_docx(tender_id, conn=conn)
+    path = _convert_review_pdf(Path(docx_file["path"]))
+    result = {"path": str(path), "format": "review_pdf", "source_docx": docx_file["path"], "artifact_audit": docx_file["artifact_audit"]}
+    if own_conn:
+        conn.close()
+    return result
+
+
+def export_review_package(tender_id: int, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
+    own_conn = conn is None
+    conn = conn or connect()
+    tender = row_to_dict(conn.execute("SELECT * FROM tenders WHERE id = ?", (tender_id,)).fetchone())
+    if not tender:
+        raise ValueError(f"Tender not found: {tender_id}")
+    pdf_file = export_review_pdf(tender_id, conn=conn)
+    docx_path = Path(pdf_file["source_docx"])
+    pdf_path = Path(pdf_file["path"])
+    package_path = EXPORT_DIR / f"{_safe_name(tender['name'])}_{tender_id}_送审包.zip"
+    note = "# 送审说明\n\n本包用于专业送审。正式投标前须补齐真实投标单位、专业复核人、合规确认、签章及人工定稿。\n"
+    names = [docx_path.name, pdf_path.name, "送审说明.md", "文件清单.txt"]
+    with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.write(docx_path, docx_path.name)
+        archive.write(pdf_path, pdf_path.name)
+        archive.writestr("送审说明.md", note)
+        archive.writestr("文件清单.txt", "\n".join(names) + "\n")
+    package_audit = audit_zip_path(package_path, allowed_names=set(names), require_review_package_types=True)
+    if not package_audit["ready"]:
+        raise ValueError("送审包最终产物审计未通过")
+    result = {
+        "path": str(package_path),
+        "format": "review_package",
+        "components": {"docx": str(docx_path), "pdf": str(pdf_path), "customer_note": "送审说明.md", "file_list": "文件清单.txt"},
+        "artifact_audit": package_audit,
+    }
+    result["delivery_record"] = record_delivery_export(tender_id, result, conn=conn)
+    if own_conn:
+        conn.close()
+    return result
 
 
 def render_client_delivery_note(tender_id: int, package_name: str = "", conn: sqlite3.Connection | None = None) -> str:
@@ -486,6 +574,11 @@ def export_client_package(tender_id: int, conn: sqlite3.Connection | None = None
         archive.writestr("客户发货说明.md", note)
         archive.writestr("客户文件清单.txt", file_list)
         archive.writestr("README.txt", readme)
+    package_names = {"技术标初稿_客户版.docx", "技术标初稿_客户版.md", "客户发货说明.md", "客户文件清单.txt", "README.txt"}
+    artifact_audit = audit_zip_path(package_path, allowed_names=package_names)
+    if not artifact_audit["ready"]:
+        raise ValueError("客户发货包最终产物审计未通过")
+    result["artifact_audit"] = artifact_audit
     result["delivery_record"] = record_delivery_export(tender_id, result, conn=conn)
     if own_conn:
         conn.close()

@@ -1,0 +1,183 @@
+name: bid-writer
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-bid_writer}
+      POSTGRES_USER: ${POSTGRES_USER:-bid_writer}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bid_writer} -d ${POSTGRES_DB:-bid_writer}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:${QDRANT_VERSION:-v1.13.4}
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  minio:
+    image: quay.io/minio/minio:${MINIO_VERSION:-latest}
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-bidwriter}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  embedding:
+    build:
+      context: .
+      dockerfile: Dockerfile.embedding
+    environment:
+      BID_WRITER_EMBEDDING_MODEL: ${BID_WRITER_EMBEDDING_MODEL:-BAAI/bge-m3}
+      BID_WRITER_RERANKER_MODEL: ${BID_WRITER_RERANKER_MODEL:-BAAI/bge-reranker-v2-m3}
+      BID_WRITER_EMBEDDING_DEVICE: ${BID_WRITER_EMBEDDING_DEVICE:-auto}
+      BID_WRITER_EMBEDDING_FP16: ${BID_WRITER_EMBEDDING_FP16:-1}
+      BID_WRITER_EMBEDDING_BATCH_SIZE: ${BID_WRITER_EMBEDDING_BATCH_SIZE:-4}
+      BID_WRITER_EMBEDDING_CONCURRENCY: ${BID_WRITER_EMBEDDING_CONCURRENCY:-2}
+      BID_WRITER_EMBEDDING_MAX_CHARS: ${BID_WRITER_EMBEDDING_MAX_CHARS:-4000}
+      BID_WRITER_EMBEDDING_CHUNK_OVERLAP: ${BID_WRITER_EMBEDDING_CHUNK_OVERLAP:-300}
+      BID_WRITER_RERANK_BATCH_SIZE: ${BID_WRITER_RERANK_BATCH_SIZE:-8}
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
+    volumes:
+      - model_cache:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 1800s
+    restart: unless-stopped
+
+  app:
+    image: bid-writer-app:latest
+    build: .
+    entrypoint: []
+    command: ["uvicorn", "bid_writer_v2.app:app", "--host", "0.0.0.0", "--port", "8765"]
+    env_file: .env
+    environment: &app-environment
+      BID_WRITER_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-bid_writer}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-bid_writer}
+      BID_WRITER_REDIS_URL: redis://redis:6379/0
+      BID_WRITER_QDRANT_URL: http://qdrant:6333
+      BID_WRITER_MINIO_ENDPOINT: minio:9000
+      BID_WRITER_MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-bidwriter}
+      BID_WRITER_MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      BID_WRITER_MINIO_BUCKET: ${BID_WRITER_MINIO_BUCKET:-bid-writer}
+      BID_WRITER_EMBEDDING_URL: http://embedding:8090
+      BID_WRITER_AUTH_ENABLED: "1"
+      BID_WRITER_BACKGROUND_JOBS: "1"
+      BID_WRITER_AUTO_PUBLISH_LOW_RISK: ${BID_WRITER_AUTO_PUBLISH_LOW_RISK:-1}
+      BID_WRITER_WORKSPACE: /workspace
+      BID_WRITER_APP_ROOT: /app
+      BID_WRITER_RAW: /workspace/raw
+      BID_WRITER_KNOWLEDGE: /workspace/knowledge
+      BID_WRITER_DELIVERY: /workspace/delivery
+      BID_WRITER_DATA: /workspace/data
+      BID_WRITER_CODEX_AUTH_FILE: /run/secrets/codex-auth.json
+    volumes:
+      - ${BID_WRITER_RAW_HOST:-./sample-data/raw}:/workspace/raw:ro
+      - ${BID_WRITER_KNOWLEDGE_HOST:-./runtime/knowledge}:/workspace/knowledge
+      - ${BID_WRITER_DELIVERY_HOST:-./runtime/delivery}:/workspace/delivery
+      - ${BID_WRITER_CODEX_AUTH_HOST:-C:/Users/Administrator/.pi/agent/auth.json}:/run/secrets/codex-auth.json:ro
+      - app_data:/workspace/data
+    ports:
+      - "${BID_WRITER_PORT:-8876}:8765"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      qdrant: { condition: service_healthy }
+      minio: { condition: service_healthy }
+      embedding: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8765/api/health/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  worker:
+    image: bid-writer-app:latest
+    entrypoint: []
+    env_file: .env
+    environment: *app-environment
+    command: ["dramatiq", "bid_writer_v2.worker", "--processes", "1", "--threads", "40"]
+    volumes:
+      - ${BID_WRITER_RAW_HOST:-./sample-data/raw}:/workspace/raw:ro
+      - ${BID_WRITER_KNOWLEDGE_HOST:-./runtime/knowledge}:/workspace/knowledge
+      - ${BID_WRITER_DELIVERY_HOST:-./runtime/delivery}:/workspace/delivery
+      - ${BID_WRITER_CODEX_AUTH_HOST:-C:/Users/Administrator/.pi/agent/auth.json}:/run/secrets/codex-auth.json:ro
+      - app_data:/workspace/data
+    depends_on:
+      app: { condition: service_healthy }
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:${PROMETHEUS_VERSION:-v3.1.0}
+    profiles: ["monitoring"]
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:${GRAFANA_VERSION:-11.4.0}
+    profiles: ["monitoring"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change-this-password}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    depends_on: [prometheus]
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  minio_data:
+  model_cache:
+  app_data:
+  prometheus_data:
+  grafana_data:

@@ -20,6 +20,10 @@ def content_hash(value: str) -> str:
 
 
 def normalize_text(value: str) -> str:
+    # PostgreSQL rejects NUL bytes and Office/PDF extractors occasionally emit
+    # other C0 controls.  Keep the three legal whitespace controls only.
+    value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", value)
+    value = re.sub(r"[\ud800-\udfff]", "�", value)
     value = value.replace("\r\n", "\n").replace("\r", "\n")
     value = re.sub(r"[ \t]+", " ", value)
     value = re.sub(r"\n{3,}", "\n\n", value)
@@ -69,3 +73,28 @@ def parse_json(value: str | None, default: Any) -> Any:
         return json.loads(value)
     except json.JSONDecodeError:
         return default
+
+
+def public_payload(value: Any) -> Any:
+    """Remove secrets and host filesystem paths from API-facing payloads."""
+    hidden = {
+        "absolute_path",
+        "file_path",
+        "local_mirror_path",
+        "markdown_path",
+        "password_hash",
+        "token_hash",
+        "code_verifier",
+    }
+    if isinstance(value, list):
+        return [public_payload(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        if key in hidden:
+            if key.endswith("path") and item:
+                result[f"{key}_name"] = Path(str(item)).name
+            continue
+        result[key] = public_payload(item)
+    return result

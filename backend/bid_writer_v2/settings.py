@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 APP_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_WORKSPACE_ROOT = APP_ROOT.parents[1]
+DEFAULT_WORKSPACE_ROOT = APP_ROOT.parents[1] if len(APP_ROOT.parents) > 1 else APP_ROOT.parent
 
 
 @dataclass(frozen=True)
@@ -23,6 +23,38 @@ class Settings:
     export_root: Path
     qa_root: Path
     operations_enabled: bool
+    database_url: str = ""
+    redis_url: str = ""
+    qdrant_url: str = ""
+    minio_endpoint: str = ""
+    minio_access_key: str = ""
+    minio_secret_key: str = ""
+    minio_secure: bool = False
+    minio_bucket: str = "bid-writer"
+    auth_enabled: bool = False
+    session_secret: str = ""
+    bootstrap_admin: str = "admin"
+    bootstrap_password: str = ""
+    oidc_issuer: str = ""
+    oidc_client_id: str = ""
+    oidc_client_secret: str = ""
+    oidc_redirect_uri: str = ""
+    embedding_model: str = "BAAI/bge-m3"
+    reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    reranker_min_score: float = 0.25
+    embedding_device: str = "auto"
+    embedding_url: str = ""
+    embedding_request_batch_size: int = 64
+    embedding_timeout_seconds: float = 300.0
+    background_jobs_enabled: bool = False
+    corpus_reconcile_seconds: float = 30.0
+    auto_publish_low_risk: bool = False
+    ocr_job_url: str = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
+    ocr_model: str = "PaddleOCR-VL-1.5"
+    ocr_token_env: str = "PADDLEOCR_TOKEN"
+    ocr_chunk_pages: int = 20
+    ocr_poll_interval_seconds: float = 5.0
+    ocr_max_polls: int = 720
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -43,6 +75,38 @@ class Settings:
             export_root=Path(os.environ.get("BID_WRITER_EXPORT", delivery_root / "\u9879\u76ee\u4ea4\u4ed8")).resolve(),
             qa_root=Path(os.environ.get("BID_WRITER_QA", delivery_root / "\u8d28\u91cf\u9a8c\u6536")).resolve(),
             operations_enabled=os.environ.get("BID_WRITER_ENABLE_OPERATIONS", "0") == "1",
+            database_url=os.environ.get("BID_WRITER_DATABASE_URL", "").strip(),
+            redis_url=os.environ.get("BID_WRITER_REDIS_URL", "").strip(),
+            qdrant_url=os.environ.get("BID_WRITER_QDRANT_URL", "").strip(),
+            minio_endpoint=os.environ.get("BID_WRITER_MINIO_ENDPOINT", "").strip(),
+            minio_access_key=os.environ.get("BID_WRITER_MINIO_ACCESS_KEY", "").strip(),
+            minio_secret_key=os.environ.get("BID_WRITER_MINIO_SECRET_KEY", "").strip(),
+            minio_secure=os.environ.get("BID_WRITER_MINIO_SECURE", "0") == "1",
+            minio_bucket=os.environ.get("BID_WRITER_MINIO_BUCKET", "bid-writer").strip() or "bid-writer",
+            auth_enabled=os.environ.get("BID_WRITER_AUTH_ENABLED", "0") == "1",
+            session_secret=os.environ.get("BID_WRITER_SESSION_SECRET", "").strip(),
+            bootstrap_admin=os.environ.get("BID_WRITER_BOOTSTRAP_ADMIN", "admin").strip() or "admin",
+            bootstrap_password=os.environ.get("BID_WRITER_BOOTSTRAP_PASSWORD", "").strip(),
+            oidc_issuer=os.environ.get("BID_WRITER_OIDC_ISSUER", "").strip(),
+            oidc_client_id=os.environ.get("BID_WRITER_OIDC_CLIENT_ID", "").strip(),
+            oidc_client_secret=os.environ.get("BID_WRITER_OIDC_CLIENT_SECRET", "").strip(),
+            oidc_redirect_uri=os.environ.get("BID_WRITER_OIDC_REDIRECT_URI", "").strip(),
+            embedding_model=os.environ.get("BID_WRITER_EMBEDDING_MODEL", "BAAI/bge-m3").strip(),
+            reranker_model=os.environ.get("BID_WRITER_RERANKER_MODEL", "BAAI/bge-reranker-v2-m3").strip(),
+            reranker_min_score=max(0.0, min(1.0, float(os.environ.get("BID_WRITER_RERANK_MIN_SCORE", "0.25")))),
+            embedding_device=os.environ.get("BID_WRITER_EMBEDDING_DEVICE", "auto").strip(),
+            embedding_url=os.environ.get("BID_WRITER_EMBEDDING_URL", "").strip().rstrip("/"),
+            embedding_request_batch_size=max(1, min(128, int(os.environ.get("BID_WRITER_EMBEDDING_REQUEST_BATCH_SIZE", "64")))),
+            embedding_timeout_seconds=max(30.0, float(os.environ.get("BID_WRITER_EMBEDDING_TIMEOUT_SECONDS", "300"))),
+            background_jobs_enabled=os.environ.get("BID_WRITER_BACKGROUND_JOBS", "0") == "1",
+            corpus_reconcile_seconds=max(5.0, float(os.environ.get("BID_WRITER_CORPUS_RECONCILE_SECONDS", "30"))),
+            auto_publish_low_risk=os.environ.get("BID_WRITER_AUTO_PUBLISH_LOW_RISK", "0") == "1",
+            ocr_job_url=(os.environ.get("BID_WRITER_OCR_URL") or os.environ.get("PADDLEOCR_JOB_URL") or "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs").rstrip("/"),
+            ocr_model=os.environ.get("BID_WRITER_OCR_MODEL") or os.environ.get("PADDLEOCR_MODEL") or "PaddleOCR-VL-1.5",
+            ocr_token_env=os.environ.get("BID_WRITER_OCR_TOKEN_ENV", "PADDLEOCR_TOKEN"),
+            ocr_chunk_pages=max(1, int(os.environ.get("BID_WRITER_OCR_CHUNK_PAGES", "20"))),
+            ocr_poll_interval_seconds=max(0.1, float(os.environ.get("BID_WRITER_OCR_POLL_SECONDS", "5"))),
+            ocr_max_polls=max(1, int(os.environ.get("BID_WRITER_OCR_MAX_POLLS", "720"))),
         )
 
     def ensure_directories(self) -> None:

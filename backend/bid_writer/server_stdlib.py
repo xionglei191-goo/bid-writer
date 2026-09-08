@@ -51,8 +51,17 @@ from .docx_visual_qa import run_docx_visual_qa
 from .draft_versions import list_draft_versions, restore_draft_version
 from .draft_polish import apply_replacement, list_replacement_records, preview_replacement, scan_project_polish
 from .enterprise_profiles import get_enterprise_profile, update_enterprise_profile
-from .exporter import export_client_docx, export_client_package, export_docx, export_markdown, export_package
-from .formal_export_gate import require_formal_export_ready
+from .exporter import (
+    export_client_docx,
+    export_client_package,
+    export_docx,
+    export_markdown,
+    export_package,
+    export_review_docx,
+    export_review_package,
+    export_review_pdf,
+)
+from .formal_export_gate import require_formal_export_ready, require_review_export_ready
 from .final_checklist import build_final_checklist, update_final_check_item
 from .final_document import build_final_document, update_final_document
 from .feedback import create_feedback_item, list_feedback_items, update_feedback_item
@@ -1046,9 +1055,17 @@ class BidWriterHandler(BaseHTTPRequestHandler):
             if match:
                 tender_id = int(match.group(1))
                 export_format = payload.get("format")
+                if export_format in {"review_docx", "review_pdf", "review_package"}:
+                    require_review_export_ready(tender_id)
                 if export_format in {"formal_docx", "docx", "client_package", "client_zip"}:
                     require_formal_export_ready(tender_id)
-                if export_format in {"client_package", "client_zip"}:
+                if export_format == "review_docx":
+                    result = export_review_docx(tender_id)
+                elif export_format == "review_pdf":
+                    result = export_review_pdf(tender_id)
+                elif export_format == "review_package":
+                    result = export_review_package(tender_id)
+                elif export_format in {"client_package", "client_zip"}:
                     result = export_client_package(tender_id)
                 elif export_format in {"internal_package", "package", "zip"}:
                     result = export_package(tender_id)
@@ -1143,7 +1160,7 @@ class BidWriterHandler(BaseHTTPRequestHandler):
         _log(f"[server] {self.address_string()} {format % args}")
 
 
-def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
+def serve(host: str = "127.0.0.1", port: int = 8876) -> None:
     conn = connect()
     init_db(conn)
     conn.close()
@@ -1155,7 +1172,7 @@ def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Serve the local bid writer workspace.")
     parser.add_argument("--host", default=os.environ.get("BID_WRITER_HOST", "127.0.0.1"))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("BID_WRITER_PORT", "8765")))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("BID_WRITER_PORT", "8876")))
     args = parser.parse_args(argv)
     serve(host=args.host, port=args.port)
     return 0

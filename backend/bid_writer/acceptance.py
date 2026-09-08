@@ -7,8 +7,10 @@ from pathlib import Path
 from typing import Any
 
 from .db import connect, row_to_dict, rows_to_dicts
+from .artifact_audit import audit_text
 from .document_settings import get_document_settings
 from .docx_audit import build_preflight_signature, load_docx_audit
+from .enterprise_profiles import get_enterprise_profile
 from .final_document import build_final_document
 from .project_profiles import get_project_profile
 from .response_matrix import build_response_matrix
@@ -41,6 +43,7 @@ def build_acceptance_status(tender_id: int, conn: sqlite3.Connection | None = No
     final_document = build_final_document(tender_id, conn=conn)
     confirmations = list_workflow_confirmations(tender_id, conn=conn)["items"]
     profile = get_project_profile(tender_id, conn=conn)
+    enterprise = get_enterprise_profile(conn=conn)
     settings = get_document_settings(tender_id, conn=conn)
     task = row_to_dict(conn.execute("SELECT * FROM production_tasks WHERE tender_id = ?", (tender_id,)).fetchone()) or {}
     drafts = rows_to_dicts(conn.execute("SELECT id, section_title, content, generation_mode, generation_error FROM drafts WHERE tender_id = ?", (tender_id,)).fetchall())
@@ -52,7 +55,8 @@ def build_acceptance_status(tender_id: int, conn: sqlite3.Connection | None = No
     docx_audit = load_docx_audit(tender_id)
     preflight_signature = build_preflight_signature(tender_id, str(final_summary.get("hash") or ""), conn)
     visual_render = (docx_audit or {}).get("visual_render") or {}
-    placeholders = sum(str(row.get("content") or "").count("【待确认") for row in drafts)
+    artifact_audit = audit_text(str(final_document.get("content") or ""), source="assembled_markdown")
+    placeholders = int((artifact_audit.get("counts") or {}).get("placeholder") or 0)
     generation_errors = [row for row in drafts if row.get("generation_error") or row.get("generation_mode") != "llm"]
     missing_profile = [field for field in PROFILE_REQUIRED_FIELDS if profile.get(field) in {None, ""}]
     compliance = [row for row in requirements if row.get("response_scope") == "compliance" and int(row.get("applicable", 1))]
@@ -67,6 +71,9 @@ def build_acceptance_status(tender_id: int, conn: sqlite3.Connection | None = No
     missing_task = [label for field, label in (("customer_name", "客户名称"), ("deadline", "交付期限")) if not task.get(field)]
     if missing_task:
         block("delivery_facts", "交付信息未补齐", "仍缺少：" + "、".join(missing_task), "overview")
+    bidder_name = str(enterprise.get("bidder_name") or "").strip()
+    if not bidder_name or not audit_text(bidder_name, source="bidder_name").get("ready"):
+        block("bidder_identity", "未登记真实投标单位", "正式交付必须登记真实投标单位，默认或测试单位不能通过门禁。", "delivery")
     if int(matrix_summary.get("verified_scoring_requirements") or 0) < int(matrix_summary.get("scoring_requirements") or 0):
         block("scoring", "评分点未完全响应", "所有评分点必须具有有效正文证据。", "outline")
     if int(matrix_summary.get("verified_high_requirements") or 0) < int(matrix_summary.get("high_requirements") or 0):
@@ -77,6 +84,10 @@ def build_acceptance_status(tender_id: int, conn: sqlite3.Connection | None = No
         block("compliance", "合规清单未确认", f"已确认 {len(compliance_confirmed)}/{len(compliance)} 条。", "review")
     if placeholders:
         block("placeholders", "存在待确认字段", f"正文仍有 {placeholders} 个待确认字段。", "editor")
+    if not artifact_audit.get("ready"):
+        counts = artifact_audit.get("counts") or {}
+        detail = "、".join(f"{key}={value}" for key, value in counts.items() if value)
+        block("artifact_audit", "最终产物审计未通过", detail or "发现禁止内容。", "delivery")
     if generation_errors:
         block("generation", "存在非正式生成章节", f"有 {len(generation_errors)} 个章节未完成大模型生成或二次终审。", "editor")
     if int(source_summary.get("invalid_citations") or 0):
@@ -125,6 +136,7 @@ def build_acceptance_status(tender_id: int, conn: sqlite3.Connection | None = No
         ),
         "docx_layout_metrics": (docx_audit or {}).get("metrics") or {},
         "docx_visual_metrics": visual_render.get("metrics") or {},
+        "artifact_findings": len(artifact_audit.get("findings") or []),
     }
     scoring_total = int(matrix_summary.get("scoring_requirements") or 0)
     scoring_verified = int(matrix_summary.get("verified_scoring_requirements") or 0)
@@ -149,13 +161,24 @@ def build_acceptance_status(tender_id: int, conn: sqlite3.Connection | None = No
     signature = hashlib.sha256(
         json.dumps({"metrics": metrics, "final_hash": final_summary.get("hash")}, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
+    formal_only_keys = {"delivery_facts", "bidder_identity", "compliance", "reviewer", "review_confirmation", "final_approval"}
+    review_blockers = [item for item in blockers if item.get("key") not in formal_only_keys]
+    formal_only_blockers = [item for item in blockers if item.get("key") in formal_only_keys]
+    review_ready = not review_blockers
+    formal_ready = review_ready and not formal_only_blockers and score >= 90
     result = {
         "tender_id": tender_id,
-        "status": "passed" if not blockers and score >= 90 else "needs_work",
-        "ready": not blockers and score >= 90,
+        "status": "passed" if formal_ready else "review_ready" if review_ready else "needs_work",
+        "ready": formal_ready,
+        "review_ready": review_ready,
+        "formal_ready": formal_ready,
+        "readiness_level": "formal" if formal_ready else "review" if review_ready else "blocked",
         "quality_score": score,
         "metrics": metrics,
         "blockers": blockers,
+        "review_blockers": review_blockers,
+        "formal_blockers": formal_only_blockers,
+        "artifact_audit": artifact_audit,
         "visual_review": visuals,
         "content_signature": signature,
         "target_manual_edit_hours": 8,
