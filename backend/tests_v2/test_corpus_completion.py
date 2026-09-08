@@ -81,6 +81,37 @@ class CorpusCompletionTest(unittest.TestCase):
             )
         return document_id
 
+    def test_representative_sections_use_one_document_level_embedding_batch(self) -> None:
+        content = "施工现场四周设置连续排水沟和集水井，并配置足量备用水泵和应急电源。"
+        document_id = self._document("batched.md", "排水方案", content)
+        with self.db.connect() as conn:
+            conn.execute(
+                "INSERT INTO document_sections(document_id,order_no,level,heading,content,content_fingerprint) VALUES (?,2,2,?,?,?)",
+                (document_id, "排水措施", content + "同时安排专人巡查。", content_hash(content + "同时安排专人巡查。")),
+            )
+            conn.execute(
+                "INSERT INTO document_sections(document_id,order_no,level,heading,content,content_fingerprint) VALUES (?,3,2,?,?,?)",
+                (document_id, "排水检查", content + "并建立检查记录。", content_hash(content + "并建立检查记录。")),
+            )
+        run = self.corpus.create_run()
+        self.retrieval.embedding.settings = replace(self.settings, embedding_url="http://embedding:8090")
+        calls: list[list[str]] = []
+
+        def embed(texts: list[str]) -> list[list[float]]:
+            calls.append(list(texts))
+            return [[1.0, 0.0] for _text in texts]
+
+        self.retrieval.embedding.embed = embed
+        representatives = self.corpus._prepare_representative_sections(run["id"], document_id)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls[0]), 3)
+        self.assertTrue(representatives)
+        clusters = self.db.rows(
+            "SELECT member_section_id FROM corpus_section_clusters WHERE run_id=?",
+            (run["id"],),
+        )
+        self.assertEqual(len(clusters), 3)
+
     def test_snapshot_assigns_every_source_an_auditable_state(self) -> None:
         original = self._source("text.docx", ".docx")
         self._source("copy.docx", ".docx", "duplicate", original)

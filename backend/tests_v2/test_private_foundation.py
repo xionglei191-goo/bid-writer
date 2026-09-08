@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from bid_writer_v2.ai_runtime import AiRuntime
 from bid_writer_v2.audit import AuditService
@@ -12,7 +14,7 @@ from bid_writer_v2.evidence import EvidenceService
 from bid_writer_v2.jobs import JobService
 from bid_writer_v2.knowledge.pipeline import CHUNK_MAX_CHARS, KnowledgePipelineService
 from bid_writer_v2.knowledge.service import KnowledgeService
-from bid_writer_v2.retrieval import HybridRetrievalService
+from bid_writer_v2.retrieval import EmbeddingClient, HybridRetrievalService
 from bid_writer_v2.storage import ObjectStorage
 from bid_writer_v2.utils import content_hash
 from test_v2_workflow import build_settings
@@ -113,6 +115,30 @@ class PrivateFoundationTest(unittest.TestCase):
         result = self.audit.verify_chain()
         self.assertTrue(result["valid"])
         self.assertEqual(result["branches"], 1)
+
+    def test_embedding_client_splits_large_requests_and_preserves_order(self) -> None:
+        settings = replace(
+            self.settings,
+            embedding_url="http://embedding:8090",
+            embedding_request_batch_size=64,
+        )
+        texts = [f"unit-{index}" for index in range(130)]
+        post = Mock()
+
+        def response_for(_url, json):
+            response = Mock()
+            response.json.return_value = {
+                "vectors": [[float(text.split("-")[1])] for text in json["texts"]]
+            }
+            return response
+
+        post.side_effect = response_for
+        with patch("bid_writer_v2.retrieval.httpx.Client") as client_type:
+            client_type.return_value.__enter__.return_value.post = post
+            vectors = EmbeddingClient(settings).embed(texts)
+        self.assertEqual([len(call.kwargs["json"]["texts"]) for call in post.call_args_list], [64, 64, 2])
+        self.assertEqual(vectors[0], [0.0])
+        self.assertEqual(vectors[-1], [129.0])
 
     def test_hybrid_index_only_contains_published_knowledge(self) -> None:
         with self.db.connect() as conn:

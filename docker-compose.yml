@@ -62,6 +62,12 @@ services:
       BID_WRITER_EMBEDDING_MODEL: ${BID_WRITER_EMBEDDING_MODEL:-BAAI/bge-m3}
       BID_WRITER_RERANKER_MODEL: ${BID_WRITER_RERANKER_MODEL:-BAAI/bge-reranker-v2-m3}
       BID_WRITER_EMBEDDING_DEVICE: ${BID_WRITER_EMBEDDING_DEVICE:-auto}
+      BID_WRITER_EMBEDDING_FP16: ${BID_WRITER_EMBEDDING_FP16:-1}
+      BID_WRITER_EMBEDDING_BATCH_SIZE: ${BID_WRITER_EMBEDDING_BATCH_SIZE:-4}
+      BID_WRITER_EMBEDDING_CONCURRENCY: ${BID_WRITER_EMBEDDING_CONCURRENCY:-2}
+      BID_WRITER_EMBEDDING_MAX_CHARS: ${BID_WRITER_EMBEDDING_MAX_CHARS:-4000}
+      BID_WRITER_EMBEDDING_CHUNK_OVERLAP: ${BID_WRITER_EMBEDDING_CHUNK_OVERLAP:-300}
+      BID_WRITER_RERANK_BATCH_SIZE: ${BID_WRITER_RERANK_BATCH_SIZE:-8}
       HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
     volumes:
       - model_cache:/models
@@ -104,10 +110,12 @@ services:
       BID_WRITER_KNOWLEDGE: /workspace/knowledge
       BID_WRITER_DELIVERY: /workspace/delivery
       BID_WRITER_DATA: /workspace/data
+      BID_WRITER_CODEX_AUTH_FILE: /run/secrets/codex-auth.json
     volumes:
       - ${BID_WRITER_RAW_HOST:-./sample-data/raw}:/workspace/raw:ro
       - ${BID_WRITER_KNOWLEDGE_HOST:-./runtime/knowledge}:/workspace/knowledge
       - ${BID_WRITER_DELIVERY_HOST:-./runtime/delivery}:/workspace/delivery
+      - ${BID_WRITER_CODEX_AUTH_HOST:-C:/Users/Administrator/.pi/agent/auth.json}:/run/secrets/codex-auth.json:ro
       - app_data:/workspace/data
     ports:
       - "${BID_WRITER_PORT:-8876}:8765"
@@ -134,6 +142,7 @@ services:
       - ${BID_WRITER_RAW_HOST:-./sample-data/raw}:/workspace/raw:ro
       - ${BID_WRITER_KNOWLEDGE_HOST:-./runtime/knowledge}:/workspace/knowledge
       - ${BID_WRITER_DELIVERY_HOST:-./runtime/delivery}:/workspace/delivery
+      - ${BID_WRITER_CODEX_AUTH_HOST:-C:/Users/Administrator/.pi/agent/auth.json}:/run/secrets/codex-auth.json:ro
       - app_data:/workspace/data
     depends_on:
       app: { condition: service_healthy }

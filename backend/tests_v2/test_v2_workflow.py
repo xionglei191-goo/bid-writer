@@ -142,10 +142,10 @@ class V2WorkflowTest(unittest.TestCase):
                     cursor = conn.execute(
                         """
                         INSERT INTO project_drafts(
-                            project_id,section_id,content,citations_json,confirmations_json,version_no,status,content_hash
-                        ) VALUES (?,?,?,?, '[]',1,'draft',?)
+                            project_id,section_id,content,citations_json,confirmations_json,version_no,status,content_hash,evidence_status
+                        ) VALUES (?,?,?,?, '[]',1,'draft',?,?)
                         """,
-                        (project["id"], section["id"], base["content"], base["citations_json"], base["content_hash"]),
+                        (project["id"], section["id"], base["content"], base["citations_json"], base["content_hash"], base["evidence_status"]),
                     )
                     copied_draft_ids.append(int(cursor.lastrowid))
                     conn.execute("UPDATE project_sections SET status='drafted' WHERE id=?", (section["id"],))
@@ -245,6 +245,39 @@ class V2WorkflowTest(unittest.TestCase):
         methods = [node.name for node in service.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
         duplicates = sorted({name for name in methods if methods.count(name) > 1})
         self.assertEqual(duplicates, [])
+
+    def test_corpus_slot_reconciler_refills_missing_ai_ticks(self) -> None:
+        app = create_app(self.settings)
+        with app.state.db.connect() as conn:
+            run_id = int(
+                conn.execute(
+                    "INSERT INTO corpus_runs(snapshot_hash,status,stage,policy_json) VALUES (?,'running','ai',?)",
+                    ("r" * 64, json.dumps({"ai_concurrency": 3})),
+                ).lastrowid
+            )
+            for index in range(3):
+                source_id = int(
+                    conn.execute(
+                        "INSERT INTO source_files(absolute_path,relative_path,file_name,extension,sha256,family_key) VALUES (?,?,?,?,?,?)",
+                        (str(self.root / f"r{index}.md"), f"r{index}.md", f"r{index}.md", ".md", str(index) * 64, f"r{index}"),
+                    ).lastrowid
+                )
+                conn.execute(
+                    "INSERT INTO corpus_run_items(run_id,source_id,source_hash,item_kind,stage,status) VALUES (?,?,?,'document','ai','pending')",
+                    (run_id, source_id, str(index) * 64),
+                )
+        self.assertEqual(app.state.reconcile_corpus_slots(), 1)
+        active = app.state.db.row(
+            "SELECT COUNT(*) AS count FROM app_jobs WHERE job_type='knowledge.corpus.tick' AND target_id=? AND status='pending'",
+            (f"{run_id}:ai",),
+        )
+        self.assertEqual(int(active["count"]), 3)
+        app.state.reconcile_corpus_slots()
+        active = app.state.db.row(
+            "SELECT COUNT(*) AS count FROM app_jobs WHERE job_type='knowledge.corpus.tick' AND target_id=? AND status='pending'",
+            (f"{run_id}:ai",),
+        )
+        self.assertEqual(int(active["count"]), 3)
 
     def test_http_status_uses_v2_database(self) -> None:
         app = create_app(self.settings)

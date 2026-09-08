@@ -34,6 +34,7 @@ npm run build
 
 ## 当前研发计划
 
+- `docs/handoffs/DELIVERY_RECOVERY_20260908.md`：2026-09-08 恢复、交付操作和真实项目验收记录。
 - `docs/ai-first-solo-development-plan.md`：单人开发条件下的 AI 优先实施计划、阶段验收和优先级。
 - `docs/private-deployment.md`：Compose安装、升级、监控和故障处理。
 - `docs/data-migration-and-backup.md`：SQLite迁移及备份恢复。
@@ -63,6 +64,14 @@ HTTP耗时操作返回`202 + job_id`；前端任务中心显示进度、取消�
 `POST /api/knowledge/corpus-runs/{id}/pause|resume|cancel`、
 `GET /api/knowledge/completion`以及`GET /api/knowledge/manual-tasks`。
 技术复核由系统以`actor_type=ai`记录；只有版权、保密、法律责任、密码或替换文件事项进入人工队列。
+
+## 送审与正式交付
+
+在项目工作台中先填写“项目资料”，再解析要求、生成目录和章节。章节已有草稿后禁止重新解析或重建目录，以免删除已有成果。长章节按要求分包生成，进度会显示当前部分；模型失败或缺少正文响应的部分保留待确认事项，不能视为已完成技术响应。
+
+“质量与交付”显示送审阻塞项、已签审条款覆盖、整本预览和历史下载。正式版还要求真实投标单位、实际专业复核人、章节签审、合规确认及整本定稿。签审绑定当前正文；修改章节或项目资料后，相关确认失效并需重新审核。旧交付文件保留原始版本，重复导出不会覆盖。
+
+DOCX 可独立导出；PDF 和含 PDF 的交付包使用 Docker 镜像内的 LibreOffice 与 Python UNO 更新目录并分页。普通 Windows Python 环境如果没有 UNO，请使用 Compose 部署执行 PDF 导出。生成后应人工检查页码、图表、签章和投标文件要求。
 
 ## 测试
 

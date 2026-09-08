@@ -1,4 +1,5 @@
 const API_BASE = import.meta.env.VITE_BID_WRITER_API_BASE || "";
+export const apiUrl = (path) => `${API_BASE}${path}`;
 
 export async function api(path, options = {}) {
   const csrf = document.cookie.split("; ").find((item) => item.startsWith("bid_writer_csrf="))?.split("=").slice(1).join("=") || "";

@@ -261,14 +261,20 @@ KNOWLEDGE_REWRITE_PROMPT = PromptSpec(
 
 SECTION_DRAFT_PROMPT = PromptSpec(
     key="production.section-draft",
-    version="1.0.0",
+    version="1.1.0",
     instructions="你是建设工程技术标编制专家。正文必须逐条响应要求并保留知识来源，不得复制旧项目事实。",
     template=(
-        "请根据项目事实、条款和已审核知识编制技术标章节。不得编造人员数量、设备型号、工程参数和承诺。"
-        "缺失参数写入confirmations。evidence.text必须逐字引用content中的支持片段。输出JSON："
+        "请根据项目事实、当前分包条款和已审核知识编制技术标章节的一个正文部分。"
+        "这是第{batch_index}/{batch_count}部分；仅响应本部分给出的条款，不写其他条款，不重复整章概况、项目简介或章节总结，"
+        "不输出一级章节标题，可使用二、三级小标题。无条款时，围绕章节主题编写一个有来源支持的正文部分。"
+        "不得编造人员数量、设备型号、工程参数和承诺。"
+        "content控制在{content_budget}字以内；逐条简明响应，避免大段复制来源或把条款全文再抄一遍。"
+        "每条要求给出一条evidence，requirement_id必须使用本部分输入的实际id，不能按1、2、3重新编号；"
+        "evidence.text必须逐字引用content中的支持片段，每条不超过80字。"
+        "缺失参数写入confirmations，每项不超过100字；visual_suggestions最多3项。输出完整JSON，不截断："
         '{{"content":"Markdown正文","evidence":[{{"requirement_id":1,"text":"正文证据原文"}}],'
         '"confirmations":["待确认事项"],"visual_suggestions":["图表建议"]}}。\n\n'
-        "项目：{project_name}\n行业：{industry}\n参数：{profile}\n章节：{section_title}\n条款：{requirements}\n\n"
+        "项目：{project_name}\n行业：{industry}\n参数：{profile}\n章节：{section_title}\n本部分条款：{requirements}\n\n"
         "已审核知识：\n{source_text}"
     ),
     output_model=SectionDraftOutput,
@@ -449,6 +455,7 @@ class AiRuntime:
         target_id: int | None = None,
         max_output_tokens: int = 8000,
         use_cache: bool = True,
+        cancelled=None,
     ) -> dict[str, Any]:
         self._register_prompt(spec)
         settings = self.llm.settings()
@@ -468,6 +475,9 @@ class AiRuntime:
                     "model": settings.get("model", ""),
                     "base_url": settings.get("base_url", ""),
                     "wire_api": settings.get("wire_api", ""),
+                    "reasoning_effort": settings.get("reasoning_effort", ""),
+                    "fallback_route": settings.get("fallback_route"),
+                    "max_output_tokens": max_output_tokens,
                 },
                 sort_keys=True,
             )
@@ -478,7 +488,7 @@ class AiRuntime:
                 return self._record_cache_hit(spec, task_type, target_type, target_id, input_json, input_hash, cache_key, settings, cached)
             recovered = self._revalidate_failed_run(cache_key, spec)
             if recovered is None:
-                recovered = self._revalidate_compatible_failed_batch_run(spec, task_type, input_payload)
+                recovered = self._revalidate_compatible_failed_batch_run(spec, task_type, input_payload, settings)
             if recovered:
                 return self._record_cache_hit(spec, task_type, target_type, target_id, input_json, input_hash, cache_key, settings, recovered)
 
@@ -507,7 +517,8 @@ class AiRuntime:
             )
             run_id = int(cursor.lastrowid)
 
-        result = self.llm.generate(spec.instructions, prompt, max_output_tokens)
+        result = ({"content": "", "error": "AI任务已取消", "attempts": 0}
+                  if cancelled and cancelled() else self.llm.generate(spec.instructions, prompt, max_output_tokens))
         output_text = str(result.get("content") or "")
         parsed = self.llm.json_payload(output_text) if output_text else None
         payload: dict[str, Any] | None = None
@@ -526,13 +537,18 @@ class AiRuntime:
             error_code = "model_unavailable" if not settings.get("configured") else "model_call_failed"
             error_message = error_message or "模型未返回内容"
 
-        if payload is None and error_code in {"schema_validation_failed", "invalid_json"}:
+        if payload is None and error_code in {"schema_validation_failed", "invalid_json"} and not (cancelled and cancelled()):
             retry_prompt = (
                 f"{prompt}\n\n"
                 "上次输出未通过JSON结构校验。请严格按照要求的JSON对象结构重新完整输出；"
                 "不要使用Markdown代码块，不要省略必填字段，不要添加说明文字。"
             )
             retried = self.llm.generate(spec.instructions, retry_prompt, max_output_tokens)
+            combined_metrics = {
+                metric: int(result.get(metric) or 0) + int(retried.get(metric) or 0)
+                for metric in ("latency_ms", "attempts", "input_tokens", "output_tokens")
+            }
+            result = {**result, **combined_metrics}
             retry_text = str(retried.get("content") or "")
             retry_parsed = self.llm.json_payload(retry_text) if retry_text else None
             if retry_parsed is not None:
@@ -540,10 +556,7 @@ class AiRuntime:
                 if retry_payload is not None:
                     result = {
                         **retried,
-                        "latency_ms": int(result.get("latency_ms") or 0) + int(retried.get("latency_ms") or 0),
-                        "attempts": int(result.get("attempts") or 0) + int(retried.get("attempts") or 0),
-                        "input_tokens": int(result.get("input_tokens") or 0) + int(retried.get("input_tokens") or 0),
-                        "output_tokens": int(result.get("output_tokens") or 0) + int(retried.get("output_tokens") or 0),
+                        **combined_metrics,
                     }
                     output_text = retry_text
                     payload = retry_payload
@@ -556,7 +569,8 @@ class AiRuntime:
             conn.execute(
                 """
                 UPDATE ai_runs SET status=?,output_text=?,output_json=?,validation_errors_json=?,error_code=?,
-                    error_message=?,latency_ms=?,attempts=?,input_tokens=?,output_tokens=?,completed_at=CURRENT_TIMESTAMP
+                    error_message=?,latency_ms=?,attempts=?,input_tokens=?,output_tokens=?,effective_model=?,
+                    effective_base_url=?,effective_wire_api=?,fallback_used=?,primary_error=?,completed_at=CURRENT_TIMESTAMP
                 WHERE id=?
                 """,
                 (
@@ -570,6 +584,11 @@ class AiRuntime:
                     int(result.get("attempts") or 0),
                     int(result.get("input_tokens") or 0),
                     int(result.get("output_tokens") or 0),
+                    result.get("model") or settings.get("model", ""),
+                    result.get("base_url") or settings.get("base_url", ""),
+                    result.get("wire_api") or settings.get("wire_api", ""),
+                    1 if result.get("fallback_used") else 0,
+                    str(result.get("primary_error") or ""),
                     run_id,
                 ),
             )
@@ -598,7 +617,8 @@ class AiRuntime:
                 f"""
                 SELECT id,task_type,target_type,target_id,prompt_key,prompt_version,input_hash,model,status,
                     error_code,error_message,latency_ms,attempts,input_tokens,output_tokens,cached_from_run_id,
-                    created_at,completed_at
+                    base_url,wire_api,effective_model,effective_base_url,effective_wire_api,fallback_used,
+                    primary_error,created_at,completed_at
                 FROM ai_runs {where} ORDER BY id DESC LIMIT ?
                 """,
                 params,
@@ -674,6 +694,7 @@ class AiRuntime:
         spec: PromptSpec,
         task_type: str,
         input_payload: dict[str, Any],
+        settings: dict[str, Any],
     ) -> dict[str, Any] | None:
         """Reuse an exact failed batch input after a compatible prompt/schema repair.
 
@@ -694,6 +715,16 @@ class AiRuntime:
                 (task_type, spec.key),
             ).fetchall()
         for row in rows:
+            prior = dict(row)
+            if any(prior.get(key) != settings.get(key, "") for key in ("model", "base_url", "wire_api")):
+                continue
+            if prior.get("fallback_used"):
+                fallback_route = settings.get("fallback_route") or {}
+                if any(
+                    prior.get(f"effective_{key}") != fallback_route.get(key)
+                    for key in ("model", "base_url", "wire_api")
+                ):
+                    continue
             try:
                 previous_input = json.loads(str(row["input_json"] or "{}"))
                 previous_payload = previous_input.get("payload")
@@ -800,14 +831,20 @@ class AiRuntime:
         settings: dict[str, Any],
         cached: dict[str, Any],
     ) -> dict[str, Any]:
+        effective_route = {
+            key: cached.get(f"effective_{key}") or cached.get(key, "")
+            for key in ("model", "base_url", "wire_api")
+        }
+        fallback_used = bool(cached.get("fallback_used"))
+        primary_error = str(cached.get("primary_error") or "")
         with self.db.connect() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO ai_runs(
                     task_type,target_type,target_id,prompt_key,prompt_version,prompt_hash,input_hash,cache_key,
-                    model,base_url,wire_api,status,input_json,output_text,output_json,validation_errors_json,
-                    cached_from_run_id,completed_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,'cached',?,?,?,?,?,CURRENT_TIMESTAMP)
+                    model,base_url,wire_api,effective_model,effective_base_url,effective_wire_api,fallback_used,primary_error,
+                    status,input_json,output_text,output_json,validation_errors_json,cached_from_run_id,completed_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'cached',?,?,?,?,?,CURRENT_TIMESTAMP)
                 """,
                 (
                     task_type,
@@ -821,6 +858,11 @@ class AiRuntime:
                     settings.get("model", ""),
                     settings.get("base_url", ""),
                     settings.get("wire_api", ""),
+                    effective_route["model"],
+                    effective_route["base_url"],
+                    effective_route["wire_api"],
+                    int(fallback_used),
+                    primary_error,
                     input_json,
                     cached["output_text"],
                     cached["output_json"],
@@ -833,7 +875,9 @@ class AiRuntime:
             "run_id": run_id,
             "payload": json.loads(cached["output_json"]),
             "content": cached["output_text"],
-            "model": settings.get("model", ""),
+            **effective_route,
+            "fallback_used": fallback_used,
+            "primary_error": primary_error,
             "cached": True,
             "cached_from_run_id": cached["id"],
             "validation_errors": json.loads(cached.get("validation_errors_json") or "[]"),

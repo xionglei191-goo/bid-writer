@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import asynccontextmanager, suppress
 import logging
 import secrets
 from pathlib import Path
@@ -117,11 +118,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     jobs.register(
         "production.generate_section",
-        lambda payload, report, _cancelled: (
-            report("generating", 10, "开始生成章节", {"section_id": payload["section_id"]}),
-            production.generate_section(int(payload["project_id"]), int(payload["section_id"])),
-            report("completed", 100, "章节生成完成"),
-        )[1],
+        lambda payload, report, cancelled: production.generate_section(
+            int(payload["project_id"]), int(payload["section_id"]), progress=report, cancelled=cancelled,
+        ),
     )
     jobs.register(
         "production.generate_all",
@@ -158,12 +157,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     corpus.dispatch = dispatch_corpus
 
+    def reconcile_corpus_slots() -> int:
+        """Periodically refill corpus worker slots even when all current ticks are long-running."""
+        runs = db.rows("SELECT id FROM corpus_runs WHERE status='running' ORDER BY id")
+        for row in runs:
+            corpus._dispatch_next(int(row["id"]))
+        return len(runs)
+
+    async def corpus_slot_reconciler() -> None:
+        while True:
+            await asyncio.sleep(settings.corpus_reconcile_seconds)
+            try:
+                await asyncio.to_thread(reconcile_corpus_slots)
+            except Exception:  # noqa: BLE001
+                logger.exception("corpus slot reconciliation failed")
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         settings.ensure_directories()
         db.migrate()
         jobs.redispatch_unfinished()
-        yield
+        reconcile_task = (
+            asyncio.create_task(corpus_slot_reconciler(), name="corpus-slot-reconciler")
+            if settings.background_jobs_enabled and settings.redis_url
+            else None
+        )
+        try:
+            yield
+        finally:
+            if reconcile_task:
+                reconcile_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await reconcile_task
 
     app = FastAPI(title="技术标生产与知识工程系统", version="2.0.0", lifespan=lifespan)
     app.state.settings = settings
@@ -179,6 +204,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.jobs = jobs
     app.state.retrieval = retrieval
     app.state.corpus = corpus
+    app.state.reconcile_corpus_slots = reconcile_corpus_slots
     app.state.initial_migrations = migrations
 
     @app.exception_handler(StarletteHTTPException)
@@ -232,9 +258,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             permission = "read" if request.method in {"GET", "HEAD", "OPTIONS"} else "write"
             if "/publish" in request.url.path or "/publications" in request.url.path:
                 permission = "publish"
-            elif "/confirm" in request.url.path or "/review" in request.url.path:
+            elif "/confirm" in request.url.path or "/review" in request.url.path or request.url.path.endswith("/final-review"):
                 permission = "review"
-            elif "/export" in request.url.path:
+            elif "/export" in request.url.path or (
+                request.url.path.startswith("/api/projects/")
+                and "/deliveries/" in request.url.path
+                and request.url.path.endswith("/download")
+            ):
                 permission = "export"
             elif request.url.path.startswith("/api/audit") or request.url.path.startswith("/api/system"):
                 permission = "*"

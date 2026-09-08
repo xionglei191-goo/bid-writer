@@ -44,7 +44,10 @@ class Settings:
     reranker_min_score: float = 0.25
     embedding_device: str = "auto"
     embedding_url: str = ""
+    embedding_request_batch_size: int = 64
+    embedding_timeout_seconds: float = 300.0
     background_jobs_enabled: bool = False
+    corpus_reconcile_seconds: float = 30.0
     auto_publish_low_risk: bool = False
     ocr_job_url: str = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
     ocr_model: str = "PaddleOCR-VL-1.5"
@@ -93,7 +96,10 @@ class Settings:
             reranker_min_score=max(0.0, min(1.0, float(os.environ.get("BID_WRITER_RERANK_MIN_SCORE", "0.25")))),
             embedding_device=os.environ.get("BID_WRITER_EMBEDDING_DEVICE", "auto").strip(),
             embedding_url=os.environ.get("BID_WRITER_EMBEDDING_URL", "").strip().rstrip("/"),
+            embedding_request_batch_size=max(1, min(128, int(os.environ.get("BID_WRITER_EMBEDDING_REQUEST_BATCH_SIZE", "64")))),
+            embedding_timeout_seconds=max(30.0, float(os.environ.get("BID_WRITER_EMBEDDING_TIMEOUT_SECONDS", "300"))),
             background_jobs_enabled=os.environ.get("BID_WRITER_BACKGROUND_JOBS", "0") == "1",
+            corpus_reconcile_seconds=max(5.0, float(os.environ.get("BID_WRITER_CORPUS_RECONCILE_SECONDS", "30"))),
             auto_publish_low_risk=os.environ.get("BID_WRITER_AUTO_PUBLISH_LOW_RISK", "0") == "1",
             ocr_job_url=(os.environ.get("BID_WRITER_OCR_URL") or os.environ.get("PADDLEOCR_JOB_URL") or "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs").rstrip("/"),
             ocr_model=os.environ.get("BID_WRITER_OCR_MODEL") or os.environ.get("PADDLEOCR_MODEL") or "PaddleOCR-VL-1.5",

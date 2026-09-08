@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from typing import Any, Literal
+from urllib.parse import quote
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from .service import ProductionService
+from ..auth import AuthService
 from ..jobs import JobService
 from ..utils import public_payload
 
@@ -58,8 +61,16 @@ class ConfirmationResolutionPayload(BaseModel):
 
 class ConfirmPayload(BaseModel):
     reviewer: str
+    target_hash: str | None = None
     notes: str = ""
     resolutions: list[ConfirmationResolutionPayload] = Field(default_factory=list)
+
+
+class FinalReviewPayload(BaseModel):
+    project_hash: str = Field(min_length=1)
+    professional_reviewer: str = Field(min_length=1)
+    compliance_confirmed: bool
+    manual_finalized: bool
 
 
 def build_router(service: ProductionService, jobs: JobService | None = None) -> APIRouter:
@@ -84,7 +95,11 @@ def build_router(service: ProductionService, jobs: JobService | None = None) -> 
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @router.patch("/{project_id}")
-    def update_project(project_id: int, payload: ProjectUpdatePayload) -> dict[str, Any]:
+    def update_project(project_id: int, payload: ProjectUpdatePayload, request: Request) -> dict[str, Any]:
+        if any((payload.profile or {}).get(key) is True for key in ("compliance_confirmed", "manual_finalized", "final_approved")):
+            user = getattr(request.state, "user", None)
+            if user and not AuthService.allowed(user, "review"):
+                raise HTTPException(status_code=403, detail="只有复核人员可以确认合规和人工定稿")
         try:
             return service.update_project(project_id, payload.model_dump(exclude_none=True))
         except (KeyError, ValueError) as exc:
@@ -96,6 +111,8 @@ def build_router(service: ProductionService, jobs: JobService | None = None) -> 
             return service.parse_requirements(project_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router.post("/{project_id}/outline")
     def build_outline(project_id: int) -> dict[str, Any]:
@@ -103,6 +120,8 @@ def build_router(service: ProductionService, jobs: JobService | None = None) -> 
             return service.build_outline(project_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router.get("/{project_id}/coverage")
     def coverage(project_id: int) -> dict[str, Any]:
@@ -160,6 +179,7 @@ def build_router(service: ProductionService, jobs: JobService | None = None) -> 
                 payload.reviewer,
                 [item.model_dump() for item in payload.resolutions],
                 payload.notes,
+                payload.target_hash,
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -199,6 +219,43 @@ def build_router(service: ProductionService, jobs: JobService | None = None) -> 
     @router.get("/{project_id}/manifests")
     def manifests(project_id: int) -> list[dict[str, Any]]:
         return service.list_manifests(project_id)
+
+    @router.get("/{project_id}/preview")
+    def preview(project_id: int) -> dict[str, Any]:
+        try:
+            return service.preview_project(project_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @router.post("/{project_id}/final-review")
+    def final_review(project_id: int, payload: FinalReviewPayload) -> dict[str, Any]:
+        try:
+            return service.confirm_final_review(project_id, **payload.model_dump())
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router.get("/{project_id}/deliveries")
+    def deliveries(project_id: int) -> list[dict[str, Any]]:
+        try:
+            return service.list_deliveries(project_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @router.get("/{project_id}/deliveries/{delivery_id}/download")
+    def download(project_id: int, delivery_id: int) -> Response:
+        try:
+            artifact = service.download_delivery(project_id, delivery_id)
+            return Response(content=artifact["data"], media_type=artifact["media_type"], headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{quote(artifact['file_name'])}",
+                "Cache-Control": "private, no-store",
+                "X-Content-Type-Options": "nosniff",
+            })
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router.post("/{project_id}/export")
     def export(project_id: int, payload: ExportPayload, request: Request, background_tasks: BackgroundTasks) -> dict[str, Any]:

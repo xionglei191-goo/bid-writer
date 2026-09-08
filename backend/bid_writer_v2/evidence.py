@@ -92,10 +92,32 @@ class EvidenceService:
             return int(cursor.lastrowid)
 
     def analyze_draft(self, generation_run_id: int, draft_id: int, content: str, sources: list[dict[str, Any]]) -> dict[str, Any]:
+        analyzed_hash = content_hash(content)
         sentences = claim_sentences(content)
         unsupported_high: list[str] = []
         supported = 0
         with self.db.connect() as conn:
+            # Compare the actual saved body while holding its write lock, so a
+            # slower analysis cannot replace evidence for a newer saved edit.
+            if self.db.backend == "sqlite":
+                conn.execute("BEGIN IMMEDIATE")
+            lock_clause = " FOR UPDATE" if self.db.backend == "postgresql" else ""
+            draft = conn.execute(
+                f"SELECT content FROM project_drafts WHERE id=?{lock_clause}", (draft_id,),
+            ).fetchone()
+            if not draft:
+                raise KeyError("章节草稿不存在")
+            current_hash = content_hash(draft["content"])
+            if current_hash != analyzed_hash:
+                conn.execute(
+                    "UPDATE generation_runs SET draft_id=?,status='invalidated',completed_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (draft_id, generation_run_id),
+                )
+                return {
+                    "claims": 0, "supported": 0, "support_rate": 0.0, "unsupported_high": [],
+                    "evidence_status": "stale", "stale": True,
+                    "analyzed_content_hash": analyzed_hash, "current_content_hash": current_hash,
+                }
             conn.execute("DELETE FROM claims WHERE draft_id=?", (draft_id,))
             for index, sentence in enumerate(sentences):
                 claim_type, risk = classify_claim(sentence)
@@ -164,6 +186,7 @@ class EvidenceService:
             "support_rate": round(supported / len(sentences), 4) if sentences else 1.0,
             "unsupported_high": unsupported_high,
             "evidence_status": evidence_status,
+            "stale": False,
         }
 
     def list_claims(self, draft_id: int) -> list[dict[str, Any]]:
@@ -205,17 +228,18 @@ class EvidenceService:
             )
         return {"claim_id": claim_id, "support_status": status, "evidence_status": "blocked" if blocked else "supported"}
 
-    def metrics(self, project_id: int) -> dict[str, Any]:
-        row = self.db.row(
-            """
+    def metrics(self, project_id: int, *, conn=None) -> dict[str, Any]:
+        query = """
             SELECT COUNT(*) AS total,
                 SUM(CASE WHEN c.support_status IN ('supported','confirmed','resolved') THEN 1 ELSE 0 END) AS supported,
                 SUM(CASE WHEN c.risk_level='high' THEN 1 ELSE 0 END) AS high_total,
                 SUM(CASE WHEN c.risk_level='high' AND c.support_status='unsupported' THEN 1 ELSE 0 END) AS high_unsupported
             FROM claims c JOIN project_drafts d ON d.id=c.draft_id WHERE d.project_id=?
-            """,
-            (project_id,),
-        ) or {"total": 0, "supported": 0, "high_total": 0, "high_unsupported": 0}
+                AND NOT EXISTS (SELECT 1 FROM project_drafts newer
+                    WHERE newer.section_id=d.section_id AND newer.version_no>d.version_no)
+            """
+        row = (conn.execute(query, (project_id,)).fetchone() if conn is not None else self.db.row(query, (project_id,))) or {"total": 0, "supported": 0, "high_total": 0, "high_unsupported": 0}
+        row = dict(row)
         metrics = {key: int(row[key] or 0) for key in row}
         metrics["support_rate"] = round(metrics["supported"] / metrics["total"] * 100, 2) if metrics["total"] else 100.0
         return metrics

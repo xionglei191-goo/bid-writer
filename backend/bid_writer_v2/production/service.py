@@ -6,16 +6,21 @@ import shutil
 import subprocess
 import tempfile
 import hashlib
+import mimetypes
+import os
 import zipfile
+from contextlib import nullcontext
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from docx import Document
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_BREAK
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Cm, Pt
+from docx.shared import Cm, Pt, RGBColor
 
 from bid_writer.artifact_audit import audit_docx_path, audit_text, audit_zip_path
 
@@ -71,6 +76,7 @@ class ProductionService:
         if not name:
             raise ValueError("项目名称不能为空")
         profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else {}
+        profile = {key: value for key, value in profile.items() if key != "delivery_confirmation"}
         with self.db.connect() as conn:
             cursor = conn.execute(
                 "INSERT INTO projects(name,industry,project_type,region,source_text,profile_json) VALUES (?,?,?,?,?,?)",
@@ -104,46 +110,83 @@ class ProductionService:
 
     def get_project(self, project_id: int) -> dict[str, Any]:
         with self.db.connect() as conn:
-            row = conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
-            if not row:
-                raise KeyError("项目不存在")
-            item = dict(row)
-            item["profile"] = parse_json(item.pop("profile_json", "{}"), {})
-            item["requirements"] = [dict(value) for value in conn.execute("SELECT * FROM project_requirements WHERE project_id=? ORDER BY id", (project_id,))]
-            sections = [dict(value) for value in conn.execute("SELECT * FROM project_sections WHERE project_id=? ORDER BY order_no", (project_id,))]
-            for section in sections:
-                section["requirement_ids"] = parse_json(section.pop("requirement_ids_json", "[]"), [])
-                draft = conn.execute("SELECT * FROM project_drafts WHERE section_id=? ORDER BY version_no DESC LIMIT 1", (section["id"],)).fetchone()
-                section["draft"] = dict(draft) if draft else None
-                if section["draft"]:
-                    section["draft"]["citations"] = parse_json(section["draft"].pop("citations_json", "[]"), [])
-                    section["draft"]["confirmations"] = parse_json(section["draft"].pop("confirmations_json", "[]"), [])
-                    section["draft"]["content_hash"] = section["draft"].get("content_hash") or content_hash(section["draft"]["content"])
-                    section["draft"]["confirmation_resolutions"] = [
-                        dict(value)
-                        for value in conn.execute(
-                            "SELECT confirmation_index,confirmation_text,resolution,resolver,created_at "
-                            "FROM confirmation_resolutions WHERE draft_id=? AND target_hash=? ORDER BY confirmation_index",
-                            (section["draft"]["id"], section["draft"]["content_hash"]),
-                        )
-                    ]
-                    section["draft"]["claims"] = self.evidence.list_claims(int(section["draft"]["id"]))
-            item["sections"] = sections
-            item["quality_issues"] = [
-                dict(value)
-                for value in conn.execute(
-                    "SELECT * FROM quality_issues WHERE project_id=? ORDER BY CASE severity WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,id DESC",
-                    (project_id,),
-                )
-            ]
+            return self._get_project_from_connection(conn, project_id)
+
+    def _get_project_from_connection(self, conn, project_id: int) -> dict[str, Any]:
+        row = conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+        if not row:
+            raise KeyError("项目不存在")
+        item = dict(row)
+        item["profile"] = parse_json(item.pop("profile_json", "{}"), {})
+        item["requirements"] = [dict(value) for value in conn.execute("SELECT * FROM project_requirements WHERE project_id=? ORDER BY id", (project_id,))]
+        sections = [dict(value) for value in conn.execute("SELECT * FROM project_sections WHERE project_id=? ORDER BY order_no", (project_id,))]
+        for section in sections:
+            section["requirement_ids"] = parse_json(section.pop("requirement_ids_json", "[]"), [])
+            draft = conn.execute("SELECT * FROM project_drafts WHERE section_id=? ORDER BY version_no DESC LIMIT 1", (section["id"],)).fetchone()
+            section["draft"] = dict(draft) if draft else None
+            if section["draft"]:
+                section["draft"]["citations"] = parse_json(section["draft"].pop("citations_json", "[]"), [])
+                section["draft"]["confirmations"] = parse_json(section["draft"].pop("confirmations_json", "[]"), [])
+                # Approval fingerprints describe the saved body, including when
+                # a legacy or interrupted write left its cached hash stale.
+                section["draft"]["content_hash"] = content_hash(section["draft"]["content"])
+                section["draft"]["confirmation_resolutions"] = [
+                    dict(value)
+                    for value in conn.execute(
+                        "SELECT confirmation_index,confirmation_text,resolution,resolver,created_at "
+                        "FROM confirmation_resolutions WHERE draft_id=? AND target_hash=? ORDER BY confirmation_index",
+                        (section["draft"]["id"], section["draft"]["content_hash"]),
+                    )
+                ]
+                section["draft"]["claims"] = self.evidence.list_claims(int(section["draft"]["id"]))
+        item["sections"] = sections
+        item["quality_issues"] = [
+            dict(value)
+            for value in conn.execute(
+                "SELECT * FROM quality_issues WHERE project_id=? ORDER BY CASE severity WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,id DESC",
+                (project_id,),
+            )
+        ]
         return item
 
-    def update_project(self, project_id: int, payload: dict[str, Any]) -> dict[str, Any]:
-        current = self.get_project(project_id)
-        profile = current["profile"]
-        if isinstance(payload.get("profile"), dict):
-            profile.update(payload["profile"])
+    def _lock_project_for_update(self, conn, project_id: int) -> None:
+        if self.db.backend == "sqlite":
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
+            return
+        if not conn.execute("SELECT id FROM projects WHERE id=? FOR UPDATE", (project_id,)).fetchone():
+            raise KeyError("项目不存在")
+        # Match the existing draft-edit order (draft before section), while the
+        # parent row lock also prevents insertion of new child versions.
+        for table in ("project_drafts", "project_sections", "project_requirements"):
+            conn.execute(f"SELECT id FROM {table} WHERE project_id=? ORDER BY id FOR UPDATE", (project_id,)).fetchall()
+
+    def update_project(self, project_id: int, payload: dict[str, Any], expected_project_hash: str | None = None) -> dict[str, Any]:
         with self.db.connect() as conn:
+            self._lock_project_for_update(conn, project_id)
+            current = self._get_project_from_connection(conn, project_id)
+            if expected_project_hash is not None and expected_project_hash != self._project_hash(current):
+                raise ValueError("项目内容已变化，请重新预览整本后确认")
+            profile = dict(current["profile"])
+            if isinstance(payload.get("profile"), dict):
+                profile.update({key: value for key, value in payload["profile"].items() if key != "delivery_confirmation"})
+            updated = {**current, **{key: payload[key] for key in ("name", "industry", "project_type", "region", "source_text") if key in payload}, "profile": profile}
+            profile_update = payload.get("profile") or {}
+            # Keep the explicit profile confirmation API compatible, binding
+            # every approval to the same locked snapshot as its write.
+            if any(profile_update.get(key) is True for key in ("compliance_confirmed", "manual_finalized", "final_approved")):
+                previous_confirmation = self._delivery_confirmation(current)
+                reviewer = normalize_text(str(profile.get("professional_reviewer") or profile.get("reviewed_by") or ""))
+                same_content = self._project_hash(current) == self._project_hash(updated) and reviewer == previous_confirmation["professional_reviewer"]
+                profile["delivery_confirmation"] = {
+                    "target_hash": self._project_hash(updated),
+                    "professional_reviewer": reviewer,
+                    "compliance_confirmed": profile_update.get("compliance_confirmed") is True or (same_content and previous_confirmation["compliance_confirmed"]),
+                    "manual_finalized": profile_update.get("manual_finalized") is True or profile_update.get("final_approved") is True or (same_content and previous_confirmation["manual_finalized"]),
+                    "confirmed_at": datetime.now(timezone.utc).isoformat(),
+                }
+            if all(updated.get(key) == current.get(key) for key in ("name", "industry", "project_type", "region", "source_text", "profile")):
+                return current
             conn.execute(
                 """
                 UPDATE projects SET name=?,industry=?,project_type=?,region=?,source_text=?,profile_json=?,updated_at=CURRENT_TIMESTAMP
@@ -163,21 +206,75 @@ class ProductionService:
             conn.execute("UPDATE generation_runs SET status='invalidated' WHERE project_id=? AND status='completed'", (project_id,))
         return self.get_project(project_id)
 
+    def preview_project(self, project_id: int) -> dict[str, Any]:
+        project = self.get_project(project_id)
+        return {
+            "project_id": project_id,
+            "project_hash": self._project_hash(project),
+            "markdown": self._project_markdown(project),
+            "confirmation": self._delivery_confirmation(project),
+        }
+
+    def confirm_final_review(self, project_id: int, project_hash: str, professional_reviewer: str,
+                             compliance_confirmed: bool, manual_finalized: bool) -> dict[str, Any]:
+        if not normalize_text(professional_reviewer):
+            raise ValueError("专业复核人不能为空")
+        if not compliance_confirmed or not manual_finalized:
+            raise ValueError("请由责任人完成合规确认和整本人工定稿")
+        self.update_project(project_id, {"profile": {
+            "professional_reviewer": normalize_text(professional_reviewer),
+            "compliance_confirmed": True,
+            "manual_finalized": True,
+        }}, expected_project_hash=project_hash)
+        self.audit.record("delivery.final_review", "project", project_id,
+                          details={"project_hash": project_hash, "professional_reviewer": normalize_text(professional_reviewer)})
+        return self.preview_project(project_id)
+
+    def _delivery_confirmation(self, project: dict[str, Any]) -> dict[str, Any]:
+        profile = project.get("profile") or {}
+        confirmation = profile.get("delivery_confirmation") or {}
+        reviewer = normalize_text(str(profile.get("professional_reviewer") or profile.get("reviewed_by") or ""))
+        valid = bool(confirmation.get("target_hash") == self._project_hash(project)
+                     and reviewer and confirmation.get("professional_reviewer") == reviewer)
+        compliance_confirmed = valid and profile.get("compliance_confirmed") is True and confirmation.get("compliance_confirmed") is True
+        manual_finalized = valid and (profile.get("manual_finalized") is True or profile.get("final_approved") is True) and confirmation.get("manual_finalized") is True
+        return {
+            "valid": compliance_confirmed and manual_finalized,
+            "professional_reviewer": reviewer,
+            "target_hash": confirmation.get("target_hash"),
+            "confirmed_at": confirmation.get("confirmed_at"),
+            "compliance_confirmed": compliance_confirmed,
+            "manual_finalized": manual_finalized,
+        }
+
     def parse_requirements(self, project_id: int) -> dict[str, Any]:
         project = self.get_project(project_id)
+        if any(section.get("draft") for section in project.get("sections", [])):
+            raise ValueError("项目已有章节草稿或签审，不能重新解析要求；请新建项目后重新解析，避免覆盖已有成果")
         source_text = normalize_text(project.get("source_text") or "")
-        candidates = [line.strip(" -\t") for line in source_text.splitlines() if len(line.strip()) >= 8]
+        candidates = self._requirement_paragraphs(source_text, str(project.get("name") or ""))
         requirements: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        keywords = ["项目", "工程", "应", "须", "不得", "评分", "要求", "工期", "质量", "安全", "施工", "技术", "方案", "响应"]
-        for line in candidates:
-            if line in seen:
+        seen: set[tuple[str, int | None]] = set()
+        keywords = ["项目", "工程", "应", "须", "不得", "禁止", "严禁", "评分", "要求", "工期", "质量", "安全", "施工", "技术", "方案", "响应"]
+        for candidate in candidates:
+            line = candidate["content"]
+            if re.fullmatch(r"(?:[（(]\d+[)）])?.{0,30}评分标准[（(]总分\s*\d+(?:\.\d+)?\s*分[)）]", line):
                 continue
-            if not any(keyword in line for keyword in keywords):
+            key = (line, candidate["source_page"])
+            if key in seen:
                 continue
-            seen.add(line)
-            priority = "high" if any(keyword in line for keyword in ["评分", "必须", "不得", "废标", "否决"]) else "normal"
-            if any(keyword in line for keyword in ["废标", "否决", "不得"]):
+            # "不得分" is a scoring result and "不得力" describes performance;
+            # neither is a prohibition. Keep actual prohibitions such as 不得分包.
+            veto = bool(candidate.get("inherited_veto") or re.search(
+                r"废标|否决|禁止|严禁|不得(?!力|分(?:$|[\s。；，：！？、,.!?;:）)]|的|者|或|并|且|则|时))", line
+            ))
+            if not candidate.get("scoring") and not candidate.get("inherited_veto") and ((len(line) < 8 and not re.search(r"(?:不得|禁止|严禁|必须).+", line)) or not any(keyword in line for keyword in keywords)):
+                continue
+            seen.add(key)
+            priority = "high" if candidate.get("scoring") or veto or any(keyword in line for keyword in ["评分", "不得分", "必须"]) else "normal"
+            if candidate.get("scoring"):
+                kind = "scoring"
+            elif veto:
                 kind = "veto"
             elif any(keyword in line for keyword in ["评分", "得分", "分值"]):
                 kind = "scoring"
@@ -193,20 +290,180 @@ class ProductionService:
                 kind = "confirmation"
             else:
                 kind = "technical"
-            requirements.append({"content": line[:1000], "priority": priority, "kind": kind})
-        if not requirements and source_text:
-            requirements.append({"content": source_text[:1000], "priority": "normal", "kind": "technical"})
+            requirements.append({"content": line, "priority": priority, "kind": kind, "source_page": candidate["source_page"]})
+        if not requirements and source_text and not re.search(r"\[第\s*\d+\s*页\]", source_text):
+            requirements.append({"content": source_text, "priority": "normal", "kind": "technical", "source_page": None})
         with self.db.connect() as conn:
             conn.execute("DELETE FROM project_requirements WHERE project_id=?", (project_id,))
             for index, requirement in enumerate(requirements, 1):
                 conn.execute(
-                    "INSERT INTO project_requirements(project_id,requirement_key,kind,content,priority) VALUES (?,?,?,?,?)",
-                    (project_id, f"REQ-{index:04d}", requirement["kind"], requirement["content"], requirement["priority"]),
+                    "INSERT INTO project_requirements(project_id,requirement_key,kind,content,priority,source_page) VALUES (?,?,?,?,?,?)",
+                    (project_id, f"REQ-{index:04d}", requirement["kind"], requirement["content"], requirement["priority"], requirement["source_page"]),
                 )
         return {"project_id": project_id, "requirements": self.get_project(project_id)["requirements"]}
 
+    @staticmethod
+    def _requirement_paragraphs(source_text: str, project_name: str = "") -> list[dict[str, Any]]:
+        """Retain PDF page provenance and join wrapped prose/table score rows."""
+        entries: list[dict[str, Any]] = []
+        page = None
+        for raw_line in source_text.splitlines():
+            line = raw_line.strip()
+            marker = re.fullmatch(r"\[第\s*(\d+)\s*页\]", line)
+            if marker:
+                page = int(marker.group(1))
+                continue
+            if line:
+                entries.append({"text": line, "page": page})
+        # Printed page numbers may appear first or last in extracted text.
+        page_positions: dict[int | None, list[int]] = {}
+        for index, entry in enumerate(entries):
+            page_positions.setdefault(entry["page"], []).append(index)
+        ignored: set[int] = set()
+        for page_number, positions in page_positions.items():
+            if page_number is not None:
+                ignored.update(index for index in {positions[0], positions[-1]} if entries[index]["text"].isdigit())
+        compact_name = re.sub(r"\s+", "", project_name)
+        header_pattern = r"^(?:第[一二三四五六七八九十百\d]+章.{0,30}|目\s*录|招\s*标\s*文\s*件|招标公告|投标人须知(?:前附表)?|评标办法(?:前附表)?|条款号\s*条款名称\s*编列内容|评分因素\s*参考评分标准|评审项目\s*标准分\s*评分因素)$"
+        for index, entry in enumerate(entries):
+            line = entry["text"]
+            compact = re.sub(r"\s+", "", line)
+            if re.match(header_pattern, line) or (compact_name and len(compact) >= 8 and compact in compact_name):
+                ignored.add(index)
+
+        def title_fragment(line: str) -> bool:
+            return len(line) <= 20 and bool(re.fullmatch(r"[\u4e00-\u9fffA-Za-z][\u4e00-\u9fffA-Za-z、及与的（）() /-]*", line))
+
+        def closes_score_table(line: str) -> bool:
+            return bool(re.match(r"^(?:第[一二三四五六七八九十百\d]+章|\d+[、．.]\s*[^\d\s])", line) or re.fullmatch(r"\d+(?:\.\d+)+(?:\s*[（(]\d+[)）])?", line))
+
+        # A table header enables score recognition. Numeric prose outside a
+        # scoring table must not become a score or consume unrelated headings.
+        anchors = []
+        score_table = False
+        table_start = 0
+        for index, entry in enumerate(entries):
+            line = entry["text"]
+            if re.search(r"评分因素|参考评分标准|评审项目.*标准分", line):
+                score_table = True
+                table_start = index + 1
+                continue
+            if closes_score_table(line):
+                score_table = False
+            if not score_table or index in ignored:
+                continue
+            inline = re.fullmatch(r"([\u4e00-\u9fffA-Za-z][\u4e00-\u9fffA-Za-z、及与的（）() /-]{1,40}?)\s+(\d{1,3}(?:\.\d+)?)\s*(?:分)?(?:\s+(.*))?", line)
+            weight = re.fullmatch(r"(\d{1,3}(?:\.\d+)?)\s*(?:分)?(?:\s+(.*))?", line)
+            if inline:
+                start, title, points, description = index, inline.group(1), inline.group(2), inline.group(3) or ""
+            elif weight:
+                start = index
+                fragments = []
+                while start > table_start and len(fragments) < 6:
+                    previous = start - 1
+                    if previous in ignored or not title_fragment(entries[previous]["text"]):
+                        break
+                    fragments.insert(0, entries[previous]["text"])
+                    start = previous
+                if not fragments:
+                    continue
+                title, points, description = "".join(fragments), weight.group(1), weight.group(2) or ""
+            else:
+                continue
+            if float(points) > 100:
+                continue
+            anchors.append({"start": start, "weight_index": index, "title": title, "points": points, "description": description})
+
+        paragraphs: list[tuple[int, dict[str, Any]]] = []
+        consumed: set[int] = set()
+        for anchor_index, anchor in enumerate(anchors):
+            end = anchors[anchor_index + 1]["start"] if anchor_index + 1 < len(anchors) else len(entries)
+            for position in range(anchor["weight_index"] + 1, end):
+                if closes_score_table(entries[position]["text"]) or re.search(r"评分因素|参考评分标准|评审项目.*标准分", entries[position]["text"]):
+                    end = position
+                    break
+            description = anchor["description"] + "".join(entries[position]["text"] for position in range(anchor["weight_index"] + 1, end) if position not in ignored)
+            text = f"{anchor['title']}（{anchor['points']}分）：{description}"
+            paragraphs.append((anchor["start"], {"content": text, "source_page": entries[anchor["start"]]["page"], "scoring": True}))
+            consumed.update(range(anchor["start"], end))
+
+        parts: list[str] = []
+        start = 0
+        current_page = None
+
+        def flush() -> None:
+            if parts:
+                paragraphs.append((start, {"content": "".join(parts), "source_page": current_page, "scoring": False}))
+                parts.clear()
+
+        for index, entry in enumerate(entries):
+            line = entry["text"]
+            if index in ignored or index in consumed:
+                flush()
+                continue
+            numbered = bool(re.match(r"^(?:\d+(?:\.\d+)*(?:[、．.]|\s)|[（(][一二三四五六七八九十\d]+[)）]|[一二三四五六七八九十]+、)", line))
+            if re.match(r"^\d+(?:\.\d+)?\s*(?:日历天|天|日|人|台|套|万元|元|平方米|米|%|m[²2]?)", line, re.IGNORECASE):
+                numbered = False
+            if parts and (entry["page"] != current_page or numbered or re.search(r"[。；！？]$", parts[-1]) or sum(map(len, parts)) + len(line) > 1200):
+                flush()
+            if not parts:
+                start, current_page = index, entry["page"]
+            parts.append(line)
+        flush()
+        # Exclusion lists inherit their parent's meaning even if the parent is
+        # on the preceding PDF page and the child contains no keyword itself.
+        # A new clause/list style or a broken sequence ends that inheritance.
+        result: list[dict[str, Any]] = []
+        exclusion_list = False
+        list_style = None
+        next_number = 1
+        previous_position = -1
+
+        def list_number(text: str) -> tuple[str, int] | None:
+            match = re.match(r"^(?:[（(](\d+|[一二三四五六七八九十]+)[)）]|(\d+|[一二三四五六七八九十]+)[、．.](?!\d))\s*", text)
+            if not match:
+                return None
+            value = match.group(1) or match.group(2)
+            if value.isdigit():
+                number = int(value)
+            else:
+                digits = {character: index for index, character in enumerate("一二三四五六七八九", 1)}
+                if "十" in value:
+                    tens, ones = value.split("十", 1)
+                    number = digits.get(tens, 1) * 10 + digits.get(ones, 0)
+                else:
+                    number = digits.get(value, 0)
+            return ("parenthesized" if match.group(1) else "plain", number)
+
+        for position, paragraph in sorted(paragraphs, key=lambda item: item[0]):
+            text = paragraph["content"]
+            chapter_boundary = any(re.match(r"^第[一二三四五六七八九十百\d]+章", entries[index]["text"])
+                                   for index in range(previous_position + 1, position))
+            previous_position = position
+            if chapter_boundary:
+                exclusion_list = False
+            if not paragraph.get("scoring") and re.search(r"(?:不得|禁止|严禁)[^。；！？]{0,12}(?:下列|以下)(?:情形|情况|行为)", text):
+                exclusion_list, list_style, next_number = True, None, 1
+            elif exclusion_list:
+                number = list_number(text)
+                if number and number[1] == next_number and (list_style is None or number[0] == list_style):
+                    paragraph["inherited_veto"] = True
+                    list_style, next_number = number[0], number[1] + 1
+                elif (not number and not paragraph.get("scoring") and result and result[-1].get("inherited_veto")
+                      and not re.match(r"^\d+(?:\.\d+)+\b", text) and not re.search(r"[。；！？]$", result[-1]["content"])):
+                    # A child itself can wrap over a page boundary. Its first
+                    # source page remains the provenance of the joined clause.
+                    result[-1]["content"] += text
+                    continue
+                else:
+                    exclusion_list = False
+            result.append(paragraph)
+        return result
+
     def build_outline(self, project_id: int) -> dict[str, Any]:
         project = self.get_project(project_id)
+        if any(section.get("draft") for section in project.get("sections", [])):
+            raise ValueError("项目已有章节草稿或签审，不能重建目录；请新建项目，避免删除已有成果")
         requirements = project["requirements"]
         with self.db.connect() as conn:
             conn.execute("DELETE FROM project_sections WHERE project_id=?", (project_id,))
@@ -239,11 +496,11 @@ class ProductionService:
     @staticmethod
     def _requirement_matches(title: str, content: str) -> bool:
         mappings = {
-            "质量": ["质量", "验收"],
+            "质量": ["质量", "验收", "竣工资料"],
             "安全": ["安全", "文明", "环保"],
             "进度": ["进度", "工期"],
             "资源": ["资源", "人员", "机械", "材料"],
-            "施工方案": ["施工", "工艺", "技术"],
+            "施工方案": ["施工", "工艺", "技术", "水性漆", "涂装", "涂料"],
             "重点难点": ["重点", "难点", "风险"],
             "平面": ["平面", "临建", "场地"],
         }
@@ -252,7 +509,22 @@ class ProductionService:
                 return True
         return False
 
-    def generate_section(self, project_id: int, section_id: int) -> dict[str, Any]:
+    def generate_section(self, project_id: int, section_id: int, progress=None, cancelled=None) -> dict[str, Any]:
+        progress = progress or (lambda *_args, **_kwargs: None)
+        cancelled = cancelled or (lambda: False)
+        generation_run_id = None
+        batch_results: list[dict[str, Any]] = []
+
+        def cancellation_result() -> dict[str, Any]:
+            if generation_run_id is not None:
+                with self.db.connect() as conn:
+                    conn.execute("UPDATE generation_runs SET status='cancelled',completed_at=CURRENT_TIMESTAMP WHERE id=?", (generation_run_id,))
+            progress("cancelled", 0, "章节生成已取消，未保存章节草稿", {"section_id": section_id, "completed_batches": len(batch_results)})
+            return {"section_id": section_id, "cancelled": True, "generation_status": "cancelled",
+                    "generation_run_id": generation_run_id, "generation_batches": batch_results}
+
+        if cancelled():
+            return cancellation_result()
         project = self.get_project(project_id)
         section = next((item for item in project["sections"] if item["id"] == section_id), None)
         if not section:
@@ -261,8 +533,12 @@ class ProductionService:
         requirements = [requirement_map[value] for value in section["requirement_ids"] if value in requirement_map]
         query = " ".join([section["title"], *[item["content"] for item in requirements[:5]]])
         sources = self.knowledge.search(query, project.get("industry") or "", limit=8)
+        if not sources and query != section["title"]:
+            sources = self.knowledge.search(section["title"], project.get("industry") or "", limit=8)
         if not sources:
             raise ValueError("已发布知识库没有匹配内容，章节生成已阻断")
+        if cancelled():
+            return cancellation_result()
         source_text = "\n\n".join(
             f"[知识{index}] {item['title']} / 发布v{item['publication_version']}\n{item['content'][:4000]}"
             for index, item in enumerate(sources, 1)
@@ -301,52 +577,108 @@ class ProductionService:
             ],
         )
         source_text = source_text[:28000]
-        prompt = SECTION_DRAFT_PROMPT.render(
-            project_name=project["name"],
-            industry=project["industry"],
-            profile=json.dumps(profile, ensure_ascii=False),
-            section_title=section["title"],
-            requirements=json.dumps(requirements, ensure_ascii=False),
-            source_text=source_text,
-        )
-        result = self.ai_runtime.execute(
-            SECTION_DRAFT_PROMPT,
-            prompt,
-            {
-                "project": {"id": project_id, "name": project["name"], "industry": project["industry"], "profile": profile},
-                "section": {"id": section_id, "title": section["title"]},
-                "requirements": requirements,
-                "sources": [
+        batches = self._section_requirement_batches(requirements)
+        content_parts = [f"# {section['title']}"]
+        confirmations: list[str] = []
+        evidence: list[dict[str, Any]] = []
+        for batch_index, batch_requirements in enumerate(batches, 1):
+            if cancelled():
+                return cancellation_result()
+            content_budget = min(3000, max(1000, len(batch_requirements) * 240)) if batch_requirements else 2400
+            batch = {"index": batch_index, "count": len(batches), "content_budget": content_budget}
+            progress("generating", 10 + int((batch_index - 1) / len(batches) * 75),
+                     f"生成章节第{batch_index}/{len(batches)}部分", {"section_id": section_id, **batch})
+            if cancelled():
+                return cancellation_result()
+            prompt = SECTION_DRAFT_PROMPT.render(
+                project_name=project["name"], industry=project["industry"],
+                profile=json.dumps(profile, ensure_ascii=False), section_title=section["title"],
+                requirements=json.dumps(batch_requirements, ensure_ascii=False), source_text=source_text,
+                batch_index=str(batch_index), batch_count=str(len(batches)), content_budget=str(content_budget),
+            )
+            try:
+                result = self.ai_runtime.execute(
+                    SECTION_DRAFT_PROMPT, prompt,
                     {
-                        "publication_id": item["publication_id"],
-                        "content_hash": item["content_hash"],
-                        "content": item["content"][:4000],
-                    }
-                    for item in sources
-                ],
-            },
-            task_type="section_draft",
-            target_type="project_section",
-            target_id=section_id,
-            max_output_tokens=12000,
-        )
-        payload = result.get("payload")
-        if payload:
-            content = normalize_text(str(payload.get("content") or ""))
-            confirmations = [
-                normalize_text(str(item))
-                for item in (payload.get("confirmations") if isinstance(payload.get("confirmations"), list) else [])
-                if normalize_text(str(item))
-            ]
-            evidence = payload.get("evidence") if isinstance(payload.get("evidence"), list) else []
-        else:
-            content = self._fallback_section(project, section, requirements, sources)
-            confirmations = ["大模型不可用，当前章节为基于已审核知识的结构化草稿，需人工复核"]
-            evidence = [
-                {"requirement_id": item["id"], "text": f"{item['requirement_key']}：{item['content']}"}
-                for item in requirements
-            ]
-        content = content.replace("[项目名称]", project["name"])
+                        "project": {"id": project_id, "name": project["name"], "industry": project["industry"], "profile": profile},
+                        "section": {"id": section_id, "title": section["title"]},
+                        "batch": batch, "requirements": batch_requirements,
+                        "sources": [
+                            {"publication_id": item["publication_id"], "content_hash": item["content_hash"], "content": item["content"][:4000]}
+                            for item in sources
+                        ],
+                    },
+                    task_type="section_draft", target_type="project_section", target_id=section_id,
+                    max_output_tokens=8000,
+                    cancelled=cancelled,
+                )
+            except Exception as exc:  # noqa: BLE001
+                result = {"error": f"{type(exc).__name__}: {exc}"}
+            if cancelled():
+                return cancellation_result()
+            payload = result.get("payload") or {}
+            body = normalize_text(str(payload.get("content") or ""))
+            succeeded = bool(body)
+            if succeeded:
+                confirmations.extend(
+                    normalize_text(str(item)) for item in (payload.get("confirmations") or []) if normalize_text(str(item))
+                )
+                batch_evidence = payload.get("evidence") or []
+            else:
+                # Multi-part fallback lists only this part's requirements, so it
+                # cannot duplicate an entire chapter for every failed request.
+                body = self._fallback_section(project, section, batch_requirements, sources if len(batches) == 1 else [])
+                if len(batches) == 1:
+                    confirmations.append("大模型不可用，当前章节为基于已审核知识的结构化草稿，需人工复核")
+                else:
+                    confirmations.append(f"第{batch_index}/{len(batches)}部分AI编写失败，当前部分仅保留招标要求，须补充技术响应并人工复核")
+                batch_evidence = [
+                    {"requirement_id": item["id"], "text": f"{item['requirement_key']}：{item['content']}"}
+                    for item in batch_requirements
+                ]
+            body = body.replace("[项目名称]", project["name"])
+            body_lines = []
+            for line in body.splitlines():
+                if line.strip() == f"# {section['title']}":
+                    continue
+                if len(batches) > 1 and line == f"本章结合{project['name']}的招标要求和已审核知识进行编制。":
+                    continue
+                body_lines.append(re.sub(r"^#\s+", "## ", line))
+            batch_body = normalize_text("\n".join(body_lines))
+            content_parts.append(batch_body)
+            batch_ids = {int(item["id"]) for item in batch_requirements}
+            covered_ids: set[int] = set()
+            for item in batch_evidence:
+                requirement_id = int(item.get("requirement_id") or 0)
+                # Legacy ordinal output can only map within its own part; a real
+                # ID belonging to another part must never be silently reassigned.
+                if requirement_id not in requirement_map and 1 <= requirement_id <= len(batch_requirements):
+                    requirement_id = int(batch_requirements[requirement_id - 1]["id"])
+                text = normalize_text(str(item.get("text") or "")).replace("[项目名称]", project["name"])
+                # Evidence must quote this part's final body. A quotation that
+                # only occurs in another part must not establish coverage here.
+                if requirement_id in batch_ids and text and text in batch_body:
+                    evidence.append({"requirement_id": requirement_id, "text": text, "coverage_score": 1.0})
+                    covered_ids.add(requirement_id)
+            missing_ids = sorted(batch_ids - covered_ids) if succeeded else []
+            if missing_ids:
+                confirmations.append(f"第{batch_index}/{len(batches)}部分有{len(missing_ids)}项要求缺少可核验的正文响应（要求ID：{','.join(map(str, missing_ids))}），须补充后复核")
+            batch_results.append({
+                **batch, "requirement_ids": [item["id"] for item in batch_requirements],
+                "status": ("ai_incomplete" if missing_ids else "ai") if succeeded else "fallback", "ai_run_id": result.get("run_id"),
+                "missing_requirement_ids": missing_ids,
+                "model": result.get("model"), "cached": bool(result.get("cached")),
+                "error": ("部分要求缺少可核验的正文响应" if missing_ids else "") if succeeded else str(result.get("error") or "模型未返回有效正文"),
+            })
+            progress("generating", 10 + int(batch_index / len(batches) * 75),
+                     f"第{batch_index}/{len(batches)}部分已处理" + ("，需要补充技术响应并复核" if not succeeded or missing_ids else ""),
+                     {"section_id": section_id, **batch, "status": batch_results[-1]["status"]})
+        content = "\n\n".join(part for part in content_parts if part)
+        confirmations = list(dict.fromkeys(confirmations))
+        fallback_batches = sum(item["status"] == "fallback" for item in batch_results)
+        incomplete_batches = sum(item["status"] == "ai_incomplete" for item in batch_results)
+        generation_status = ("incomplete" if incomplete_batches else "ai") if not fallback_batches else "fallback" if fallback_batches == len(batches) else "partial_fallback"
+        models = list(dict.fromkeys(str(item["model"]) for item in batch_results if item["status"] in {"ai", "ai_incomplete"} and item.get("model")))
         citations = [
             {
                 "unit_id": item["unit_id"],
@@ -359,7 +691,9 @@ class ProductionService:
             for item in sources
         ]
         draft_hash = content_hash(content)
-        allowed_requirement_ids = {int(item["id"]) for item in requirements}
+        progress("saving", 95, "合并各部分并核验证据", {"section_id": section_id, "batch_count": len(batches), "fallback_batches": fallback_batches, "incomplete_batches": incomplete_batches})
+        if cancelled():
+            return cancellation_result()
         with self.db.connect() as conn:
             version_no = int(conn.execute("SELECT COALESCE(MAX(version_no),0)+1 FROM project_drafts WHERE section_id=?", (section_id,)).fetchone()[0])
             cursor = conn.execute(
@@ -370,12 +704,8 @@ class ProductionService:
             conn.execute("UPDATE project_sections SET status='drafted' WHERE id=?", (section_id,))
             for item in evidence:
                 requirement_id = int(item.get("requirement_id") or 0)
-                if requirement_id not in allowed_requirement_ids and 1 <= requirement_id <= len(requirements):
-                    requirement_id = int(requirements[requirement_id - 1]["id"])
-                if requirement_id not in allowed_requirement_ids:
-                    continue
                 text = normalize_text(str(item.get("text") or ""))
-                coverage_score = 1.0 if text and text in content else 0.0
+                coverage_score = float(item["coverage_score"])
                 conn.execute(
                     "INSERT INTO requirement_responses(requirement_id,draft_id,evidence_text,coverage_score,content_fingerprint) VALUES (?,?,?,?,?)",
                     (requirement_id, draft_id, text, coverage_score, draft_hash),
@@ -403,6 +733,9 @@ class ProductionService:
                     "UPDATE project_drafts SET confirmations_json=? WHERE id=?",
                     (json.dumps(confirmations, ensure_ascii=False), draft_id),
                 )
+        needs_review = fallback_batches + incomplete_batches
+        progress("completed", 100, "章节生成完成" + (f"，含{needs_review}个待补充复核部分" if needs_review else ""),
+                 {"section_id": section_id, "generation_status": generation_status, "fallback_batches": fallback_batches, "incomplete_batches": incomplete_batches})
         return {
             "draft_id": draft_id,
             "section_id": section_id,
@@ -410,14 +743,36 @@ class ProductionService:
             "content": content,
             "citations": citations,
             "confirmations": confirmations,
-            "model": result.get("model"),
-            "ai_run_id": result.get("run_id"),
-            "cached": bool(result.get("cached")),
-            "error": result.get("error", ""),
+            "model": ", ".join(models) if models else "structured-fallback",
+            "ai_run_id": batch_results[0]["ai_run_id"] if len(batch_results) == 1 else None,
+            "ai_run_ids": [item["ai_run_id"] for item in batch_results if item["ai_run_id"] is not None],
+            "generation_status": generation_status, "generation_batches": batch_results,
+            "ai_batches": len(batches) - fallback_batches, "fallback_batches": fallback_batches,
+            "incomplete_batches": incomplete_batches,
+            "cached": not fallback_batches and not incomplete_batches and all(item["cached"] for item in batch_results),
+            "error": "；".join(f"第{item['index']}部分：{item['error']}" for item in batch_results if item["error"]),
             "generation_run_id": generation_run_id,
             "evidence": evidence_report,
             "claims": self.evidence.list_claims(draft_id),
         }
+
+    @staticmethod
+    def _section_requirement_batches(requirements: list[dict[str, Any]], max_items: int = 12, max_chars: int = 6000) -> list[list[dict[str, Any]]]:
+        batches: list[list[dict[str, Any]]] = []
+        current: list[dict[str, Any]] = []
+        current_chars = 0
+        for requirement in requirements:
+            size = len(str(requirement.get("content") or ""))
+            if current and (len(current) >= max_items or current_chars + size > max_chars):
+                batches.append(current)
+                current, current_chars = [], 0
+            # A single oversized source clause stays intact in its own part;
+            # truncating it here would silently discard tender requirements.
+            current.append(requirement)
+            current_chars += size
+        if current:
+            batches.append(current)
+        return batches or [[]]
 
     def generate_all(self, project_id: int, progress=None, cancelled=None) -> dict[str, Any]:
         progress = progress or (lambda *_args, **_kwargs: None)
@@ -434,16 +789,28 @@ class ProductionService:
                 break
             progress("generating", int(index / len(project["sections"]) * 95), f"生成章节 {index + 1}/{len(project['sections'])}", {"section_id": section["id"]})
             try:
-                results.append(self.generate_section(project_id, int(section["id"])))
+                def section_progress(stage, value, message="", details=None):
+                    progress("cancelled" if stage == "cancelled" else "generating",
+                             int((index + value / 100) / len(project["sections"]) * 95),
+                             f"第{index + 1}章：{message}", details or {})
+
+                results.append(self.generate_section(project_id, int(section["id"]), progress=section_progress, cancelled=cancelled))
+                if results[-1].get("cancelled"):
+                    break
             except Exception as exc:  # noqa: BLE001
                 results.append({"section_id": section["id"], "section_title": section["title"], "error": f"{type(exc).__name__}: {exc}"})
         output = {
             "project_id": project_id,
             "generated": sum(1 for item in results if item.get("draft_id")),
-            "failed": sum(1 for item in results if not item.get("draft_id")),
+            "failed": sum(1 for item in results if not item.get("draft_id") and not item.get("cancelled")),
+            "fallback_chapters": sum(1 for item in results if item.get("fallback_batches")),
+            "incomplete_chapters": sum(1 for item in results if item.get("incomplete_batches")),
+            "cancelled": bool(cancelled()) or any(item.get("cancelled") for item in results),
             "results": results,
         }
-        progress("completed", 100, "批量章节生成完成", {"generated": output["generated"], "failed": output["failed"]})
+        progress("cancelled" if output["cancelled"] else "completed", 100,
+                 "批量章节生成已取消" if output["cancelled"] else f"批量章节生成完成，{sum(bool(item.get('fallback_batches') or item.get('incomplete_batches')) for item in results)}章含待补充复核内容",
+                 {"generated": output["generated"], "failed": output["failed"], "fallback_chapters": output["fallback_chapters"], "incomplete_chapters": output["incomplete_chapters"]})
         return output
 
     @staticmethod
@@ -461,10 +828,16 @@ class ProductionService:
         normalized = normalize_text(content)
         updated_hash = content_hash(normalized)
         with self.db.connect() as conn:
+            if self.db.backend == "sqlite":
+                conn.execute("BEGIN IMMEDIATE")
+            owner = conn.execute("SELECT project_id FROM project_drafts WHERE id=?", (draft_id,)).fetchone()
+            if not owner:
+                raise KeyError("章节草稿不存在")
+            self._lock_project_for_update(conn, int(owner["project_id"]))
             row = conn.execute("SELECT * FROM project_drafts WHERE id=?", (draft_id,)).fetchone()
             if not row:
                 raise KeyError("章节草稿不存在")
-            current_hash = row["content_hash"] or content_hash(row["content"])
+            current_hash = content_hash(row["content"])
             if current_hash == updated_hash:
                 return {"draft_id": draft_id, "status": row["status"], "changed": False, "quality_confirmations_invalidated": False}
             conn.execute(
@@ -476,7 +849,35 @@ class ProductionService:
             conn.execute("UPDATE claims SET support_status='invalidated',updated_at=CURRENT_TIMESTAMP WHERE draft_id=?", (draft_id,))
             conn.execute("UPDATE generation_runs SET status='invalidated' WHERE draft_id=?", (draft_id,))
             conn.execute("UPDATE delivery_manifests SET status='invalidated',invalidated_at=CURRENT_TIMESTAMP WHERE project_id=? AND invalidated_at IS NULL", (row["project_id"],))
-        return {"draft_id": draft_id, "status": "draft", "changed": True, "quality_confirmations_invalidated": True}
+            responses = conn.execute("SELECT id,evidence_text FROM requirement_responses WHERE draft_id=?", (draft_id,)).fetchall()
+            for response in responses:
+                evidence_text = normalize_text(response["evidence_text"] or "")
+                conn.execute("UPDATE requirement_responses SET content_fingerprint=?,coverage_score=? WHERE id=?",
+                             (updated_hash, 1.0 if evidence_text and evidence_text in normalized else 0.0, response["id"]))
+        # A saved edit must be evaluated against the frozen sources again;
+        # invalidated claims must never disappear from the high-risk gate.
+        citations = parse_json(row["citations_json"], [])
+        evidence_sources = []
+        for citation in citations:
+            source = self.db.row(
+                "SELECT p.unit_id,p.id AS publication_id,p.content_hash,v.content "
+                "FROM knowledge_publications p JOIN knowledge_versions v ON v.id=p.version_id "
+                "WHERE p.id=? AND p.status='published' AND p.content_hash=?",
+                (citation.get("publication_id"), citation.get("content_hash")),
+            )
+            if source:
+                evidence_sources.append({**source, "sources": citation.get("sources") or []})
+        requirements = self.db.rows(
+            "SELECT DISTINCT r.content,r.source_page FROM project_requirements r "
+            "JOIN requirement_responses rr ON rr.requirement_id=r.id WHERE rr.draft_id=?", (draft_id,),
+        )
+        evidence_sources.extend({"content": item["content"], "content_hash": content_hash(item["content"]),
+                                 "sources": [{"page_start": item.get("source_page")}]} for item in requirements)
+        run_id = self.evidence.create_generation_run(int(row["project_id"]), int(row["section_id"]), updated_hash,
+                                                      "manual-edit", "manual-edit-1", "evidence-2.0.0", None, citations)
+        analysis = self.evidence.analyze_draft(run_id, draft_id, normalized, evidence_sources)
+        return {"draft_id": draft_id, "status": "draft", "changed": True, "quality_confirmations_invalidated": True,
+                "evidence_status": analysis["evidence_status"], "analysis_stale": bool(analysis.get("stale"))}
 
     def confirm_draft(
         self,
@@ -484,23 +885,34 @@ class ProductionService:
         reviewer: str,
         resolutions: list[dict[str, Any]] | None = None,
         notes: str = "",
+        target_hash: str | None = None,
     ) -> dict[str, Any]:
         if not reviewer.strip():
             raise ValueError("确认人不能为空")
         with self.db.connect() as conn:
-            row = conn.execute("SELECT * FROM project_drafts WHERE id=?", (draft_id,)).fetchone()
+            if self.db.backend == "sqlite":
+                conn.execute("BEGIN IMMEDIATE")
+            owner = conn.execute("SELECT project_id FROM project_drafts WHERE id=?", (draft_id,)).fetchone()
+            if not owner:
+                raise KeyError("章节草稿不存在")
+            self._lock_project_for_update(conn, int(owner["project_id"]))
+            lock_clause = " FOR UPDATE" if self.db.backend == "postgresql" else ""
+            row = conn.execute(f"SELECT * FROM project_drafts WHERE id=?{lock_clause}", (draft_id,)).fetchone()
             if not row:
                 raise KeyError("章节草稿不存在")
+            current_hash = content_hash(row["content"])
+            if target_hash is not None and target_hash != current_hash:
+                raise ValueError("章节内容已变化，请重新查看后签审")
             confirmations = parse_json(row["confirmations_json"], [])
             unsupported_high = int(
                 conn.execute(
-                    "SELECT COUNT(*) FROM claims WHERE draft_id=? AND risk_level='high' AND support_status='unsupported'",
+                    "SELECT COUNT(*) FROM claims WHERE draft_id=? AND risk_level='high' AND support_status IN ('unsupported','invalidated')",
                     (draft_id,),
                 ).fetchone()[0]
             )
             if unsupported_high:
                 raise ValueError(f"仍有{unsupported_high}条高风险Claim缺少证据，不能签审")
-            target_hash = row["content_hash"] or content_hash(row["content"])
+            target_hash = current_hash
             supplied: dict[int, str] = {}
             for item in resolutions or []:
                 index = int(item.get("index", -1))
@@ -556,29 +968,29 @@ class ProductionService:
             "resolved_confirmations": len(confirmations),
         }
 
-    def quality_gate(self, project_id: int) -> dict[str, Any]:
-        project = self.get_project(project_id)
+    def quality_gate(self, project_id: int, *, conn=None, sync_issues: bool = True) -> dict[str, Any]:
+        project = self._get_project_from_connection(conn, project_id) if conn is not None else self.get_project(project_id)
         sections = project["sections"]
         drafts = [item["draft"] for item in sections if item.get("draft")]
         text = "\n".join(item["content"] for item in drafts)
         review_blockers: list[dict[str, str]] = []
         formal_only_blockers: list[dict[str, str]] = []
-        if len(drafts) < len(sections):
+        if not sections or len(drafts) < len(sections) or any(not draft["content"].strip() for draft in drafts):
             review_blockers.append({"key": "missing_sections", "title": "章节未全部生成", "detail": f"{len(drafts)}/{len(sections)}章已有草稿"})
         confirmation_count = 0
         unreviewed_drafts = 0
-        with self.db.connect() as conn:
+        with (nullcontext(conn) if conn is not None else self.db.connect()) as connection:
             for draft in drafts:
                 target_hash = draft["content_hash"]
                 resolved = {
                     int(row[0])
-                    for row in conn.execute(
+                    for row in connection.execute(
                         "SELECT confirmation_index FROM confirmation_resolutions WHERE draft_id=? AND target_hash=?",
                         (draft["id"], target_hash),
                     )
                 }
                 confirmation_count += sum(1 for index, _ in enumerate(draft.get("confirmations") or []) if index not in resolved)
-                reviewed = conn.execute(
+                reviewed = connection.execute(
                     "SELECT 1 FROM draft_review_decisions WHERE draft_id=? AND target_hash=? AND decision='approved' LIMIT 1",
                     (draft["id"], target_hash),
                 ).fetchone()
@@ -589,10 +1001,10 @@ class ProductionService:
         if unreviewed_drafts:
             formal_only_blockers.append({"key": "unreviewed_drafts", "title": "章节尚未绑定当前版本签审", "detail": f"共{unreviewed_drafts}章"})
         invalid_citations = 0
-        with self.db.connect() as conn:
+        with (nullcontext(conn) if conn is not None else self.db.connect()) as connection:
             for draft in drafts:
                 for citation in draft.get("citations") or []:
-                    valid = conn.execute(
+                    valid = connection.execute(
                         "SELECT 1 FROM knowledge_publications WHERE id=? AND status='published' AND content_hash=?",
                         (citation.get("publication_id"), citation.get("content_hash")),
                     ).fetchone()
@@ -600,7 +1012,14 @@ class ProductionService:
                         invalid_citations += 1
         if invalid_citations:
             review_blockers.append({"key": "invalid_citations", "title": "引用已失效", "detail": f"共{invalid_citations}项"})
-        evidence_metrics = self.evidence.metrics(project_id)
+        stale_evidence = sum(
+            1 for draft in drafts
+            if draft.get("evidence_status") in {"pending", "invalidated", "failed"}
+            or any(claim.get("support_status") == "invalidated" for claim in draft.get("claims", []))
+        )
+        if stale_evidence:
+            review_blockers.append({"key": "stale_evidence", "title": "章节证据检查未完成", "detail": f"共{stale_evidence}章证据检查未完成或已失效"})
+        evidence_metrics = self.evidence.metrics(project_id, conn=conn)
         if evidence_metrics["high_unsupported"]:
             review_blockers.append({"key": "unsupported_high_claims", "title": "高风险表述缺少证据", "detail": f"共{evidence_metrics['high_unsupported']}项"})
         artifact_audit = audit_text(self._project_markdown(project), source="assembled_markdown")
@@ -608,8 +1027,8 @@ class ProductionService:
             detail = "、".join(f"{key}={value}" for key, value in artifact_audit["counts"].items() if value)
             review_blockers.append({"key": "artifact_audit", "title": "最终产物审计未通过", "detail": detail or "发现禁止内容"})
         coverage_total = len(project["requirements"])
-        with self.db.connect() as conn:
-            covered = int(conn.execute(
+        with (nullcontext(conn) if conn is not None else self.db.connect()) as connection:
+            covered = int(connection.execute(
                 """
                 SELECT COUNT(DISTINCT rr.requirement_id) FROM requirement_responses rr
                 JOIN project_requirements r ON r.id=rr.requirement_id
@@ -643,10 +1062,11 @@ class ProductionService:
         reviewer = normalize_text(str(profile.get("professional_reviewer") or profile.get("reviewed_by") or ""))
         if not reviewer:
             formal_only_blockers.append({"key": "professional_reviewer", "title": "缺少专业复核人", "detail": "正式版必须由专业复核人署名"})
-        if profile.get("compliance_confirmed") is not True:
-            formal_only_blockers.append({"key": "compliance_confirmation", "title": "合规确认未完成", "detail": "正式版必须完成合规清单确认"})
-        if profile.get("manual_finalized") is not True and profile.get("final_approved") is not True:
-            formal_only_blockers.append({"key": "manual_finalization", "title": "人工定稿未完成", "detail": "正式版必须由责任人完成整本定稿"})
+        confirmation = self._delivery_confirmation(project)
+        if not confirmation["compliance_confirmed"]:
+            formal_only_blockers.append({"key": "compliance_confirmation", "title": "合规确认未完成", "detail": "正式版必须针对当前内容完成合规清单确认；修改后须重新确认"})
+        if not confirmation["manual_finalized"]:
+            formal_only_blockers.append({"key": "manual_finalization", "title": "人工定稿未完成", "detail": "正式版必须由责任人对当前内容完成整本定稿；修改后须重新确认"})
         formal_blockers = [*review_blockers, *formal_only_blockers]
         review_score = max(0, 100 - len(review_blockers) * 12)
         score = max(0, 100 - len(formal_blockers) * 12)
@@ -678,7 +1098,8 @@ class ProductionService:
                 "artifact_findings": len(artifact_audit["findings"]),
             },
         }
-        self._sync_quality_issues(project_id, [*formal_blockers, *warnings])
+        if sync_issues:
+            self._sync_quality_issues(project_id, [*formal_blockers, *warnings])
         return report
 
     @staticmethod
@@ -754,6 +1175,94 @@ class ProductionService:
             row["manifest"] = parse_json(row.pop("manifest_json", "{}"), {})
         return rows
 
+    def list_deliveries(self, project_id: int) -> list[dict[str, Any]]:
+        project = self.get_project(project_id)
+        project_hash = self._project_hash(project)
+        confirmation = self._delivery_confirmation(project)
+        readiness = self.quality_gate(project_id, sync_issues=False)
+        rows = self.db.rows(
+            "SELECT d.*,m.id AS manifest_id,m.manifest_hash,m.project_hash,m.status AS manifest_status,m.manifest_json "
+            "FROM deliveries d LEFT JOIN delivery_manifests m ON m.delivery_id=d.id "
+            "WHERE d.project_id=? ORDER BY d.id DESC", (project_id,),
+        )
+        items = []
+        for row in rows:
+            metadata = self._delivery_metadata(row)
+            mode, separator, file_format = row["format"].partition("_")
+            frozen_confirmation = parse_json(row.get("manifest_json"), {}).get("delivery_confirmation")
+            items.append({
+                "delivery_id": row["id"], "project_id": project_id,
+                "format": file_format if separator else row["format"], "mode": mode if separator else "unknown",
+                "created_at": row["created_at"], "file_name": metadata.get("file_name") or Path(row["file_path"]).name,
+                "manifest_id": row.get("manifest_id"), "manifest_hash": row.get("manifest_hash"),
+                "status": row.get("manifest_status") or "unverified",
+                "current": (row.get("manifest_status") == "frozen" and row.get("project_hash") == project_hash
+                            and bool(readiness.get(f"{mode}_ready")) and frozen_confirmation == confirmation),
+                "available": bool(metadata.get("sha256") and (metadata.get("object_key") or self._safe_delivery_path(row["file_path"]))),
+                "download_url": f"/api/projects/{project_id}/deliveries/{row['id']}/download",
+            })
+        return items
+
+    def _safe_delivery_path(self, value: str) -> Path | None:
+        path = Path(value).resolve()
+        if not path.is_relative_to(self.settings.export_root.resolve()) or not path.is_file():
+            return None
+        return path
+
+    def _delivery_metadata(self, row: dict[str, Any]) -> dict[str, Any]:
+        quality = parse_json(row.get("quality_json"), {})
+        metadata = quality.get("_delivery_file") or {}
+        if metadata:
+            return metadata
+        # Earlier releases stored an editable export path. Only offer those
+        # artifacts when the manifest supplies an independently frozen hash.
+        manifest = parse_json(row.get("manifest_json"), {})
+        file_name = Path(row["file_path"]).name
+        if row["format"].endswith("_package") and not file_name.endswith(".zip"):
+            return {}
+        item = next((item for item in manifest.get("files", []) if item.get("name") == file_name), None)
+        if not item:
+            return {}
+        object_key = f"deliveries/{row['project_id']}/{str(row.get('manifest_hash') or '')[:12]}/{file_name}"
+        record = self.db.row("SELECT sha256 FROM object_records WHERE object_key=?", (object_key,))
+        return {"file_name": file_name, "sha256": item.get("sha256"),
+                "object_key": object_key if record and record["sha256"] == item.get("sha256") else ""}
+
+    def download_delivery(self, project_id: int, delivery_id: int) -> dict[str, Any]:
+        row = self.db.row(
+            "SELECT d.*,m.manifest_hash,m.manifest_json FROM deliveries d "
+            "LEFT JOIN delivery_manifests m ON m.delivery_id=d.id WHERE d.project_id=? AND d.id=?",
+            (project_id, delivery_id),
+        )
+        if not row:
+            raise KeyError("交付记录不存在")
+        metadata = self._delivery_metadata(row)
+        expected_hash = metadata.get("sha256")
+        if not expected_hash:
+            raise ValueError("历史交付文件缺少可核验的冻结记录，请重新导出")
+        data = None
+        object_key = str(metadata.get("object_key") or "")
+        if object_key:
+            if not object_key.startswith(f"deliveries/{project_id}/") or any(part in {"", ".", ".."} for part in object_key.replace("\\", "/").split("/")):
+                raise ValueError("交付文件存储位置无效")
+            record = self.db.row("SELECT sha256 FROM object_records WHERE object_key=?", (object_key,))
+            if record and record["sha256"] == expected_hash:
+                try:
+                    with self.storage.open(object_key) as handle:
+                        data = handle.read()
+                except FileNotFoundError:
+                    pass
+        if data is None:
+            path = self._safe_delivery_path(row["file_path"])
+            if not path:
+                raise KeyError("交付文件不存在")
+            data = path.read_bytes()
+        if hashlib.sha256(data).hexdigest() != expected_hash:
+            raise ValueError("交付文件与冻结记录不一致，请重新导出")
+        file_name = Path(str(metadata.get("file_name") or row["file_path"])).name
+        return {"data": data, "file_name": file_name,
+                "media_type": mimetypes.guess_type(file_name)[0] or "application/octet-stream"}
+
     def export_project(self, project_id: int, file_format: str, mode: str = "formal", progress=None) -> dict[str, Any]:
         progress = progress or (lambda *_args, **_kwargs: None)
         if mode not in {"review", "formal"}:
@@ -764,23 +1273,27 @@ class ProductionService:
             label = "送审" if mode == "review" else "正式"
             raise ValueError(f"质量门禁未通过，不能导出{label}版")
         safe_name = re.sub(r"[\\/:*?\"<>|]", "_", project["name"])
+        export_id = uuid4().hex
+        export_directory = self.settings.export_root / str(project_id) / export_id
+        export_directory.mkdir(parents=True, exist_ok=False)
         progress("rendering", 20, "生成交付文件")
         files: list[Path] = []
         if file_format == "markdown":
-            path = self.settings.export_root / f"{safe_name}_{project_id}.md"
+            path = export_directory / f"{safe_name}_{project_id}_{mode}.md"
             content = self._project_markdown(project)
             write_text_atomic(path, content)
             files.append(path)
         elif file_format == "docx":
-            path = self.settings.export_root / f"{safe_name}_{project_id}.docx"
-            self._write_docx(project, path)
+            path = export_directory / f"{safe_name}_{project_id}_{mode}.docx"
+            self._write_docx(project, path, mode=mode)
             self._preflight_docx(path)
             files.append(path)
         elif file_format in {"pdf", "package"}:
-            docx_path = self.settings.export_root / f"{safe_name}_{project_id}.docx"
-            self._write_docx(project, docx_path)
+            docx_path = export_directory / f"{safe_name}_{project_id}_{mode}.docx"
+            self._write_docx(project, docx_path, mode=mode)
             self._preflight_docx(docx_path)
             pdf_path = self._convert_pdf(docx_path)
+            self._preflight_docx(docx_path)
             self._preflight_pdf(pdf_path)
             files.extend([docx_path, pdf_path])
             path = pdf_path
@@ -791,17 +1304,16 @@ class ProductionService:
             {"name": item.name, "size_bytes": item.stat().st_size, "sha256": hashlib.sha256(item.read_bytes()).hexdigest()}
             for item in files
         ]
-        with self.db.connect() as conn:
-            cursor = conn.execute(
-                "INSERT INTO deliveries(project_id,format,file_path,quality_json) VALUES (?,?,?,?)",
-                (project_id, f"{mode}_{file_format}", str(path), json.dumps(quality, ensure_ascii=False)),
-            )
-            delivery_id = int(cursor.lastrowid)
         manifest = {
             "schema_version": "1.0",
+            "export_id": export_id,
+            "mode": mode,
+            "format": file_format,
             "project_id": project_id,
             "project_name": project["name"],
             "project_hash": project_hash,
+            "delivery_confirmation": self._delivery_confirmation(project),
+            "bidder_name": str((project.get("profile") or {}).get("bidder_name") or (project.get("profile") or {}).get("tenderer_name") or (project.get("profile") or {}).get("bidder") or ""),
             "quality": quality,
             "files": file_items,
             "drafts": [
@@ -818,11 +1330,11 @@ class ProductionService:
         }
         manifest_json = json.dumps(manifest, ensure_ascii=False, indent=2)
         manifest_hash = content_hash(manifest_json)
-        manifest_path = self.settings.export_root / f"{safe_name}_{project_id}_manifest.json"
+        manifest_path = export_directory / f"{safe_name}_{project_id}_{mode}_manifest.json"
         write_text_atomic(manifest_path, manifest_json)
         files.append(manifest_path)
         if file_format == "package":
-            package_path = self.settings.export_root / f"{safe_name}_{project_id}_{'review' if mode == 'review' else 'delivery'}.zip"
+            package_path = export_directory / f"{safe_name}_{project_id}_{'review' if mode == 'review' else 'delivery'}.zip"
             with zipfile.ZipFile(package_path, "w", zipfile.ZIP_DEFLATED) as archive:
                 if mode == "review":
                     deliverables = [item for item in files if item.suffix.lower() in {".docx", ".pdf"}]
@@ -848,10 +1360,37 @@ class ProductionService:
                     raise ValueError("送审包产物审计失败")
             path = package_path
             file_items.append({"name": package_path.name, "size_bytes": package_path.stat().st_size, "sha256": hashlib.sha256(package_path.read_bytes()).hexdigest()})
-        stored = []
+        if self._project_hash(self.get_project(project_id)) != project_hash:
+            raise ValueError("导出期间项目内容已变化，请检查后重新导出")
+        if not self.quality_gate(project_id)[f"{mode}_ready"]:
+            raise ValueError("导出期间质量或签审状态已变化，请检查后重新导出")
+        stored = {}
         for item in files + ([path] if path not in files else []):
-            stored.append(self.storage.put_file(f"deliveries/{project_id}/{manifest_hash[:12]}/{item.name}", item))
+            stored[item.name] = self.storage.put_file(f"deliveries/{project_id}/{export_id}/{item.name}", item)
+        artifact = {"file_name": path.name, "object_key": stored[path.name]["object_key"], "sha256": stored[path.name]["sha256"]}
         with self.db.connect() as conn:
+            # File upload can take minutes. Recheck under the same project lock
+            # used by edits/approvals, immediately before the immutable record.
+            self._lock_project_for_update(conn, project_id)
+            if self.db.backend == "postgresql":
+                for table in ("claims", "requirement_responses", "confirmation_resolutions", "draft_review_decisions"):
+                    conn.execute(f"SELECT id FROM {table} WHERE draft_id IN (SELECT id FROM project_drafts WHERE project_id=?) ORDER BY id FOR UPDATE", (project_id,)).fetchall()
+                publication_ids = sorted({item[0] for item in manifest["knowledge"]})
+                for publication_id in publication_ids:
+                    conn.execute("SELECT id FROM knowledge_publications WHERE id=? FOR SHARE", (publication_id,)).fetchone()
+            frozen_project = self._get_project_from_connection(conn, project_id)
+            if self._project_hash(frozen_project) != project_hash:
+                raise ValueError("导出期间项目内容已变化，请检查后重新导出")
+            if self._delivery_confirmation(frozen_project) != manifest["delivery_confirmation"]:
+                raise ValueError("导出期间质量或签审状态已变化，请检查后重新导出")
+            frozen_quality = self.quality_gate(project_id, conn=conn, sync_issues=False)
+            if not frozen_quality[f"{mode}_ready"]:
+                raise ValueError("导出期间质量或签审状态已变化，请检查后重新导出")
+            cursor = conn.execute(
+                "INSERT INTO deliveries(project_id,format,file_path,quality_json) VALUES (?,?,?,?)",
+                (project_id, f"{mode}_{file_format}", str(path), json.dumps({**quality, "_delivery_file": artifact}, ensure_ascii=False)),
+            )
+            delivery_id = int(cursor.lastrowid)
             cursor = conn.execute(
                 """
                 INSERT INTO delivery_manifests(project_id,delivery_id,project_hash,manifest_json,manifest_hash)
@@ -870,20 +1409,29 @@ class ProductionService:
             "format": file_format,
             "mode": mode,
             "file_path": str(path),
-            "object_key": stored[-1]["object_key"] if stored else "",
+            "object_key": artifact["object_key"],
+            "file_name": path.name,
+            "download_url": f"/api/projects/{project_id}/deliveries/{delivery_id}/download",
             "files": file_items,
             "quality": quality,
         }
 
     @staticmethod
     def _project_hash(project: dict[str, Any]) -> str:
+        confirmation_fields = {"delivery_confirmation", "professional_reviewer", "reviewed_by", "compliance_confirmed", "manual_finalized", "final_approved"}
         return content_hash(
             json.dumps(
                 {
                     "id": project["id"],
-                    "updated_at": project.get("updated_at"),
+                    "name": project.get("name"),
+                    "industry": project.get("industry"),
+                    "project_type": project.get("project_type"),
+                    "region": project.get("region"),
+                    "source_text": project.get("source_text"),
+                    "profile": {key: value for key, value in (project.get("profile") or {}).items() if key not in confirmation_fields},
                     "requirements": [(item["id"], item["content"], item["kind"]) for item in project["requirements"]],
-                    "drafts": [(section["draft"]["id"], section["draft"]["content_hash"]) for section in project["sections"] if section.get("draft")],
+                    "sections": [(section["id"], section["title"], section.get("order_no"), section.get("requirement_ids")) for section in project["sections"]],
+                    "drafts": [(section["draft"]["id"], section["draft"]["content_hash"], section["draft"].get("citations")) for section in project["sections"] if section.get("draft")],
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -914,16 +1462,21 @@ class ProductionService:
                 executable = str(windows_soffice)
         if not executable:
             raise ValueError("未安装LibreOffice，无法生成和预检PDF")
+        uno_python = os.environ.get("BID_WRITER_LIBREOFFICE_PYTHON") or "/usr/bin/python3"
+        if not Path(uno_python).is_file():
+            raise ValueError("缺少LibreOffice目录更新组件，请安装python3-uno或设置BID_WRITER_LIBREOFFICE_PYTHON")
+        pdf_path = docx_path.with_suffix(".pdf")
         result = subprocess.run(
-            [executable, "--headless", "--convert-to", "pdf", "--outdir", str(docx_path.parent), str(docx_path)],
+            [uno_python, str(Path(__file__).with_name("render_pdf.py")), "--soffice", executable,
+             "--input", str(docx_path.resolve()), "--output", str(pdf_path.resolve())],
             capture_output=True,
             text=True,
             timeout=180,
             check=False,
         )
-        pdf_path = docx_path.with_suffix(".pdf")
         if result.returncode or not pdf_path.exists():
-            raise ValueError("LibreOffice生成PDF失败")
+            detail = (result.stderr or result.stdout or "未生成文件").strip().splitlines()[-1][:240]
+            raise ValueError(f"LibreOffice生成PDF或更新目录失败：{detail}")
         return pdf_path
 
     @staticmethod
@@ -946,7 +1499,9 @@ class ProductionService:
                 parts.append(section["draft"]["content"])
         return "\n\n".join(parts)
 
-    def _write_docx(self, project: dict[str, Any], path: Path) -> None:
+    def _write_docx(self, project: dict[str, Any], path: Path, mode: str = "formal") -> None:
+        if mode not in {"review", "formal"}:
+            raise ValueError("封面模式仅支持review或formal")
         document = Document()
         section = document.sections[0]
         section.top_margin = Cm(2.5)
@@ -957,18 +1512,81 @@ class ProductionService:
         normal.font.name = "宋体"
         normal.font.size = Pt(12)
         normal._element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+        for style_name in ["Title", "Subtitle", "TOC Heading", *[f"Heading {level}" for level in range(1, 10)]]:
+            style = document.styles[style_name]
+            style.font.color.rgb = RGBColor(0, 0, 0)
+            for borders in style._element.xpath("./w:pPr/w:pBdr"):
+                borders.getparent().remove(borders)
         title = document.add_heading(project["name"], level=0)
         title.alignment = 1
+        title.paragraph_format.space_before = Pt(72)
+        title.paragraph_format.space_after = Pt(20)
+        for run in title.runs:
+            run.font.size = Pt(24)
+            run.font.bold = True
+            run.font.color.rgb = RGBColor(0, 0, 0)
         subtitle = document.add_paragraph("技术标")
         subtitle.alignment = 1
+        subtitle.paragraph_format.space_after = Pt(12)
+        subtitle.runs[0].font.size = Pt(18)
+        edition = document.add_paragraph("专业送审版" if mode == "review" else "正式版")
+        edition.alignment = 1
+        edition.paragraph_format.space_after = Pt(48)
+        edition.runs[0].font.size = Pt(14)
+        profile = project.get("profile") or {}
+        cover_fields = [
+            ("投标单位", profile.get("bidder_name") or profile.get("tenderer_name") or profile.get("bidder")),
+            ("授权签字人", profile.get("authorized_signatory") or profile.get("signatory")),
+            ("专业复核人", profile.get("professional_reviewer") or profile.get("reviewed_by")),
+        ]
+        confirmed_at = (profile.get("delivery_confirmation") or {}).get("confirmed_at")
+        if mode == "formal" and confirmed_at:
+            try:
+                confirmed = datetime.fromisoformat(str(confirmed_at).replace("Z", "+00:00"))
+                if confirmed.tzinfo is None:
+                    confirmed = confirmed.replace(tzinfo=timezone.utc)
+                # Confirmation timestamps are stored in UTC; bid documents use China local dates.
+                cover_fields.append(("定稿日期", confirmed.astimezone(timezone(timedelta(hours=8))).strftime("%Y年%m月%d日")))
+            except ValueError:
+                pass
+        elif profile.get("document_date"):
+            cover_fields.append(("编制日期", profile["document_date"]))
+        for label, value in cover_fields:
+            text = normalize_text(str(value or ""))
+            if not text:
+                continue
+            paragraph = document.add_paragraph(f"{label}：{text}")
+            paragraph.alignment = 1
+            paragraph.paragraph_format.space_after = Pt(12)
+            paragraph.runs[0].font.size = Pt(13)
         document.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
-        toc_title = document.add_heading("目录", level=1)
+        toc_title = document.add_paragraph("目录", style="TOC Heading")
         toc_title.alignment = 0
         toc = document.add_paragraph()
-        run = toc.add_run()
-        field = OxmlElement("w:fldSimple")
-        field.set(qn("w:instr"), 'TOC \\o "1-3" \\h \\z \\u')
-        run._r.addnext(field)
+        begin = OxmlElement("w:fldChar")
+        begin.set(qn("w:fldCharType"), "begin")
+        begin.set(qn("w:dirty"), "true")
+        toc.add_run()._r.append(begin)
+        instruction = OxmlElement("w:instrText")
+        instruction.set(qn("xml:space"), "preserve")
+        instruction.text = ' TOC \\o "1-3" \\h \\z \\u '
+        toc.add_run()._r.append(instruction)
+        separate = OxmlElement("w:fldChar")
+        separate.set(qn("w:fldCharType"), "separate")
+        toc.add_run()._r.append(separate)
+        # Native TOC fields need cached result paragraphs. These are actual titles,
+        # never guessed page numbers; LibreOffice refreshes pagination for PDF export.
+        for index, item in enumerate(section for section in project["sections"] if section.get("draft")):
+            if index:
+                toc = document.add_paragraph()
+            toc.add_run(item["title"])
+            toc.paragraph_format.space_after = Pt(8)
+        end = OxmlElement("w:fldChar")
+        end.set(qn("w:fldCharType"), "end")
+        toc.add_run()._r.append(end)
+        update_fields = OxmlElement("w:updateFields")
+        update_fields.set(qn("w:val"), "true")
+        document.settings._element.append(update_fields)
         document.add_page_break()
         for section_index, item in enumerate(project["sections"], 1):
             draft = item.get("draft")
@@ -978,6 +1596,33 @@ class ProductionService:
                 document.add_page_break()
             document.add_heading(item["title"], level=1)
             self._append_markdown(document, draft["content"], item["title"])
+        for table in document.tables:
+            borders = OxmlElement("w:tblBorders")
+            for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+                border = OxmlElement(f"w:{edge}")
+                for key, value in (("val", "single"), ("sz", "4"), ("color", "D9D9D9")):
+                    border.set(qn(f"w:{key}"), value)
+                borders.append(border)
+            table._tbl.tblPr.append(borders)
+            for row_index, row in enumerate(table.rows):
+                for cell in row.cells:
+                    cell_properties = cell._tc.get_or_add_tcPr()
+                    margins = OxmlElement("w:tcMar")
+                    for edge in ("top", "left", "bottom", "right"):
+                        margin = OxmlElement(f"w:{edge}")
+                        margin.set(qn("w:w"), "80" if edge in {"top", "bottom"} else "100")
+                        margin.set(qn("w:type"), "dxa")
+                        margins.append(margin)
+                    cell_properties.append(margins)
+                    if row_index == 0:
+                        for shading in cell_properties.findall(qn("w:shd")):
+                            shading.set(qn("w:fill"), "DDEBF7")
+                    for paragraph in cell.paragraphs:
+                        paragraph.paragraph_format.line_spacing = 1.15
+                        paragraph.paragraph_format.space_before = Pt(2)
+                        paragraph.paragraph_format.space_after = Pt(2)
+                        for run in paragraph.runs:
+                            run.font.size = Pt(10.5)
         footer = document.sections[0].footer.paragraphs[0]
         footer.alignment = 1
         footer.add_run(f"{project['name']}  |  ")

@@ -272,6 +272,33 @@ td small { color: #7a8790; margin-top: 4px; max-width: 460px; overflow: hidden; 
 .architecture-lines svg { color: #2e8050; }
 .architecture-lines code { margin-top: 6px; color: #64747e; }
 .spin { animation: spin .9s linear infinite; }
+.form-section-title { margin: 24px 0 8px; font-size: 15px; }
+.form-help { color: #687680; font-size: 12px; line-height: 1.7; font-weight: 400; }
+.source-text-label { margin-top: 18px; }
+.delivery-modes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.delivery-mode { min-width: 0; border: 1px solid #dce2e6; border-radius: 6px; padding: 16px; }
+.delivery-mode h3 { margin: 0; font-size: 16px; }
+.delivery-mode > p { color: #687680; font-size: 12px; line-height: 1.7; min-height: 42px; }
+.delivery-mode .actions { margin-top: 14px; }
+.delivery-mode .gate-result:empty { display: none; }
+.project-delivery .gate-result button { margin-top: 8px; font-size: 12px; }
+.delivery-latest { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 14px; margin-bottom: 16px; border: 1px solid #98c7ab; border-radius: 6px; background: #f0f8f3; font-size: 13px; }
+.delivery-download { display: inline-flex; align-items: center; gap: 7px; min-height: 36px; color: #176b62; font-weight: 700; font-size: 12px; overflow-wrap: anywhere; }
+.delivery-download svg { flex-shrink: 0; }
+.delivery-download:hover { text-decoration: underline; }
+.book-preview { margin: 16px 0; border: 1px solid #dce2e6; border-radius: 6px; }
+.book-preview summary { padding: 12px; cursor: pointer; font-size: 13px; font-weight: 700; }
+.book-preview pre { margin: 0; padding: 16px; border-top: 1px solid #dce2e6; max-height: 540px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.8 "Microsoft YaHei", sans-serif; }
+.final-review-form { display: grid; gap: 14px; }
+.final-review-form > label:first-child { max-width: 320px; }
+.final-review-form button { justify-self: start; }
+.confirmation-check { display: flex; align-items: flex-start; gap: 10px; line-height: 1.7; font-weight: 400; }
+.confirmation-check input { width: 17px; height: 17px; flex: 0 0 17px; margin: 3px 0 0; }
+.delivery-history article { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; padding: 14px 0; border-top: 1px solid #e6eaed; }
+.delivery-history article > div { min-width: 0; flex: 1 1 280px; overflow-wrap: anywhere; }
+.delivery-history strong, .delivery-history small { display: block; }
+.delivery-history strong { font-size: 13px; }
+.delivery-history small { margin-top: 6px; color: #71808b; font-size: 11px; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 @media (max-width: 1100px) {
@@ -284,6 +311,9 @@ td small { color: #7a8790; margin-top: 4px; max-width: 460px; overflow: hidden; 
 }
 
 @media (max-width: 760px) {
+  .delivery-modes { grid-template-columns: 1fr; }
+  .project-delivery .panel-title, .project-profile .panel-title { align-items: flex-start; flex-direction: column; gap: 12px; }
+  .project-delivery .gate-badge { min-height: 46px; height: auto; padding: 12px; }
   .app-shell { grid-template-columns: 1fr; }
   .sidebar { position: static; width: 100%; height: auto; padding: 10px; }
   .brand { border-bottom: 0; padding-bottom: 10px; }

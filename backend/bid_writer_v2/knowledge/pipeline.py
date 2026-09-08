@@ -206,6 +206,7 @@ class KnowledgePipelineService:
                         content,summary,tags_json,applicability,risk_level,source_quote,review_decision,
                         review_confidence,review_issues_json,rule_findings_json,status
                     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(pipeline_run_id, candidate_index) DO NOTHING
                     """,
                     (
                         run_id,
@@ -228,6 +229,8 @@ class KnowledgePipelineService:
                         status,
                     ),
                 )
+                if not getattr(cursor, "lastrowid", None):
+                    continue
                 candidate_id = int(cursor.lastrowid)
                 findings = [*model_issues, *rule_findings]
                 if decision != "pass" and not findings:
@@ -548,6 +551,7 @@ class KnowledgePipelineService:
                         content,summary,tags_json,applicability,risk_level,source_quote,review_decision,
                         review_confidence,review_issues_json,rule_findings_json,status
                     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(pipeline_run_id, candidate_index) DO NOTHING
                     """,
                     (
                         run_id,
@@ -570,6 +574,8 @@ class KnowledgePipelineService:
                         "ready" if ready else "needs_review",
                     ),
                 )
+                if not getattr(cursor, "lastrowid", None):
+                    continue
                 candidate_id = int(cursor.lastrowid)
                 findings = [*model_issues, *rule_findings]
                 if decision != "pass" and not findings:
@@ -919,6 +925,7 @@ class KnowledgePipelineService:
                         content,summary,tags_json,applicability,risk_level,source_quote,review_decision,
                         review_confidence,review_issues_json,rule_findings_json,status,chunk_id
                     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(pipeline_run_id, candidate_index) DO NOTHING
                     """,
                     (
                         run_id, document_id, document["source_id"], section["id"], candidate_index,
@@ -929,6 +936,8 @@ class KnowledgePipelineService:
                         "ready" if ready else "needs_review", chunk_id,
                     ),
                 )
+                if not getattr(cursor, "lastrowid", None):
+                    continue
                 candidate_id = int(cursor.lastrowid)
                 findings = [*model_issues, *rule_findings]
                 if decision != "pass" and not findings:

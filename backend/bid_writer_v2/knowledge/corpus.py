@@ -3,12 +3,16 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import threading
 from collections import Counter
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
-from ..ai_runtime import AiRuntime, KNOWLEDGE_FORMAL_REVIEW_PROMPT, KNOWLEDGE_REVIEW_PROMPT
+from pydantic import BaseModel, ConfigDict, Field
+
+from ..ai_runtime import AiRuntime, KNOWLEDGE_FORMAL_REVIEW_PROMPT, KNOWLEDGE_REVIEW_PROMPT, KnowledgeReviewIssue, PromptSpec
 from ..database import Database
 from ..evaluation import RetrievalEvaluationService
 from ..retrieval import HybridRetrievalService, tokenize
@@ -60,6 +64,68 @@ SCANNED_TEXTUAL_TITLE_PATTERN = re.compile(
     r"(?:审查|意见|记录|报告|说明|方案|文本|合同|要求|清单|验收|推荐|申报|表格)",
     re.IGNORECASE,
 )
+_RUN_LOCKS: dict[tuple[str, int, str], Any] = {}
+_RUN_LOCKS_GUARD = threading.Lock()
+
+
+RECOVERY_CONTRACT = "structured-body-summary-applicability-v2"
+
+
+class RetiredPublicationRevision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_index: Literal[0]
+    decision: Literal["revise", "reject", "escalate"]
+    confidence: float = Field(ge=0, le=1)
+    issues: list[KnowledgeReviewIssue] = Field(max_length=20)
+    corrected_content: str = Field(max_length=12000)
+    corrected_summary: str = Field(max_length=600)
+    corrected_applicability: str = Field(max_length=1500)
+
+
+class RetiredPublicationRevisionOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reviews: list[RetiredPublicationRevision] = Field(min_length=1, max_length=1)
+
+
+RETIRED_PUBLICATION_REVISION_PROMPT = PromptSpec(
+    key="knowledge.retired-publication-structured-revision", version="2.0.0",
+    instructions=KNOWLEDGE_FORMAL_REVIEW_PROMPT.instructions,
+    template=(
+        "依据来源修订这份停用知识，逐项解决recovery_context中的原复核问题。失败说明只是复核证据，不能作为来源。"
+        "只输出JSON对象reviews，且仅一条，完整字段为candidate_index=0、decision、confidence、issues、"
+        "corrected_content、corrected_summary、corrected_applicability。可修复时decision=revise，并同时给出三个完整的新字段；"
+        "证据不足时reject或escalate，三个修订字段均为空。corrected_content仅为技术正文，不能包裹标题、内容、正文、摘要、"
+        "适用范围等字段标签或章节；corrected_summary必须是独立概括，不得复制正文或截取正文前200字；"
+        "corrected_applicability必须具体且有来源支持，不得继承原来范围过宽的适用性。三者的条件和适用范围必须一致。"
+        "保持输入标题，不要另造标题；禁止增加来源之外的事实、参数、承诺。\n\n"
+        "来源章节：\n{section_text}\n\n待修订知识：\n{candidate_json}"
+    ),
+    output_model=RetiredPublicationRevisionOutput,
+)
+
+
+def _recovery_review_spec(formal: bool) -> PromptSpec:
+    base = KNOWLEDGE_FORMAL_REVIEW_PROMPT if formal else KNOWLEDGE_REVIEW_PROMPT
+    return PromptSpec(
+        key="knowledge.retired-publication-formal" if formal else "knowledge.retired-publication-review",
+        version="2.0.0", instructions=base.instructions,
+        template=base.template + (
+            "\n\n本次采用完整结构化修订契约v2。content是将同一summary、applicability与技术正文组合后的完整发布稿。"
+            "独立核验这三个字段与来源及彼此一致，特别检查summary是否扩大范围、applicability是否遗漏条件；"
+            "字段缺失、元数据与正文矛盾、摘要复制正文或范围扩大时不得pass。没有遗留旧摘要或旧范围；"
+            "不得根据历史修订或通过记录推定本稿通过。"
+        ),
+        output_model=base.output_model,
+    )
+
+
+class FinalizationInterrupted(RuntimeError):
+    """The operator stopped the run at a durable finalization checkpoint."""
+
+    def __init__(self, message: str, *, cancel_requested: bool = False) -> None:
+        super().__init__(message)
+        self.cancel_requested = cancel_requested
 
 
 def utc_now() -> datetime:
@@ -87,6 +153,34 @@ class CorpusCompletionService:
         self.ai_runtime = ai_runtime
         self.evaluation = evaluation
         self.dispatch: Callable[[int, int, int, str], None] | None = None
+
+    @contextmanager
+    def _run_mutex(self, run_id: int, purpose: str):
+        identity = self.db.database_url or str(self.db.path.resolve())
+        with _RUN_LOCKS_GUARD:
+            lock = _RUN_LOCKS.setdefault((identity, run_id, purpose), threading.Lock())
+        if not lock.acquire(blocking=False):
+            yield False
+            return
+        try:
+            if self.db.backend == "postgresql":
+                # A session lock spans the short transactions used by AI/index
+                # checkpoints and is released even if the worker process exits.
+                key = run_id * 100_000 + (9_138 if purpose == "finalize" else 9_139)
+                with self.db.connect() as conn:
+                    row = conn.execute("SELECT pg_try_advisory_lock(CAST(? AS BIGINT)) AS locked", (key,)).fetchone()
+                    if not row or not row["locked"]:
+                        yield False
+                        return
+                    try:
+                        yield True
+                    finally:
+                        # Pooled connections must never retain a session lock.
+                        conn.execute("SELECT pg_advisory_unlock(CAST(? AS BIGINT))", (key,))
+            else:
+                yield True
+        finally:
+            lock.release()
 
     def create_run(self, created_by: int | None = None) -> dict[str, Any]:
         active = self.db.row("SELECT id FROM corpus_runs WHERE status IN ('pending','running','paused') ORDER BY id DESC LIMIT 1")
@@ -429,7 +523,7 @@ class CorpusCompletionService:
             if int((waiting or {}).get("count", 0)):
                 self._dispatch_next(run_id, 60_000, current_running_stage=preferred_stage)
                 return self.get_run(run_id)
-            return self._finalize_run(run_id, progress)
+            return self._finalize_run(run_id, progress, cancelled)
         progress(str(item["stage"]), 5, f"处理 {item['file_name']}", {"source_id": item["source_id"]})
         active_items = [item]
         try:
@@ -473,12 +567,12 @@ class CorpusCompletionService:
                 (run_id,),
             )
             if int((remaining or {}).get("count", 0)) == 0:
-                return self._finalize_run(run_id, progress)
+                return self._finalize_run(run_id, progress, cancelled)
             self._dispatch_next(run_id, current_running_stage=str(item["stage"]))
         return self.get_run(run_id)
 
     def _claim_next_item(self, run_id: int, preferred_stage: str = "") -> dict[str, Any] | None:
-        if preferred_stage == "__recovery__":
+        if preferred_stage in {"__recovery__", "__finalize__"}:
             preferred_stage = ""
         policy = parse_json(self._raw_run(run_id).get("policy_json"), {})
         capacities = {
@@ -589,6 +683,14 @@ class CorpusCompletionService:
     def _dispatch_next(self, run_id: int, delay_ms: int = 0, *, current_running_stage: str = "") -> None:
         if not self.dispatch:
             return
+        with self._run_mutex(run_id, "dispatch") as acquired:
+            if acquired:
+                self._dispatch_available(run_id, delay_ms)
+
+    def _dispatch_available(self, run_id: int, delay_ms: int) -> None:
+        run = self._raw_run(run_id)
+        if run["status"] not in {"pending", "running"}:
+            return
         pending = self.db.rows(
             """
             SELECT stage,COUNT(*) AS count FROM corpus_run_items
@@ -598,8 +700,39 @@ class CorpusCompletionService:
             (run_id,),
         )
         if not pending:
+            unfinished = self.db.row(
+                "SELECT COUNT(*) AS count FROM corpus_run_items WHERE run_id=? AND status<>'terminal'", (run_id,)
+            ) or {}
+            if int(unfinished.get("count") or 0):
+                return
+            active = self.db.row(
+                """
+                SELECT id FROM app_jobs WHERE job_type='knowledge.corpus.tick' AND target_id=?
+                    AND status IN ('pending','retrying','running') LIMIT 1
+                """,
+                (f"{run_id}:__finalize__",),
+            )
+            if not active:
+                latest_job = self._latest_corpus_job(run_id)
+                checkpoint = parse_json(run.get("checkpoint_json"), {}).get("finalization", {})
+                if (
+                    latest_job and latest_job["status"] == "failed"
+                    and int(checkpoint.get("acknowledged_failed_job_id") or 0) != int(latest_job["id"])
+                ):
+                    # A scheduler restart must not silently turn a failed final
+                    # audit into thousands of fresh external-model requests.
+                    error = {"type": latest_job.get("error_code") or "background_job_failed", "message": str(latest_job.get("error_message") or "后台任务失败")[:1000], "job_id": latest_job["id"]}
+                    with self.db.connect() as conn:
+                        conn.execute(
+                            "UPDATE corpus_runs SET status='paused',stage='finalization_recovery',pause_reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('pending','running')",
+                            (f"收尾前发现上一后台任务失败，等待显式恢复：{error['message']}", run_id),
+                        )
+                    self._finalization_checkpoint(run_id, "finalization_recovery", 95, status="failed", error=error)
+                    self._write_finalization_failure_report(run_id, {"error": error})
+                    return
+                self.dispatch(run_id, delay_ms, 1, "__finalize__")
             return
-        policy = parse_json(self._raw_run(run_id).get("policy_json"), {})
+        policy = parse_json(run.get("policy_json"), {})
         for row in pending:
             stage = str(row["stage"])
             if stage == "__recovery__":
@@ -612,6 +745,16 @@ class CorpusCompletionService:
             }.get(stage, 1)
             desired = max(1, min(capacity, int(row["count"])))
             self.dispatch(run_id, delay_ms, desired, stage)
+
+    def _latest_corpus_job(self, run_id: int) -> dict[str, Any] | None:
+        return self.db.row(
+            """
+            SELECT id,status,error_code,error_message FROM app_jobs
+            WHERE job_type='knowledge.corpus.tick' AND (target_id=? OR target_id LIKE ?)
+            ORDER BY id DESC LIMIT 1
+            """,
+            (str(run_id), f"{run_id}:%"),
+        )
 
     def _normalize_item(self, item: dict[str, Any]) -> None:
         if str(item.get("file_name") or "").startswith("~$"):
@@ -1051,38 +1194,88 @@ class CorpusCompletionService:
         return ""
 
     def _prepare_representative_sections(self, run_id: int, document_id: int) -> list[int]:
+        """Cluster one document with one batched embedding pass.
+
+        The old implementation called /embed once per section (N+1 requests).
+        We still shortlist lexically per section, but deduplicate all section and
+        candidate texts before sending bounded batches to the GPU service.
+        """
         sections = self.db.rows(
             "SELECT ds.*,d.source_id FROM document_sections ds JOIN standard_documents d ON d.id=ds.document_id WHERE ds.document_id=? AND LENGTH(TRIM(ds.content))>=30 ORDER BY ds.order_no",
             (document_id,),
         )
-        representatives: list[int] = []
+        plans: list[tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any] | None, list[tuple[dict[str, Any], float]]]] = []
+        vector_texts: dict[int, str] = {}
         for section in sections:
             existing = self.db.row(
                 "SELECT representative_section_id,relation_type FROM corpus_section_clusters WHERE run_id=? AND member_section_id=?",
                 (run_id, section["id"]),
             )
+            exact = None
+            shortlisted: list[tuple[dict[str, Any], float]] = []
+            if not existing:
+                exact = self.db.row(
+                    """
+                    SELECT c.representative_section_id,ds.content
+                    FROM corpus_section_clusters c
+                    JOIN document_sections ds ON ds.id=c.representative_section_id
+                    WHERE c.run_id=? AND c.representative_section_id=c.member_section_id
+                      AND ds.content_fingerprint=? AND ds.id<>?
+                    ORDER BY ds.id LIMIT 1
+                    """,
+                    (run_id, section["content_fingerprint"], section["id"]),
+                )
+                if not exact:
+                    shortlisted = self._near_section_shortlist(section, run_id)
+            plans.append((section, existing, exact, shortlisted))
+            # All current-document section vectors are prepared together. This
+            # also preserves near-duplicate detection among sections first seen
+            # in this same document.
+            vector_texts[int(section["id"])] = str(section["content"])
+            for candidate, _lexical in shortlisted[:32]:
+                vector_texts.setdefault(int(candidate["id"]), str(candidate["content"]))
+
+        vectors_by_id: dict[int, list[float]] = {}
+        if vector_texts and self.retrieval.embedding.available:
+            vector_ids = list(vector_texts)
+            vectors = self.retrieval.embedding.embed([vector_texts[item_id] for item_id in vector_ids])
+            if len(vectors) == len(vector_ids):
+                vectors_by_id = dict(zip(vector_ids, vectors))
+
+        representatives: list[int] = []
+        current_representatives: list[dict[str, Any]] = []
+        fingerprint_representatives: dict[str, int] = {}
+        for section, existing, exact, shortlisted in plans:
+            section_id = int(section["id"])
             if existing:
-                if int(existing["representative_section_id"]) == int(section["id"]):
-                    representatives.append(int(section["id"]))
+                if int(existing["representative_section_id"]) == section_id:
+                    representatives.append(section_id)
+                    current_representatives.append(section)
+                    fingerprint_representatives[str(section["content_fingerprint"])] = section_id
                 continue
-            exact = self.db.row(
-                """
-                SELECT c.representative_section_id,ds.content
-                FROM corpus_section_clusters c
-                JOIN document_sections ds ON ds.id=c.representative_section_id
-                WHERE c.run_id=? AND c.representative_section_id=c.member_section_id
-                  AND ds.content_fingerprint=? AND ds.id<>?
-                ORDER BY ds.id LIMIT 1
-                """,
-                (run_id, section["content_fingerprint"], section["id"]),
+
+            in_document_exact = fingerprint_representatives.get(str(section["content_fingerprint"]))
+            representative_id: int | None = (
+                in_document_exact
+                or (int(exact["representative_section_id"]) if exact else None)
             )
-            representative_id: int | None = int(exact["representative_section_id"]) if exact else None
-            relation_type = "exact" if exact else "representative"
-            lexical_score = 1.0 if exact else 0.0
-            semantic_score = 1.0 if exact else 0.0
+            relation_type = "exact" if representative_id is not None else "representative"
+            lexical_score = 1.0 if representative_id is not None else 0.0
+            semantic_score = 1.0 if representative_id is not None else 0.0
             conflict = False
             if representative_id is None:
-                near = self._near_section(section, run_id)
+                combined = list(shortlisted)
+                source_tokens = set(tokenize(section["content"]))
+                source_length = max(1, len(normalize_text(section["content"])))
+                for candidate in current_representatives:
+                    candidate_length = len(normalize_text(candidate["content"]))
+                    if not int(source_length * 0.8) <= candidate_length <= int(source_length * 1.2):
+                        continue
+                    other_tokens = set(tokenize(candidate["content"]))
+                    lexical = len(source_tokens & other_tokens) / max(1, len(source_tokens | other_tokens))
+                    if lexical >= 0.85:
+                        combined.append((candidate, lexical))
+                near = self._best_near_section(section, combined, vectors_by_id)
                 if near:
                     representative_id = int(near["id"])
                     relation_type = "near"
@@ -1090,12 +1283,14 @@ class CorpusCompletionService:
                     semantic_score = float(near["semantic_score"])
                     conflict = bool(near["conflict_detected"])
             if representative_id is None or conflict:
-                representative_id = int(section["id"])
+                representative_id = section_id
                 relation_type = "representative"
                 lexical_score = semantic_score = 1.0
                 representatives.append(representative_id)
+                current_representatives.append(section)
+                fingerprint_representatives[str(section["content_fingerprint"])] = representative_id
             else:
-                self._reattach_section_sources(representative_id, int(section["id"]), int(section["source_id"]))
+                self._reattach_section_sources(representative_id, section_id, int(section["source_id"]))
             with self.db.connect() as conn:
                 conn.execute(
                     """
@@ -1107,7 +1302,7 @@ class CorpusCompletionService:
                     (
                         run_id,
                         representative_id,
-                        section["id"],
+                        section_id,
                         relation_type,
                         lexical_score,
                         semantic_score,
@@ -1117,18 +1312,49 @@ class CorpusCompletionService:
                 )
         return representatives
 
-    def _near_section(self, section: dict[str, Any], run_id: int) -> dict[str, Any] | None:
+    def _near_section_shortlist(self, section: dict[str, Any], run_id: int) -> list[tuple[dict[str, Any], float]]:
         length = max(1, len(normalize_text(section["content"])))
-        candidates = self.db.rows(
-            """
-            SELECT ds.id,ds.heading,ds.content
-            FROM corpus_section_clusters c JOIN document_sections ds ON ds.id=c.representative_section_id
-            WHERE c.run_id=? AND c.representative_section_id=c.member_section_id AND ds.id<>?
-              AND LENGTH(ds.content) BETWEEN ? AND ?
-            ORDER BY CASE WHEN ds.heading=? THEN 0 ELSE 1 END,ds.id DESC LIMIT 250
-            """,
-            (run_id, section["id"], int(length * 0.8), int(length * 1.2), section["heading"]),
-        )
+        lower_length = int(length * 0.8)
+        upper_length = int(length * 1.2)
+        if self.db.backend == "postgresql":
+            # Force PostgreSQL to use the content-length expression index first.
+            # Without the materialized candidate set the planner underestimates
+            # self-representatives and performs ~160k primary-key lookups per
+            # section. Fetch full text only for the final 250 rows.
+            candidates = self.db.rows(
+                """
+                WITH length_candidates AS MATERIALIZED (
+                    SELECT id,heading FROM document_sections
+                    WHERE id<>? AND LENGTH(content) BETWEEN ? AND ?
+                ), picked AS MATERIALIZED (
+                    SELECT ds.id,ds.heading,
+                        CASE WHEN ds.heading=? THEN 0 ELSE 1 END AS heading_rank
+                    FROM length_candidates ds
+                    WHERE EXISTS (
+                        SELECT 1 FROM corpus_section_clusters c
+                        WHERE c.run_id=? AND c.member_section_id=ds.id
+                          AND c.representative_section_id=ds.id
+                        LIMIT 1 OFFSET 0
+                    )
+                    ORDER BY heading_rank,ds.id DESC LIMIT 250
+                )
+                SELECT p.id,p.heading,ds.content
+                FROM picked p JOIN document_sections ds ON ds.id=p.id
+                ORDER BY p.heading_rank,p.id DESC
+                """,
+                (section["id"], lower_length, upper_length, section["heading"], run_id),
+            )
+        else:
+            candidates = self.db.rows(
+                """
+                SELECT ds.id,ds.heading,ds.content
+                FROM corpus_section_clusters c JOIN document_sections ds ON ds.id=c.representative_section_id
+                WHERE c.run_id=? AND c.representative_section_id=c.member_section_id AND ds.id<>?
+                  AND LENGTH(ds.content) BETWEEN ? AND ?
+                ORDER BY CASE WHEN ds.heading=? THEN 0 ELSE 1 END,ds.id DESC LIMIT 250
+                """,
+                (run_id, section["id"], lower_length, upper_length, section["heading"]),
+            )
         source_tokens = set(tokenize(section["content"]))
         shortlisted: list[tuple[dict[str, Any], float]] = []
         for candidate in candidates:
@@ -1136,16 +1362,29 @@ class CorpusCompletionService:
             lexical = len(source_tokens & other_tokens) / max(1, len(source_tokens | other_tokens))
             if lexical >= 0.85:
                 shortlisted.append((candidate, lexical))
-        if not shortlisted or not self.retrieval.embedding.available:
-            return None
-        texts = [section["content"], *[item[0]["content"] for item in shortlisted[:32]]]
-        vectors = self.retrieval.embedding.embed(texts)
-        if len(vectors) != len(texts):
+        return shortlisted[:32]
+
+    def _best_near_section(
+        self,
+        section: dict[str, Any],
+        shortlisted: list[tuple[dict[str, Any], float]],
+        vectors_by_id: dict[int, list[float]],
+    ) -> dict[str, Any] | None:
+        source_vector = vectors_by_id.get(int(section["id"]))
+        if not shortlisted or source_vector is None:
             return None
         source_numbers = self._number_signature(section["content"])
         best: dict[str, Any] | None = None
-        for (candidate, lexical), vector in zip(shortlisted[:32], vectors[1:]):
-            semantic = self._cosine(vectors[0], vector)
+        seen: set[int] = set()
+        for candidate, lexical in shortlisted:
+            candidate_id = int(candidate["id"])
+            if candidate_id in seen:
+                continue
+            seen.add(candidate_id)
+            vector = vectors_by_id.get(candidate_id)
+            if vector is None:
+                continue
+            semantic = self._cosine(source_vector, vector)
             if semantic < 0.94:
                 continue
             conflict = source_numbers != self._number_signature(candidate["content"])
@@ -1495,23 +1734,67 @@ class CorpusCompletionService:
             used += len(block)
         return "\n\n".join(blocks)
 
-    def _ai_review(self, candidate: dict[str, Any], task_type: str, formal: bool = False) -> dict[str, Any]:
+    def _ai_review(self, candidate: dict[str, Any], task_type: str, formal: bool = False, *, recovery_context: dict[str, Any] | None = None) -> dict[str, Any]:
         section_id = int(candidate.get("source_section_id") or 0)
         section = self.db.row("SELECT heading,content FROM document_sections WHERE id=?", (section_id,)) or {}
         spec = KNOWLEDGE_FORMAL_REVIEW_PROMPT if formal else KNOWLEDGE_REVIEW_PROMPT
+        structured_recovery = recovery_context is not None or candidate.get("recovery_contract") == RECOVERY_CONTRACT
+        if structured_recovery:
+            spec = RETIRED_PUBLICATION_REVISION_PROMPT if task_type == "retired_publication_revision" else _recovery_review_spec(formal)
+        review_input = {"candidate_index": 0, **{key: candidate.get(key) for key in ("title", "content", "summary", "applicability", "risk_level", "source_quote", "source_section_id")}}
+        payload = {"candidate_id": candidate["id"], "content_hash": content_hash(candidate["content"])}
+        if structured_recovery:
+            review_input["recovery_contract"] = RECOVERY_CONTRACT
+            payload["recovery_contract"] = RECOVERY_CONTRACT
+        if recovery_context is not None:
+            # Previous findings are review evidence, never part of a source quote.
+            review_input["recovery_context"] = recovery_context
+            payload["recovery_context"] = recovery_context
         prompt = spec.render(
             section_text=f"[SECTION:{section_id}] {section.get('heading','')}\n{section.get('content','')}",
-            candidate_json=json.dumps([{"candidate_index": 0, **{key: candidate.get(key) for key in ("title", "content", "summary", "applicability", "risk_level", "source_quote", "source_section_id")}}], ensure_ascii=False),
+            candidate_json=json.dumps([review_input], ensure_ascii=False),
         )
         result = self.ai_runtime.execute(
-            spec, prompt, {"candidate_id": candidate["id"], "content_hash": content_hash(candidate["content"])},
+            spec, prompt, payload,
             task_type=task_type, target_type="knowledge_candidate", target_id=int(candidate.get("id") or candidate.get("unit_id") or 0), use_cache=False,
         )
         reviews = ((result.get("payload") or {}).get("reviews") or [])
-        if not reviews:
+        if not reviews or (structured_recovery and (len(reviews) != 1 or reviews[0].get("candidate_index") != 0)):
             raise RuntimeError(f"model review failed: {result.get('error') or '复核无结果'}")
         review = reviews[0]
         return {**review, "run_id": result.get("run_id")}
+
+    @staticmethod
+    def _recovery_artifact(content: str, summary: str, applicability: str) -> dict[str, str]:
+        fields = {"body": content, "summary": summary, "applicability": applicability}
+        if any(not isinstance(value, str) for value in fields.values()):
+            raise ValueError("recovery_metadata_fields_must_be_strings")
+        fields = {key: normalize_text(value) for key, value in fields.items()}
+        if any(not value for value in fields.values()):
+            raise ValueError("recovery_requires_complete_body_summary_applicability")
+        if len(fields["body"]) > 12000 or len(fields["summary"]) > 600 or len(fields["applicability"]) > 1500:
+            raise ValueError("recovery_metadata_field_too_long")
+        # A labelled whole document in corrected_content used to leave stale
+        # summary/applicability in the subsequent model input. Require actual
+        # separate fields; never silently extract or invent missing metadata.
+        wrapper = r"(?:^|\n)\s*(?:#{1,6}\s*)?(?:标题|内容|正文|摘要|适用范围|title|content|body|summary|applicability)\s*(?:[:：]|\n|$)"
+        if any(re.search(wrapper, value, re.IGNORECASE) for value in fields.values()):
+            raise ValueError("recovery_metadata_contains_wrapped_or_duplicate_fields")
+        if fields["summary"] in {fields["body"], fields["body"][:200]}:
+            raise ValueError("recovery_summary_must_not_copy_or_truncate_body")
+        artifact = f"## 摘要\n{fields['summary']}\n\n## 适用范围\n{fields['applicability']}\n\n## 正文\n{fields['body']}"
+        return {**fields, "content": artifact}
+
+    @classmethod
+    def _read_recovery_artifact(cls, content: str, summary: str) -> dict[str, str]:
+        match = re.fullmatch(r"## 摘要\n(.+?)\n\n## 适用范围\n(.+?)\n\n## 正文\n(.+)", str(content), re.DOTALL)
+        if not match:
+            raise ValueError("recovery_version_missing_structured_metadata")
+        embedded_summary, applicability, body = match.groups()
+        artifact = cls._recovery_artifact(body, embedded_summary, applicability)
+        if artifact["content"] != content or artifact["summary"] != summary:
+            raise ValueError("recovery_version_metadata_mismatch")
+        return artifact
 
     def _apply_revision(self, candidate: dict[str, Any], corrected_content: str) -> dict[str, Any]:
         corrected = normalize_text(corrected_content)
@@ -1521,6 +1804,312 @@ class CorpusCompletionService:
                 (corrected, candidate["id"]),
             )
         return {**candidate, "content": corrected, "review_decision": "revise"}
+
+    def _accepted_without_publication(self, run_id: int) -> list[dict[str, Any]]:
+        # Do not inner-join provenance here: missing provenance is a blocker,
+        # not a reason for an accepted candidate to disappear from this queue.
+        return self.db.rows(
+            """
+            SELECT c.id AS candidate_id,c.unit_id,c.title FROM knowledge_ai_candidates c
+            WHERE c.status='accepted'
+                AND EXISTS (SELECT 1 FROM corpus_run_items i WHERE i.run_id=? AND i.pipeline_run_id=c.pipeline_run_id)
+                AND NOT EXISTS (SELECT 1 FROM knowledge_publications p WHERE p.unit_id=c.unit_id AND p.status='published')
+            ORDER BY c.id
+            """, (run_id,),
+        )
+
+    def _retired_recovery_state(self, candidate_id: int) -> dict[str, Any]:
+        candidate = self.db.row("SELECT * FROM knowledge_ai_candidates WHERE id=?", (candidate_id,))
+        if not candidate or candidate["status"] != "accepted" or not candidate.get("unit_id"):
+            raise ValueError("candidate_not_accepted_or_missing_unit")
+        unit_id = int(candidate["unit_id"])
+        if self.db.row("SELECT id FROM knowledge_publications WHERE unit_id=? AND status='published'", (unit_id,)):
+            raise ValueError("publication_state_changed")
+        unit = self.db.row("SELECT * FROM knowledge_units WHERE id=?", (unit_id,))
+        publication = self.db.row(
+            """SELECT p.*,v.content AS version_content,v.summary AS version_summary,v.origin AS version_origin FROM knowledge_publications p
+            JOIN knowledge_versions v ON v.id=p.version_id WHERE p.unit_id=? AND p.status='retired' ORDER BY p.id DESC LIMIT 1""",
+            (unit_id,),
+        )
+        candidate_source = self.db.row(
+            """SELECT ds.id,ds.document_id,ds.heading,ds.content,d.source_id,s.sha256
+            FROM document_sections ds JOIN standard_documents d ON d.id=ds.document_id
+            JOIN source_files s ON s.id=d.source_id WHERE ds.id=?""", (candidate.get("source_section_id"),),
+        )
+        if not unit or not publication:
+            raise ValueError("missing_retired_publication")
+        if (not candidate_source or not normalize_text(str(candidate_source.get("content") or ""))
+                or candidate_source["document_id"] != candidate["document_id"] or candidate_source["source_id"] != candidate["source_id"]):
+            raise ValueError("missing_or_mismatched_source_provenance")
+        # Publication audit chooses the first unit-source link. Use that same
+        # source for recovery, even when this accepted candidate came from a
+        # later source linked to a shared unit; do not rewrite source links.
+        source = self.db.row(
+            """SELECT ds.id,ds.document_id,ds.heading,ds.content,us.source_id,s.sha256,us.id AS source_link_id
+            FROM knowledge_unit_sources us LEFT JOIN document_sections ds ON ds.id=us.section_id
+            LEFT JOIN source_files s ON s.id=us.source_id WHERE us.unit_id=? ORDER BY us.id LIMIT 1""", (unit_id,),
+        )
+        if not source or not source.get("id") or not source.get("sha256") or not normalize_text(str(source.get("content") or "")):
+            raise ValueError("missing_publication_audit_source")
+        retirement = self.db.row(
+            """SELECT * FROM knowledge_review_decisions WHERE unit_id=?
+            AND decision_stage='published_artifact_audit' AND decision='retire' ORDER BY id DESC LIMIT 1""", (unit_id,),
+        )
+        if not retirement:
+            raise ValueError("missing_retirement_review_evidence")
+        try:
+            retirement_time = datetime.fromisoformat(str(retirement["created_at"]).replace("Z", "+00:00"))
+            publication_time = datetime.fromisoformat(str(publication["retired_at"]).replace("Z", "+00:00"))
+            retirement_time = retirement_time.replace(tzinfo=retirement_time.tzinfo or timezone.utc)
+            publication_time = publication_time.replace(tzinfo=publication_time.tzinfo or timezone.utc)
+            if retirement_time < publication_time:
+                raise ValueError("retirement_review_does_not_match_latest_publication")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("retirement_review_does_not_match_latest_publication") from exc
+        previous_review = self.db.row(
+            """SELECT d.*,a.input_json AS ai_input_json,a.status AS ai_status,a.prompt_hash AS ai_prompt_hash
+            FROM knowledge_review_decisions d LEFT JOIN ai_runs a ON a.id=d.ai_run_id WHERE d.unit_id=? AND d.id<?
+            AND d.decision_stage='published_revalidation' ORDER BY d.id DESC LIMIT 1""", (unit_id, retirement["id"]),
+        )
+        identity = {"publication_id": int(publication["id"]), "version_id": int(publication["version_id"]),
+                    "publication_version": int(publication["publication_version"]), "content_hash": publication["content_hash"],
+                    "body_hash": content_hash(publication["version_content"])}
+        bound = False
+        review_bound = False
+        for decision in (retirement, previous_review):
+            if not decision:
+                continue
+            findings = parse_json(decision.get("findings_json"), [])
+            saved = next((finding for finding in findings if isinstance(finding, dict) and finding.get("code") == "publication_binding"), None)
+            if saved and all(saved.get(key) == value for key, value in identity.items()):
+                bound = True
+                if decision is previous_review:
+                    review_bound = True
+        if not review_bound and previous_review:
+            # Earlier audits predate explicit bindings, but their immutable AI
+            # input records the exact publication ID and body hash.
+            ai_input = parse_json(previous_review.get("ai_input_json"), {})
+            payload = ai_input.get("payload") or {}
+            review_bound = (previous_review.get("ai_status") == "succeeded"
+                            and previous_review.get("ai_prompt_hash") == KNOWLEDGE_FORMAL_REVIEW_PROMPT.prompt_hash
+                            and payload.get("candidate_id") == identity["publication_id"]
+                            and payload.get("content_hash") == identity["body_hash"])
+            bound = bound or review_bound
+        if not bound:
+            raise ValueError("retirement_evidence_not_bound_to_publication")
+        if not review_bound:
+            previous_review = None
+        context = {
+            "candidate_id": candidate_id, "unit_id": unit_id,
+            "old_publication_id": publication["id"], "old_version_id": publication["version_id"],
+            "old_content_hash": publication["content_hash"], "old_body_hash": content_hash(publication["version_content"]),
+            "retirement_decision_id": retirement["id"], "retirement_findings": parse_json(retirement["findings_json"], []),
+            "prior_review_id": previous_review["id"] if previous_review else None,
+            "prior_findings": parse_json(previous_review["findings_json"], []) if previous_review else [],
+            "prior_decision": previous_review["decision"] if previous_review else None,
+            "prior_confidence": previous_review["confidence"] if previous_review else None,
+            "source_section_id": source["id"],
+            "source_hash": content_hash(json.dumps(source, ensure_ascii=False, sort_keys=True)),
+            "candidate_source_hash": content_hash(json.dumps(candidate_source, ensure_ascii=False, sort_keys=True)),
+            "candidate_hash": content_hash(json.dumps(candidate, ensure_ascii=False, sort_keys=True)),
+        }
+        return {"candidate": candidate, "unit": unit, "publication": publication, "source": source, "context": context}
+
+    def _recovery_blocked(self, run_id: int, candidate_id: int, unit_id: int | None, reason: str, context: dict[str, Any]) -> dict[str, Any]:
+        details = {"code": "retired_publication_recovery", "severity": "high", "message": reason[:1000], **context}
+        self._decision(run_id, {"id": candidate_id, "unit_id": unit_id}, "retired_recovery", "blocked", 0, [details])
+        # The accepted candidate stays accepted, so this open issue cannot make
+        # the formal-eligible denominator fall or masquerade as a rejection.
+        with self.db.connect() as conn:
+            task = conn.execute(
+                "SELECT id FROM knowledge_exception_tasks WHERE candidate_id=? AND issue_code='retired_publication_recovery' AND status='open'",
+                (candidate_id,),
+            ).fetchone()
+            if task:
+                conn.execute("UPDATE knowledge_exception_tasks SET message=? WHERE id=?", (reason[:1000], task["id"]))
+            else:
+                conn.execute(
+                    """INSERT INTO knowledge_exception_tasks(candidate_id,issue_code,severity,message,source)
+                    VALUES (?,'retired_publication_recovery','high',?,'corpus_recovery')""", (candidate_id, reason[:1000]),
+                )
+        return {"candidate_id": candidate_id, "unit_id": unit_id, "status": "blocked", "reason": reason[:1000]}
+
+    def _audit_recovery_publications(self, run_id: int, progress=None, cancelled=None) -> dict[str, Any]:
+        # Version origin survives a crash between publish_unit and recording the
+        # recovery decision. Audit these even when another recovery is blocked.
+        targets = self.db.rows(
+            """SELECT DISTINCT p.id AS publication_id,p.unit_id FROM knowledge_publications p
+            JOIN knowledge_versions v ON v.id=p.version_id WHERE p.status='published'
+            AND v.origin='corpus_retired_recovery' AND EXISTS (
+                SELECT 1 FROM knowledge_ai_candidates c JOIN corpus_run_items i ON i.pipeline_run_id=c.pipeline_run_id
+                WHERE c.unit_id=p.unit_id AND c.status='accepted' AND i.run_id=?) ORDER BY p.id""", (run_id,),
+        )
+        if not targets:
+            return {"scanned": 0, "revalidated_publication_ids": []}
+        audit = self._audit_active_publications(run_id, progress=progress, cancelled=cancelled,
+                                                publication_ids=[int(item["publication_id"]) for item in targets])
+        revalidated = []
+        for target in targets:
+            row = next((row for row in self._published_audit_rows(int(target["unit_id"])) if row["id"] == target["publication_id"]), None)
+            decision = self.db.row(
+                "SELECT * FROM knowledge_review_decisions WHERE unit_id=? AND decision_stage='published_revalidation' ORDER BY id DESC LIMIT 1",
+                (target["unit_id"],),
+            )
+            if not row or not decision or not self._publication_review_reusable(row, [decision]):
+                continue
+            self._check_finalization(run_id, cancelled or (lambda: False))
+            with self.db.connect() as conn:
+                conn.execute(
+                    """UPDATE knowledge_exception_tasks SET status='resolved',resolved_by='AI复核系统（非人工）',
+                    resolution=?,resolved_at=CURRENT_TIMESTAMP
+                    WHERE issue_code='retired_publication_recovery' AND status='open'
+                    AND candidate_id IN (SELECT id FROM knowledge_ai_candidates WHERE unit_id=?)""",
+                    (f"定向修订的新发布{target['publication_id']}已通过独立发布复核；decision={decision['id']}", target["unit_id"]),
+                )
+            revalidated.append(target["publication_id"])
+        return {**audit, "revalidated_publication_ids": revalidated}
+
+    def _recover_retired_candidates(self, run_id: int, progress=None, cancelled=None, *, candidate_ids: list[int] | None = None, limit: int = 50) -> dict[str, Any]:
+        """One bounded recovery pass; only an explicit resume starts another.
+
+        Keep accepted candidates and retired publications immutable. A repaired
+        body lives in a new version of the SAME unit, and its new publication
+        still has to pass the normal publication audit before final activation.
+        """
+        progress = progress or (lambda *_args, **_kwargs: None)
+        cancelled = cancelled or (lambda: False)
+        if not 1 <= limit <= 50:
+            raise ValueError("recovery limit must be between 1 and 50")
+        selected = None if candidate_ids is None else {int(value) for value in candidate_ids}
+        if selected is not None:
+            if not selected or len(selected) > 50:
+                raise ValueError("select between 1 and 50 candidate IDs")
+            for candidate_id in selected:
+                if not self.db.row(
+                    """SELECT c.id FROM knowledge_ai_candidates c WHERE c.id=? AND c.status='accepted'
+                    AND EXISTS (SELECT 1 FROM corpus_run_items i WHERE i.pipeline_run_id=c.pipeline_run_id AND i.run_id=?)""",
+                    (candidate_id, run_id),
+                ):
+                    raise ValueError(f"candidate {candidate_id} is not accepted in this corpus run")
+        targets = {}
+        for item in self._accepted_without_publication(run_id):
+            if selected is None or item["candidate_id"] in selected:
+                targets.setdefault(item["unit_id"] or -item["candidate_id"], item)
+        outcome: dict[str, Any] = {"scanned": 0, "published": [], "blocked": [], "remaining": []}
+        callback = self.knowledge.on_publication_changed
+        self.knowledge.on_publication_changed = None
+        try:
+            for item in list(targets.values())[:limit]:
+                self._check_finalization(run_id, cancelled)
+                candidate_id, unit_id = int(item["candidate_id"]), item["unit_id"]
+                context: dict[str, Any] = {"candidate_id": candidate_id, "unit_id": unit_id}
+                outcome["scanned"] += 1
+                progress("retired_recovery", 95, f"恢复停用知识 {outcome['scanned']}/{min(len(targets), limit)}", context)
+                try:
+                    state = self._retired_recovery_state(candidate_id)
+                    original, unit, retired, source, context = (state[key] for key in ("candidate", "unit", "publication", "source", "context"))
+                    risk = "high" if "high" in {original.get("risk_level"), unit.get("risk_level")} else "medium"
+                    threshold = 0.97 if risk == "high" else 0.95
+                    # The failed publication is the revision target. Replace an
+                    # unfaithful historical quote only with actual source text;
+                    # preserve the historical candidate/quote in the database.
+                    verified_source = normalize_text(source["content"])
+                    context["historical_source_quote"] = str(original.get("source_quote") or "")
+                    old_body = retired["version_content"]
+                    old_summary = str(retired.get("version_summary") or original.get("summary") or "")
+                    old_applicability = str(original.get("applicability") or "")
+                    if retired.get("version_origin") == "corpus_retired_recovery":
+                        old_artifact = self._read_recovery_artifact(retired["version_content"], retired.get("version_summary"))
+                        old_body, old_summary, old_applicability = (old_artifact[key] for key in ("body", "summary", "applicability"))
+                    candidate = {**original, "title": unit["title"], "content": retired["version_content"], "source_section_id": source["id"],
+                                 "summary": old_summary, "applicability": old_applicability,
+                                 "risk_level": risk, "source_quote": verified_source, "recovery_contract": RECOVERY_CONTRACT}
+                    context["contract"] = RECOVERY_CONTRACT
+                    context["instruction"] = "依据原始来源逐项处理上次复核问题；完整修订正文、摘要及适用范围，不能补造事实、仅修改标签或恢复旧发布。失败说明是复核证据，不是来源原文。"
+
+                    def review(task: str, target: dict[str, Any], *, formal: bool = False) -> dict[str, Any]:
+                        self._check_finalization(run_id, cancelled)
+                        result = self._ai_review(target, task, formal=formal, recovery_context={**context, "stage": task})
+                        self._check_finalization(run_id, cancelled)
+                        self._decision(run_id, target, task, result["decision"], result["confidence"],
+                                       [*(result.get("issues") or []), {"code": "recovery_binding", "severity": "info", **context,
+                                        "draft_hash": content_hash(target["content"])}], result.get("run_id"))
+                        return result
+
+                    repair = review("retired_publication_revision", candidate, formal=True)
+                    if repair.get("decision") != "revise":
+                        raise ValueError("revision_requires_a_changed_nonempty_body")
+                    artifact = self._recovery_artifact(repair.get("corrected_content"), repair.get("corrected_summary"), repair.get("corrected_applicability"))
+                    if content_hash(artifact["body"]) == content_hash(normalize_text(old_body)):
+                        raise ValueError("revision_requires_a_changed_nonempty_body")
+                    corrected = artifact["content"]
+                    candidate = {**candidate, **{key: artifact[key] for key in ("content", "summary", "applicability")}}
+                    context["instruction"] = "独立复核这份完整修订稿的正文、摘要及适用范围，核查三者彼此一致且忠实来源；缺失或不一致必须拒绝。只有上次问题已解决且无中高风险事项才可pass，不得降低门槛。"
+                    if self._blocking_codes(candidate) or any(re.search(pattern, corrected) for _, pattern in LEGAL_PATTERNS):
+                        raise ValueError("revised_body_has_deterministic_or_legal_blockers")
+                    post = review("retired_publication_post_revision_review", candidate)
+                    if not self._review_passes(post, threshold):
+                        raise ValueError("post_revision_review_not_passed")
+                    if risk == "high":
+                        second = review("retired_publication_second_review", candidate)
+                        if not self._review_passes(second, threshold):
+                            raise ValueError("high_risk_second_review_not_passed")
+                    final = review("retired_publication_formal_adjudication", candidate, formal=True)
+                    if not self._review_passes(final, threshold):
+                        raise ValueError("formal_adjudication_not_passed")
+                    fresh = self._retired_recovery_state(candidate_id)
+                    for key in ("old_publication_id", "old_version_id", "old_content_hash", "old_body_hash", "retirement_decision_id", "prior_review_id", "source_hash", "candidate_source_hash", "candidate_hash"):
+                        if fresh["context"].get(key) != context.get(key):
+                            raise ValueError(f"recovery_input_changed:{key}")
+                    self._check_finalization(run_id, cancelled)
+                    digest = content_hash(corrected)
+                    # Reuse an unpublished recovery version of this exact body
+                    # after a publication/write interruption; re-review above
+                    # still occurs, and no historical published version is reused.
+                    with self.db.connect() as conn:
+                        version = conn.execute(
+                            """SELECT v.id,v.version_no FROM knowledge_versions v WHERE v.unit_id=?
+                            AND v.origin='corpus_retired_recovery' AND v.content_hash=? AND v.content=? AND v.summary=?
+                            AND NOT EXISTS (SELECT 1 FROM knowledge_publications p WHERE p.version_id=v.id)
+                            ORDER BY v.id DESC LIMIT 1""", (unit_id, digest, corrected, candidate["summary"]),
+                        ).fetchone()
+                        if version:
+                            version_id, version_no = int(version["id"]), int(version["version_no"])
+                        else:
+                            version_no = int(conn.execute("SELECT COALESCE(MAX(version_no),0)+1 FROM knowledge_versions WHERE unit_id=?", (unit_id,)).fetchone()[0])
+                            version_id = int(conn.execute(
+                                """INSERT INTO knowledge_versions(unit_id,version_no,content,summary,origin,content_hash,status)
+                                VALUES (?,?,?,?,'corpus_retired_recovery',?,'review_required')""", (unit_id, version_no, corrected, candidate["summary"], digest),
+                            ).lastrowid)
+                        conn.execute("UPDATE knowledge_units SET cleaned_content=?,content_fingerprint=?,status='review_required',updated_at=CURRENT_TIMESTAMP WHERE id=?", (corrected, digest, unit_id))
+                    draft_path = self.knowledge.settings.knowledge_directories["drafts"] / f"{unit_id:07d}" / f"v{version_no}.md"
+                    write_text_atomic(draft_path, corrected)
+                    self._decision(run_id, original, "retired_recovery_version", "prepared", final["confidence"],
+                                   [{"code": "recovery_binding", "severity": "info", **context, "version_id": version_id, "draft_hash": digest}], final.get("run_id"))
+                    self.knowledge.review_unit(int(unit_id), version_id, "approve", "AI复核系统（非人工）",
+                                               f"停用发布{retired['id']}定向修订；新独立复核与正式裁决通过，candidate={candidate_id}，原停用记录保留。")
+                    self._check_finalization(run_id, cancelled)
+                    fresh = self._retired_recovery_state(candidate_id)
+                    if any(fresh["context"].get(key) != context.get(key) for key in ("old_publication_id", "source_hash", "candidate_source_hash", "candidate_hash", "retirement_decision_id")):
+                        raise ValueError("recovery_input_changed_before_publication")
+                    self._check_finalization(run_id, cancelled)
+                    publication = self.knowledge.publish_unit(int(unit_id), version_id, "AI复核系统（非人工）")
+                    published = {"candidate_id": candidate_id, "unit_id": unit_id, "old_publication_id": retired["id"],
+                                 "version_id": version_id, "publication_id": publication["publication_id"], "status": "pending_revalidation"}
+                    # Not the 'publication' stage: that would create a reusable
+                    # approval binding and skip the new publication's own audit.
+                    self._decision(run_id, original, "retired_recovery_publication", "publish", final["confidence"],
+                                   [{"code": "recovery_binding", "severity": "info", **context, **published}], final.get("run_id"))
+                    outcome["published"].append(published)
+                except FinalizationInterrupted:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    outcome["blocked"].append(self._recovery_blocked(run_id, candidate_id, unit_id, str(exc), context))
+                self._finalization_checkpoint(run_id, "retired_recovery", 95, retired_recovery=outcome)
+        finally:
+            self.knowledge.on_publication_changed = callback
+        outcome["remaining"] = self._accepted_without_publication(run_id)
+        return outcome
 
     @staticmethod
     def _blocking_codes(candidate: dict[str, Any]) -> list[str]:
@@ -1535,7 +2124,13 @@ class CorpusCompletionService:
             and not [item for item in (review.get("issues") or []) if item.get("severity") in {"medium", "high"}]
         )
 
-    def _decision(self, run_id: int, candidate: dict[str, Any], stage: str, decision: str, confidence: float, findings: Any, ai_run_id: int | None = None) -> None:
+    def _decision(self, run_id: int, candidate: dict[str, Any], stage: str, decision: str, confidence: float, findings: Any, ai_run_id: int | None = None, *, publication_binding: dict[str, Any] | None = None) -> None:
+        if stage == "publication" and candidate.get("unit_id") and publication_binding is None:
+            published = self._published_audit_rows(int(candidate["unit_id"]))
+            if len(published) == 1:
+                publication_binding = self._publication_review_binding(published[0])
+        if publication_binding:
+            findings = [*(findings or []), {"code": "publication_binding", "severity": "info", **publication_binding}]
         with self.db.connect() as conn:
             conn.execute(
                 """
@@ -1853,72 +2448,356 @@ class CorpusCompletionService:
         if should_pause and self.dispatch:
             self.dispatch(run_id, 15 * 60 * 1000, 1, "__recovery__")
 
-    def _finalize_run(self, run_id: int, progress) -> dict[str, Any]:
-        publication_audit = self._audit_active_publications(run_id)
-        progress("index", 96, "构建最终检索索引", {})
-        index = self.retrieval.build_index(progress=lambda *_args, **_kwargs: None, cancelled=lambda: False, activate=False)
-        evaluation = self._build_and_run_evaluation(run_id, progress, int(index["id"]))
-        if not evaluation.get("passed"):
-            self._set_run(run_id, "paused", "evaluation", "检索评测未达到发布阈值，已保留上一活动索引")
-            self.write_reports(run_id, {"candidate_index": index, "evaluation": evaluation, "publication_audit": publication_audit})
-            return self.get_run(run_id)
-        index = self.retrieval.activate_index(int(index["id"]))
-        completion = self.completion(run_id)
-        if not completion["index_consistent"]:
-            self._set_run(run_id, "paused", "index", "活动索引与发布表不一致")
-            return self.get_run(run_id)
-        with self.db.connect() as conn:
-            conn.execute("UPDATE corpus_runs SET status='completed',stage='completed',progress=100,completed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?", (run_id,))
-        self.write_reports(run_id, {"index": index, "evaluation": evaluation, "publication_audit": publication_audit})
-        return self.get_run(run_id)
+    def _check_finalization(self, run_id: int, cancelled: Callable[[], bool]) -> None:
+        if cancelled():
+            # Unwind evaluation's own transaction before writing cancellation;
+            # otherwise a SQLite writer can deadlock against its callback.
+            raise FinalizationInterrupted("用户取消", cancel_requested=True)
+        run = self._raw_run(run_id)
+        if run["status"] not in {"pending", "running"}:
+            raise FinalizationInterrupted(str(run.get("pause_reason") or run["status"]))
 
-    def _audit_active_publications(self, run_id: int) -> dict[str, Any]:
+    def _finalization_checkpoint(self, run_id: int, phase: str, percent: int, **details: Any) -> None:
+        checkpoint = parse_json(self._raw_run(run_id).get("checkpoint_json"), {})
+        finalization = checkpoint.setdefault("finalization", {})
+        finalization.update(details)
+        finalization.update({"phase": phase, "updated_at": iso_now()})
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE corpus_runs SET checkpoint_json=?,
+                    stage=CASE WHEN status IN ('pending','running') THEN ? ELSE stage END,
+                    progress=CASE WHEN status IN ('pending','running') THEN ? ELSE progress END,
+                    updated_at=CURRENT_TIMESTAMP WHERE id=?
+                """,
+                (json.dumps(checkpoint, ensure_ascii=False), phase, percent, run_id),
+            )
+
+    def _publication_snapshot(self) -> str:
         rows = self.db.rows(
-            """
-            SELECT p.id,p.unit_id,v.content,u.title,u.risk_level,us.section_id,s.id AS source_id
+            "SELECT id,unit_id,version_id,publication_version,content_hash FROM knowledge_publications WHERE status='published' ORDER BY id"
+        )
+        return content_hash(json.dumps(rows, sort_keys=True))
+
+    def _finalize_run(self, run_id: int, progress=None, cancelled=None) -> dict[str, Any]:
+        progress = progress or (lambda *_args, **_kwargs: None)
+        cancelled = cancelled or (lambda: False)
+        with self._run_mutex(run_id, "finalize") as acquired:
+            if not acquired or self._raw_run(run_id)["status"] not in {"pending", "running"}:
+                return self.get_run(run_id)
+            remaining = self.db.row(
+                "SELECT COUNT(*) AS count FROM corpus_run_items WHERE run_id=? AND status<>'terminal'", (run_id,)
+            ) or {}
+            if int(remaining.get("count") or 0):
+                return self.get_run(run_id)
+            previous = parse_json(self._raw_run(run_id).get("checkpoint_json"), {}).get("finalization", {})
+            phase = "retired_recovery"
+            percentages = {"retired_recovery": 95, "publication_audit": 95, "index": 96, "evaluation": 97, "activation": 99, "reports": 99}
+            extra: dict[str, Any] = {}
+            completed_here = False
+
+            def report(step: str, value: int, message: str = "", details=None) -> None:
+                self._check_finalization(run_id, cancelled)
+                self._finalization_checkpoint(
+                    run_id, phase, percentages[phase], status="running", message=message,
+                    step_stage=step, step_progress=value, details=details or {},
+                )
+                progress(phase, percentages[phase], message, details or {})
+
+            def check_cancelled() -> bool:
+                self._check_finalization(run_id, cancelled)
+                return False
+
+            try:
+                self._check_finalization(run_id, cancelled)
+                self._finalization_checkpoint(
+                    run_id, phase, 95, status="running", attempt=int(previous.get("attempt") or 0) + 1,
+                    started_at=iso_now(), error=None, previous_error=previous.get("error"),
+                )
+                report(phase, 0, "核对已接纳但发布停用的知识")
+                recovery = self._recover_retired_candidates(run_id, progress=report, cancelled=cancelled)
+                extra["retired_recovery"] = recovery
+                recovery_audit = self._audit_recovery_publications(run_id, progress=report, cancelled=cancelled)
+                extra["retired_recovery_audit"] = recovery_audit
+                for item in recovery["published"]:
+                    item["status"] = "revalidated" if item["publication_id"] in recovery_audit["revalidated_publication_ids"] else "blocked"
+                recovery["remaining"] = self._accepted_without_publication(run_id)
+                self._finalization_checkpoint(run_id, phase, 95, retired_recovery=recovery)
+                if recovery["blocked"] or recovery["remaining"]:
+                    ids = sorted({int(item["candidate_id"]) for item in [*recovery["blocked"], *recovery["remaining"]]})
+                    raise RuntimeError(f"停用知识恢复仍待复核，已保留候选和停用记录；candidate_ids={ids}")
+                phase = "publication_audit"
+                report(phase, 0, "复核当前已发布知识")
+                publication_audit = self._audit_active_publications(run_id, progress=report, cancelled=cancelled)
+                extra["publication_audit"] = publication_audit
+                missing = self._accepted_without_publication(run_id)
+                if missing:
+                    extra["publication_recovery_pending"] = missing
+                    raise RuntimeError(f"发布复核后仍有已接纳知识未发布，需显式恢复后定向修订；candidate_ids={[item['candidate_id'] for item in missing]}")
+                snapshot = self._publication_snapshot()
+                phase = "index"
+                report(phase, 0, "构建最终检索索引")
+                index = None
+                if previous.get("publication_snapshot") == snapshot and previous.get("candidate_index_id"):
+                    index = self.db.row(
+                        "SELECT * FROM retrieval_indexes WHERE id=? AND status IN ('building','active')",
+                        (int(previous["candidate_index_id"]),),
+                    )
+                if not index:
+                    index = self.retrieval.build_index(progress=report, cancelled=check_cancelled, activate=False)
+                self._check_finalization(run_id, cancelled)
+                if not index.get("id") or index.get("cancelled"):
+                    raise RuntimeError("候选索引未完成构建")
+                self._finalization_checkpoint(
+                    run_id, phase, 96, candidate_index_id=int(index["id"]),
+                    publication_snapshot=snapshot, publication_audit=publication_audit,
+                )
+                extra["candidate_index"] = index
+                phase = "evaluation"
+                report(phase, 0, "执行最终检索评测")
+                evaluation = self._build_and_run_evaluation(run_id, report, int(index["id"]), cancelled=cancelled)
+                extra["evaluation"] = evaluation
+                self._finalization_checkpoint(
+                    run_id, phase, 97, evaluation={key: value for key, value in evaluation.items() if key != "results"},
+                )
+                self._check_finalization(run_id, cancelled)
+                if not evaluation.get("passed"):
+                    raise RuntimeError("检索评测未达到发布阈值，已保留上一活动索引")
+                if self._publication_snapshot() != snapshot:
+                    raise RuntimeError("评测期间已发布知识发生变化，已保留上一活动索引")
+                completion = self.completion(run_id)
+                if completion["corpus_terminal_rate"] < 1 or completion["formal_eligible_publication_rate"] < 1:
+                    raise RuntimeError("来源闭环或正式可用知识发布尚未完成，已保留上一活动索引")
+                phase = "activation"
+                report(phase, 0, "验证并激活已通过评测的候选索引")
+                extra["index"] = self.retrieval.activate_index(int(index["id"]))
+                self._check_finalization(run_id, cancelled)
+                completion = self.completion(run_id)
+                if not completion["index_consistent"]:
+                    raise RuntimeError("活动索引与发布表不一致")
+                if completion["corpus_terminal_rate"] < 1 or completion["formal_eligible_publication_rate"] < 1:
+                    raise RuntimeError("来源闭环或正式可用知识发布尚未完成")
+                phase = "reports"
+                report(phase, 0, "写入最终验收报告与清单")
+                # Materialize deliverables before declaring the run completed.
+                self.write_reports(run_id, extra)
+                self._check_finalization(run_id, cancelled)
+                self._finalization_checkpoint(run_id, phase, 99, status="completed", completed_at=iso_now())
+                with self.db.connect() as conn:
+                    changed = conn.execute(
+                        "UPDATE corpus_runs SET status='completed',stage='completed',progress=100,completed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('pending','running')",
+                        (run_id,),
+                    )
+                if not changed.rowcount:
+                    raise FinalizationInterrupted("运行状态已改变")
+                completed_here = True
+                self.write_reports(run_id, extra)
+            except FinalizationInterrupted as exc:
+                if exc.cancel_requested:
+                    with self.db.connect() as conn:
+                        conn.execute(
+                            "UPDATE corpus_runs SET status='cancelled',stage='cancelled',pause_reason='用户取消',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('pending','running')",
+                            (run_id,),
+                        )
+                state = self._raw_run(run_id)
+                self._finalization_checkpoint(run_id, phase, percentages[phase], status=state["status"], interrupted_at=iso_now())
+                self._write_finalization_failure_report(run_id, extra)
+            except Exception as exc:  # noqa: BLE001
+                error = {"type": type(exc).__name__, "message": str(exc)[:1000], "phase": phase, "at": iso_now()}
+                extra["error"] = error
+                with self.db.connect() as conn:
+                    conn.execute(
+                        """
+                        UPDATE corpus_runs SET status='paused',stage=?,pause_reason=?,completed_at=NULL,updated_at=CURRENT_TIMESTAMP
+                        WHERE id=? AND (status IN ('pending','running') OR (status='completed' AND ?=1))
+                        """,
+                        (phase, f"最终收口失败（{phase}）：{error['type']}: {error['message']}", run_id, int(completed_here)),
+                    )
+                self._finalization_checkpoint(run_id, phase, percentages[phase], status="failed", error=error)
+                self._write_finalization_failure_report(run_id, extra)
+            return self.get_run(run_id)
+
+    def _write_finalization_failure_report(self, run_id: int, extra: dict[str, Any]) -> None:
+        try:
+            self.write_reports(run_id, extra)
+        except Exception as exc:  # noqa: BLE001
+            state = self._raw_run(run_id)
+            self._finalization_checkpoint(
+                run_id, str(state["stage"]), int(state["progress"]),
+                report_error={"type": type(exc).__name__, "message": str(exc)[:1000]},
+            )
+
+    def _published_audit_rows(self, unit_id: int | None = None) -> list[dict[str, Any]]:
+        rows = self.db.rows(
+            f"""
+            SELECT p.id,p.unit_id,p.version_id,p.publication_version,p.content_hash,p.published_at,
+                v.content,v.summary,v.origin,u.title,u.risk_level,us.section_id,s.id AS source_id,
+                ds.heading AS source_heading,ds.content AS source_content
             FROM knowledge_publications p
             JOIN knowledge_versions v ON v.id=p.version_id JOIN knowledge_units u ON u.id=p.unit_id
             LEFT JOIN knowledge_unit_sources us ON us.unit_id=u.id
             LEFT JOIN source_files s ON s.id=us.source_id
-            WHERE p.status='published' ORDER BY p.id,us.id
-            """
+            LEFT JOIN document_sections ds ON ds.id=us.section_id
+            WHERE p.status='published' {"AND p.unit_id=?" if unit_id is not None else ""} ORDER BY p.id,us.id
+            """,
+            (unit_id,) if unit_id is not None else (),
         )
-        rows = list({int(row["id"]): row for row in reversed(rows)}.values())
+        unique: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            unique.setdefault(int(row["id"]), row)
+        return list(unique.values())
+
+    @classmethod
+    def _published_review_candidate(cls, row: dict[str, Any]) -> dict[str, Any]:
+        candidate = {
+            "id": int(row["id"]), "source_section_id": int(row.get("section_id") or 0),
+            "title": row["title"], "content": row["content"], "summary": str(row["content"])[:200],
+            "applicability": "按来源章节适用条件执行",
+            "risk_level": "high" if str(row.get("risk_level")) == "high" else "medium",
+            "source_quote": str(row["content"])[:1000],
+        }
+        if row.get("origin") == "corpus_retired_recovery":
+            candidate.update(summary=str(row.get("summary") or ""), applicability="",
+                             source_quote=normalize_text(str(row.get("source_content") or "")), recovery_contract=RECOVERY_CONTRACT)
+            try:
+                artifact = cls._read_recovery_artifact(row["content"], row.get("summary"))
+                candidate.update({key: artifact[key] for key in ("content", "summary", "applicability")})
+            except ValueError as exc:
+                candidate["recovery_metadata_error"] = str(exc)
+        return candidate
+
+    def _published_review_prompt(self, row: dict[str, Any]) -> str:
+        candidate = self._published_review_candidate(row)
+        spec = _recovery_review_spec(True) if candidate.get("recovery_contract") else KNOWLEDGE_FORMAL_REVIEW_PROMPT
+        review_input = {
+            "candidate_index": 0,
+            **{key: candidate.get(key) for key in ("title", "content", "summary", "applicability", "risk_level", "source_quote", "source_section_id")},
+        }
+        if candidate.get("recovery_contract"):
+            review_input["recovery_contract"] = RECOVERY_CONTRACT
+        return spec.render(
+            section_text=f"[SECTION:{candidate['source_section_id']}] {row.get('source_heading') or ''}\n{row.get('source_content') or ''}",
+            candidate_json=json.dumps([review_input], ensure_ascii=False),
+        )
+
+    def _publication_review_binding(self, row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "publication_id": int(row["id"]), "version_id": int(row["version_id"]),
+            "publication_version": int(row["publication_version"]),
+            "content_hash": row["content_hash"], "body_hash": content_hash(str(row["content"])),
+            "review_input_hash": content_hash(self._published_review_prompt(row)),
+        }
+
+    def _publication_review_reusable(self, row: dict[str, Any], decisions: list[dict[str, Any]]) -> bool:
+        if self._published_review_candidate(row).get("recovery_metadata_error"):
+            return False
+        binding = self._publication_review_binding(row)
+        if binding["content_hash"] != binding["body_hash"]:
+            return False
+        for decision in decisions:
+            publication_stage = decision["decision_stage"] == "publication"
+            expected_decision = "publish" if publication_stage else "pass"
+            threshold = {"low": 0.92, "high": 0.97}.get(str(row.get("risk_level")), 0.95) if publication_stage else (0.97 if row.get("risk_level") == "high" else 0.95)
+            issues = parse_json(decision.get("findings_json"), [])
+            if decision["decision"] != expected_decision or float(decision.get("confidence") or 0) < threshold:
+                continue
+            if not isinstance(issues, list) or any(isinstance(item, dict) and item.get("severity") in {"medium", "high"} for item in issues):
+                continue
+            saved = next((item for item in issues if isinstance(item, dict) and item.get("code") == "publication_binding"), None)
+            if saved:
+                if all(saved.get(key) == value for key, value in binding.items()):
+                    return True
+                continue
+            if not publication_stage:
+                # Legacy successful revalidations already contain exact source
+                # context and the publication ID in their immutable AI input.
+                ai_input = parse_json(decision.get("ai_input_json"), {})
+                payload = ai_input.get("payload") or {}
+                if (
+                    decision.get("ai_status") == "succeeded"
+                    and decision.get("ai_prompt_hash") == KNOWLEDGE_FORMAL_REVIEW_PROMPT.prompt_hash
+                    and payload.get("candidate_id") == int(row["id"])
+                    and payload.get("content_hash") == binding["body_hash"]
+                    and ai_input.get("rendered_prompt") == self._published_review_prompt(row)
+                ):
+                    return True
+            elif (
+                decision.get("candidate_status") == "accepted"
+                and decision.get("candidate_unit_id") == row["unit_id"]
+                and content_hash(str(decision.get("candidate_content") or "")) == binding["body_hash"]
+            ):
+                # A legacy publication decision is usable only for a version
+                # already published when that exact accepted candidate was signed.
+                try:
+                    reviewed_at = datetime.fromisoformat(str(decision["created_at"]).replace("Z", "+00:00"))
+                    published_at = datetime.fromisoformat(str(row["published_at"]).replace("Z", "+00:00"))
+                    reviewed_at = reviewed_at.replace(tzinfo=reviewed_at.tzinfo or timezone.utc)
+                    published_at = published_at.replace(tzinfo=published_at.tzinfo or timezone.utc)
+                    if reviewed_at >= published_at:
+                        return True
+                except (TypeError, ValueError):
+                    pass
+        return False
+
+    def _audit_active_publications(self, run_id: int, progress=None, cancelled=None, *, publication_ids: list[int] | None = None) -> dict[str, Any]:
+        progress = progress or (lambda *_args, **_kwargs: None)
+        cancelled = cancelled or (lambda: False)
+        rows = self._published_audit_rows()
+        if publication_ids is not None:
+            selected = set(publication_ids)
+            rows = [row for row in rows if row["id"] in selected]
+        decisions_by_unit: dict[int, list[dict[str, Any]]] = {}
+        for decision in self.db.rows(
+            """
+            SELECT d.*,c.content AS candidate_content,c.status AS candidate_status,c.unit_id AS candidate_unit_id,
+                a.input_json AS ai_input_json,a.status AS ai_status,a.prompt_hash AS ai_prompt_hash
+            FROM knowledge_review_decisions d
+            LEFT JOIN knowledge_ai_candidates c ON c.id=d.candidate_id LEFT JOIN ai_runs a ON a.id=d.ai_run_id
+            WHERE d.run_id=? AND d.decision_stage IN ('publication','published_revalidation')
+                AND d.unit_id IN (SELECT unit_id FROM knowledge_publications WHERE status='published')
+            ORDER BY d.id DESC
+            """,
+            (run_id,),
+        ):
+            decisions_by_unit.setdefault(int(decision["unit_id"]), []).append(decision)
         retired: list[dict[str, Any]] = []
+        reused = 0
         publication_callback = self.knowledge.on_publication_changed
         self.knowledge.on_publication_changed = None
         try:
-            for row in rows:
+            for ordinal, row in enumerate(rows, 1):
+                self._check_finalization(run_id, cancelled)
                 blockers = [code for code, pattern in BLOCK_PATTERNS if re.search(pattern, row["content"], re.IGNORECASE)]
-                already_reviewed = self.db.row(
-                    "SELECT id FROM knowledge_review_decisions WHERE run_id=? AND unit_id=? AND decision_stage='publication' LIMIT 1",
-                    (run_id, row["unit_id"]),
-                )
+                if row["content_hash"] != content_hash(str(row["content"])):
+                    blockers.append("published_content_hash_mismatch")
+                metadata_error = self._published_review_candidate(row).get("recovery_metadata_error")
+                if metadata_error:
+                    blockers.append(metadata_error)
+                already_reviewed = self._publication_review_reusable(row, decisions_by_unit.get(int(row["unit_id"]), []))
+                if already_reviewed:
+                    reused += 1
+                if not already_reviewed or ordinal % 25 == 0:
+                    progress("publication_audit", 95, f"复核已发布知识 {ordinal}/{len(rows)}", {"publication_id": row["id"], "reused": reused, "retired": len(retired)})
                 if not blockers and not already_reviewed and row.get("section_id"):
-                    legacy = {
-                        "id": int(row["id"]),
-                        "source_section_id": int(row["section_id"]),
-                        "title": row["title"],
-                        "content": row["content"],
-                        "summary": str(row["content"])[:200],
-                        "applicability": "按来源章节适用条件执行",
-                        "risk_level": "high" if str(row.get("risk_level")) == "high" else "medium",
-                        "source_quote": str(row["content"])[:1000],
-                    }
+                    legacy = self._published_review_candidate(row)
                     review = self._ai_review(legacy, "published_knowledge_revalidation", formal=True)
+                    self._check_finalization(run_id, cancelled)
                     threshold = 0.97 if legacy["risk_level"] == "high" else 0.95
-                    self._decision(run_id, {"unit_id": row["unit_id"]}, "published_revalidation", review["decision"], review["confidence"], review["issues"], review.get("run_id"))
+                    self._decision(run_id, {"unit_id": row["unit_id"]}, "published_revalidation", review["decision"], review["confidence"], review["issues"], review.get("run_id"), publication_binding=self._publication_review_binding(row))
                     if not self._review_passes(review, threshold):
                         blockers.append("published_revalidation_failed")
                 if blockers:
                     self.knowledge.retire_publication(int(row["id"]), "AI内容安全审计（非人工）")
                     retired.append({"publication_id": row["id"], "unit_id": row["unit_id"], "blockers": blockers})
-                    self._decision(run_id, {"unit_id": row["unit_id"]}, "published_artifact_audit", "retire", 1.0, blockers)
+                    self._decision(run_id, {"unit_id": row["unit_id"]}, "published_artifact_audit", "retire", 1.0, blockers,
+                                   publication_binding=self._publication_review_binding(row))
         finally:
             self.knowledge.on_publication_changed = publication_callback
-        return {"scanned": len(rows), "retired": retired, "passed": len(rows) - len(retired)}
+        return {"scanned": len(rows), "retired": retired, "passed": len(rows) - len(retired), "reused": reused}
 
-    def _build_and_run_evaluation(self, run_id: int, progress, candidate_index_id: int) -> dict[str, Any]:
+    def _build_and_run_evaluation(self, run_id: int, progress, candidate_index_id: int, cancelled=None) -> dict[str, Any]:
+        cancelled = cancelled or (lambda: False)
+        self._check_finalization(run_id, cancelled)
         if not self.evaluation:
             return {"status": "not_configured"}
         dataset = f"corpus-{run_id}"
@@ -1928,10 +2807,13 @@ class CorpusCompletionService:
         failures = self._ensure_evaluation_case_coverage(dataset, publications, progress)
         if failures:
             return {"passed": False, "technical_failures": failures, "dataset_name": dataset}
-        search_fn = lambda query, industry, unit_type, top_k: self.retrieval.search_index(
-            candidate_index_id, query, industry, unit_type, top_k
-        )
+        def search_fn(query, industry, unit_type, top_k):
+            self._check_finalization(run_id, cancelled)
+            return self.retrieval.search_index(candidate_index_id, query, industry, unit_type, top_k)
+
+        self._check_finalization(run_id, cancelled)
         self.evaluation.repair_confusing_negatives(dataset, search_fn=search_fn)
+        self._check_finalization(run_id, cancelled)
         result = self.evaluation.run(
             dataset,
             "silver",
@@ -2013,6 +2895,7 @@ class CorpusCompletionService:
                 )
                 if not proposed:
                     break
+                progress("evaluation", 97, "独立复核评测问题", {"pending_cases": len(proposed)})
                 try:
                     result = self.evaluation.review_silver_cases_ai(
                         dataset,
@@ -2104,9 +2987,18 @@ class CorpusCompletionService:
         return self.get_run(run_id)
 
     def resume(self, run_id: int) -> dict[str, Any]:
+        run = self._raw_run(run_id)
+        if run["status"] in {"completed", "cancelled"}:
+            return self.get_run(run_id)
         self._consolidate_manual_tasks(run_id)
+        latest_job = self._latest_corpus_job(run_id)
+        if latest_job and latest_job["status"] == "failed":
+            self._finalization_checkpoint(
+                run_id, str(run["stage"]), int(run["progress"]),
+                acknowledged_failed_job_id=int(latest_job["id"]), resumed_at=iso_now(),
+            )
         with self.db.connect() as conn:
-            conn.execute("UPDATE corpus_runs SET status='running',pause_reason='',consecutive_errors=0,recent_results_json='[]',updated_at=CURRENT_TIMESTAMP WHERE id=?", (run_id,))
+            conn.execute("UPDATE corpus_runs SET status='running',pause_reason='',consecutive_errors=0,recent_results_json='[]',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('pending','running','paused')", (run_id,))
         self._dispatch_next(run_id)
         return self.get_run(run_id)
 
@@ -2147,7 +3039,14 @@ class CorpusCompletionService:
         }
         progress = int(terminal * 95 / total) if total else 95
         with self.db.connect() as conn:
-            conn.execute("UPDATE corpus_runs SET progress=?,counters_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (progress, json.dumps(counters, ensure_ascii=False), run_id))
+            conn.execute(
+                """
+                UPDATE corpus_runs SET progress=CASE WHEN status='completed' THEN 100
+                    WHEN stage IN ('publication_audit','index','evaluation','activation','reports') AND progress>? THEN progress
+                    ELSE ? END,counters_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?
+                """,
+                (progress, progress, json.dumps(counters, ensure_ascii=False), run_id),
+            )
         return self.get_run(run_id)
 
     def get_run(self, run_id: int) -> dict[str, Any]:
@@ -2181,7 +3080,8 @@ class CorpusCompletionService:
         ) or {"published": 0, "eligible": 0}
         manual = self.db.row("SELECT COUNT(*) AS count FROM governance_tasks WHERE run_id=? AND status='open' AND requires_human=1", (run_id,)) or {}
         published_count = int((self.db.row("SELECT COUNT(*) AS count FROM knowledge_publications WHERE status='published'") or {}).get("count", 0))
-        index = self.db.row("SELECT publication_count FROM retrieval_indexes WHERE status='active' ORDER BY id DESC LIMIT 1") or {}
+        index_status = self.retrieval.status()
+        index = index_status.get("active_index") or {}
         total = int(totals.get("total") or 0)
         terminal = int(totals.get("terminal") or 0)
         eligible = int(candidate.get("eligible") or 0)
@@ -2198,7 +3098,7 @@ class CorpusCompletionService:
             "legal_clearance_ready": int(manual.get("count") or 0) == 0,
             "published_total": published_count,
             "active_index_publications": int(index.get("publication_count") or 0),
-            "index_consistent": bool(index) and int(index.get("publication_count") or 0) == published_count,
+            "index_consistent": bool(index_status.get("index_consistent")),
         }
 
     def list_manual_tasks(self, status: str = "open", limit: int = 500, run_id: int | None = None) -> list[dict[str, Any]]:
@@ -2273,7 +3173,10 @@ class CorpusCompletionService:
         )
         payload = {"schema_version": "1.0", "generated_at": iso_now(), "run": run, "completion": completion, "extra": extra or {}, "counts": {"sources": len(sources), "publications": len(publications), "exclusions": len(exclusions), "manual_tasks": len(manual)}}
         write_json_atomic(root / "knowledge_completion.json", payload)
-        lines = ["# 知识库全量整理验收", "", f"- 全资料闭环率：{completion['corpus_terminal_rate']:.2%}", f"- 正式可用发布率：{completion['formal_eligible_publication_rate']:.2%}", f"- 正式发布知识：{completion['published_total']} 条", f"- 人工法律/授权事项：{completion['manual_legal_open']} 项", f"- 活动索引一致：{'是' if completion['index_consistent'] else '否'}", "", "人工事项不进入正式检索，只有全部解决后 `legal_clearance_ready` 才为 true。"]
+        finalization = run.get("checkpoint", {}).get("finalization", {})
+        evaluation = (extra or {}).get("evaluation") or finalization.get("evaluation") or {}
+        evaluation_status = "通过" if evaluation.get("passed") else ("未通过" if evaluation else "尚未完成")
+        lines = ["# 知识库全量整理验收", "", f"- 运行状态：{run['status']}", f"- 当前阶段：{run['stage']}", f"- 检索评测：{evaluation_status}", f"- 暂停或失败原因：{run.get('pause_reason') or '无'}", f"- 全资料闭环率：{completion['corpus_terminal_rate']:.2%}", f"- 正式可用发布率：{completion['formal_eligible_publication_rate']:.2%}", f"- 正式发布知识：{completion['published_total']} 条", f"- 人工法律/授权事项：{completion['manual_legal_open']} 项", f"- 活动索引一致：{'是' if completion['index_consistent'] else '否'}", "", "人工事项不进入正式检索，只有全部解决后 `legal_clearance_ready` 才为 true。"]
         write_text_atomic(root / "knowledge_completion.md", "\n".join(lines) + "\n")
         for name, rows in (("source_disposition.json", sources), ("publication_manifest.json", publications), ("exclusion_manifest.json", exclusions), ("manual_tasks.json", manual), ("asset_governance.json", assets)):
             write_json_atomic(root / name, rows)

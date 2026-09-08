@@ -63,20 +63,43 @@ class EmbeddingClient:
     def embed(self, texts: list[str]) -> list[list[float]]:
         if not self.available or not texts:
             return []
-        response = httpx.post(f"{self.settings.embedding_url}/embed", json={"texts": texts}, timeout=120)
-        response.raise_for_status()
-        return response.json()["vectors"]
+        batch_size = self.settings.embedding_request_batch_size
+        vectors: list[list[float]] = []
+        with httpx.Client(timeout=self.settings.embedding_timeout_seconds) as client:
+            for start in range(0, len(texts), batch_size):
+                batch = texts[start:start + batch_size]
+                response = client.post(f"{self.settings.embedding_url}/embed", json={"texts": batch})
+                response.raise_for_status()
+                batch_vectors = response.json().get("vectors") or []
+                if len(batch_vectors) != len(batch):
+                    raise RuntimeError(
+                        f"embedding响应数量不一致: expected={len(batch)}, actual={len(batch_vectors)}"
+                    )
+                vectors.extend(batch_vectors)
+        return vectors
 
     def rerank(self, query: str, documents: list[str]) -> list[float]:
         if not self.available or not documents:
             return []
-        response = httpx.post(
-            f"{self.settings.embedding_url}/rerank",
-            json={"query": query, "documents": documents},
-            timeout=120,
-        )
-        response.raise_for_status()
-        return [float(value) for value in response.json()["scores"]]
+        # The GPU endpoint accepts at most 64 documents. Cross-encoder scores are
+        # absolute, so independent batches can be concatenated without changing order.
+        batch_size = min(64, self.settings.embedding_request_batch_size)
+        scores: list[float] = []
+        with httpx.Client(timeout=self.settings.embedding_timeout_seconds) as client:
+            for start in range(0, len(documents), batch_size):
+                batch = documents[start:start + batch_size]
+                response = client.post(
+                    f"{self.settings.embedding_url}/rerank",
+                    json={"query": query, "documents": batch},
+                )
+                response.raise_for_status()
+                batch_scores = response.json().get("scores") or []
+                if len(batch_scores) != len(batch):
+                    raise RuntimeError(
+                        f"rerank响应数量不一致: expected={len(batch)}, actual={len(batch_scores)}"
+                    )
+                scores.extend(float(value) for value in batch_scores)
+        return scores
 
 
 class HybridRetrievalService:
@@ -133,16 +156,23 @@ class HybridRetrievalService:
         stored = self.storage.put_bytes(object_key, json.dumps(corpus, ensure_ascii=False).encode("utf-8"), "application/json")
         progress("embedding", 35, "生成知识向量")
         dense_indexed = 0
-        if rows and self.settings.qdrant_url and self.embedding.available and not cancelled():
-            vectors = self.embedding.embed([f"{row['title']}\n{row['content']}" for row in rows])
-            if vectors:
-                from qdrant_client import QdrantClient, models
+        if rows and self.settings.qdrant_url and self.embedding.available:
+            from qdrant_client import QdrantClient, models
 
-                client = QdrantClient(url=self.settings.qdrant_url, timeout=60)
-                client.create_collection(
-                    collection_name=collection,
-                    vectors_config=models.VectorParams(size=len(vectors[0]), distance=models.Distance.COSINE),
-                )
+            client = QdrantClient(url=self.settings.qdrant_url, timeout=60)
+            batch_size = self.settings.embedding_request_batch_size
+            for start in range(0, len(rows), batch_size):
+                if cancelled():
+                    return {"cancelled": True, "dense_documents": dense_indexed}
+                batch = rows[start:start + batch_size]
+                vectors = self.embedding.embed([f"{row['title']}\n{row['content']}" for row in batch])
+                if len(vectors) != len(batch):
+                    raise RuntimeError(f"索引向量数量不一致：需要{len(batch)}条，收到{len(vectors)}条")
+                if start == 0:
+                    client.create_collection(
+                        collection_name=collection,
+                        vectors_config=models.VectorParams(size=len(vectors[0]), distance=models.Distance.COSINE),
+                    )
                 client.upsert(
                     collection_name=collection,
                     points=[
@@ -157,11 +187,24 @@ class HybridRetrievalService:
                                 "content_hash": row["content_hash"],
                             },
                         )
-                        for row, vector in zip(rows, vectors)
+                        for row, vector in zip(batch, vectors)
                     ],
+                    wait=True,
                 )
-                dense_indexed = len(vectors)
-        metrics = {"bm25_documents": len(rows), "dense_documents": dense_indexed}
+                dense_indexed += len(vectors)
+                progress("embedding", 35 + int(55 * dense_indexed / len(rows)),
+                         f"检索向量已写入 {dense_indexed}/{len(rows)} 条",
+                         {"dense_documents": dense_indexed, "publications": len(rows)})
+            actual_count = int(client.count(collection_name=collection, exact=True).count)
+            if actual_count != len(rows):
+                raise RuntimeError(f"向量索引核对失败：发布{len(rows)}条，索引{actual_count}条")
+        if cancelled():
+            return {"cancelled": True, "dense_documents": dense_indexed}
+        latest = self._published_rows()
+        if self._publication_members(rows) != self._publication_members(latest):
+            raise RuntimeError("构建期间已发布知识发生变化，已保留原索引，请重新构建")
+        metrics = {"bm25_documents": len(rows), "dense_documents": dense_indexed,
+                   "publication_manifest_hash": self._members_hash(self._publication_members(rows))}
         with self.db.connect() as conn:
             if activate:
                 conn.execute("UPDATE retrieval_indexes SET status='superseded' WHERE status='active'")
@@ -195,11 +238,27 @@ class HybridRetrievalService:
         index = self.db.row("SELECT * FROM retrieval_indexes WHERE id=?", (index_id,))
         if not index:
             raise KeyError("检索索引不存在")
+        with self.storage.open(index["bm25_object_key"]) as handle:
+            corpus = json.loads(handle.read().decode("utf-8"))
+        if self._publication_members(corpus) != self._published_members():
+            raise ValueError("候选索引与当前已发布知识不一致，请重新构建")
         with self.db.connect() as conn:
             conn.execute("UPDATE retrieval_indexes SET status='superseded' WHERE status='active' AND id<>?", (index_id,))
             conn.execute("UPDATE retrieval_indexes SET status='active',activated_at=CURRENT_TIMESTAMP WHERE id=?", (index_id,))
         self._index_cache = {}
         return self.db.row("SELECT * FROM retrieval_indexes WHERE id=?", (index_id,)) or {}
+
+    @staticmethod
+    def _publication_members(rows: list[dict[str, Any]]) -> set[tuple[int, int, str]]:
+        return {(int(row["publication_id"]), int(row["unit_id"]), str(row["content_hash"])) for row in rows}
+
+    def _published_members(self) -> set[tuple[int, int, str]]:
+        rows = self.db.rows("SELECT id AS publication_id,unit_id,content_hash FROM knowledge_publications WHERE status='published'")
+        return self._publication_members(rows)
+
+    @staticmethod
+    def _members_hash(members: set[tuple[int, int, str]]) -> str:
+        return content_hash(json.dumps(sorted(members), separators=(",", ":")))
 
     def _active_index(self) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
         if self._index_override is not None:
@@ -231,15 +290,17 @@ class HybridRetrievalService:
         started = time.perf_counter()
         limit = max(1, min(int(limit), 50))
         index, corpus = self._active_index()
-        if not index or not corpus:
+        current_members = self._published_members()
+        if not index or not corpus or (self._index_override is None and self._publication_members(corpus) != current_members):
             corpus = [
                 {**row, "tags": parse_json(row.pop("tags_json", "[]"), []), "tokens": tokenize(f"{row['title']} {row['content']}")}
-                for row in self._published_rows(industry, unit_type, classification)
+                for row in self._published_rows(industry, unit_type)
             ]
             index = {"version": "live-lexical", "qdrant_collection": ""}
         eligible = [
             row for row in corpus
-            if (not industry or row.get("industry") == industry)
+            if (int(row["publication_id"]), int(row["unit_id"]), str(row["content_hash"])) in current_members
+            and (not industry or row.get("industry") == industry)
             and (not unit_type or row.get("unit_type") == unit_type)
             and row.get("classification", "internal") in {classification, "public"}
         ]
@@ -369,4 +430,9 @@ class HybridRetrievalService:
 
     def status(self) -> dict[str, Any]:
         active = self.db.row("SELECT * FROM retrieval_indexes WHERE status='active' ORDER BY id DESC LIMIT 1")
-        return {"active_index": active, "embedding_available": self.embedding.available, "qdrant_configured": bool(self.settings.qdrant_url)}
+        members = self._published_members()
+        metrics = parse_json((active or {}).get("metrics_json"), {})
+        consistent = bool(active) and int(active["publication_count"]) == len(members) and metrics.get("publication_manifest_hash") == self._members_hash(members)
+        return {"active_index": active, "embedding_available": self.embedding.available,
+                "qdrant_configured": bool(self.settings.qdrant_url),
+                "published_total": len(members), "index_consistent": consistent}
